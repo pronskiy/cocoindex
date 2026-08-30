@@ -1,0 +1,4854 @@
+"""Tests for the Omnigraph target connector.
+
+Run with:
+    uv run pytest python/tests/connectors/test_omnigraph_target.py -v
+
+Builder unit tests run without a server. Integration tests require the
+omnigraph CLI and are gated on OMNIGRAPH_TEST_STORE=1.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import datetime
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Annotated, Any, cast
+
+import pytest
+
+from cocoindex._internal.context_keys import ContextKey, ContextProvider
+
+import cocoindex as coco
+from cocoindex.connectors import omnigraph
+from cocoindex.connectors.omnigraph._client import (
+    ConnectionFactory,
+    OmnigraphCliError,
+    _CliClient,
+)
+from cocoindex.connectors.omnigraph._gq import (
+    COCO_KEY,
+    Mutation,
+    PropertyValue,
+    build_edge_delete,
+    build_edge_insert,
+    build_endpoint_stub,
+    build_node_delete,
+    build_node_upsert,
+    combine_mutations,
+    merge_type_into_schema,
+    remove_type_from_schema,
+    render_edge_type,
+    render_node_type,
+    render_property,
+    validate_identifier,
+    validate_pg_type,
+)
+from cocoindex.connectorkits import statediff
+from cocoindex.connectorkits.target import ManagedBy
+from cocoindex.connectors.omnigraph import _target as ogt
+from cocoindex.connectors.omnigraph._target import (
+    NodeSchema,
+    OmnigraphType,
+    PropertyDef,
+    _EdgeHandler,
+    _EdgeTypeHandler,
+    _EdgeValue,
+    _EntityTrackingRecord,
+    _NodeHandler,
+    _NodeTypeHandler,
+    _NodeValue,
+    _TypeKey,
+    _TypeSpec,
+    _type_tracking_record_from_spec,
+    derive_coco_key,
+    plan_commits,
+)
+
+from tests import common
+
+coco_env = common.create_test_env(__file__)
+
+
+@dataclass
+class _Doc:
+    slug: str
+    title: str
+    words: int
+    ratio: float
+    published: bool
+    on: datetime.date
+    at: datetime.datetime
+    note: str | None
+
+
+class TestValidateIdentifier:
+    @pytest.mark.parametrize("name", ["Person", "_private", "T1", "a_b_c", "WorksAt"])
+    def test_valid(self, name: str) -> None:
+        validate_identifier(name, "node type")
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "my-type",
+            "123abc",
+            "",
+            "has space",
+            "semi;colon",
+            "a.b",
+            "back`tick",
+            "foo\n",
+            "foo\r",
+            "foo\t",
+            "foo\x00",
+            "foo\nbar",
+        ],
+    )
+    def test_invalid(self, name: str) -> None:
+        with pytest.raises(ValueError, match="Invalid Omnigraph node type"):
+            validate_identifier(name, "node type")
+
+
+class TestRenderProperty:
+    def test_plain(self) -> None:
+        assert render_property("title", "String", is_key=False) == "title: String"
+
+    def test_key(self) -> None:
+        assert render_property("slug", "String", is_key=True) == "slug: String @key"
+
+    def test_nullable_is_passed_through(self) -> None:
+        assert render_property("age", "I32?", is_key=False) == "age: I32?"
+
+
+class TestRenderNodeType:
+    def test_injects_coco_key(self) -> None:
+        assert render_node_type(
+            "Source", [("slug", "String"), ("title", "String")], key=("slug",)
+        ) == (
+            "node Source {\n  slug: String @key\n  title: String\n  coco_key: String\n}"
+        )
+
+    def test_zero_properties_still_gets_coco_key(self) -> None:
+        assert render_node_type("Empty", [], key=()) == (
+            "node Empty {\n  coco_key: String\n}"
+        )
+
+    def test_composite_key_raises(self) -> None:
+        """Omnigraph allows exactly one `@key` per node type: a two-`@key`
+        block is rejected outright at `init` with "node type Reading has
+        multiple @key constraints; only one is supported" (verified against
+        the binary). Rendering it anyway would emit a `.pg` the engine can
+        never accept, so it's refused here."""
+        with pytest.raises(ValueError, match="exactly one @key property"):
+            render_node_type(
+                "Reading",
+                [("sensor", "String"), ("at", "DateTime"), ("v", "F64")],
+                key=("sensor", "at"),
+            )
+
+    def test_reserved_property_id_raises(self) -> None:
+        """`id` is the engine's own identity column, materialized from the
+        `@key` property. Declaring one fails at `init` with "physical schema
+        for 'node:X' must contain exactly one top-level `id` field; found 2",
+        and keying on it fails with the far more confusing "@key must
+        reference declared properties" — both verified against the binary."""
+        with pytest.raises(ValueError, match=r"\['id'\] is reserved by Omnigraph"):
+            render_node_type("X", [("slug", "String"), ("id", "I64")], key=("slug",))
+
+    def test_key_property_must_exist(self) -> None:
+        with pytest.raises(ValueError, match="key property 'missing' is not declared"):
+            render_node_type("X", [("a", "String")], key=("missing",))
+
+    def test_key_must_not_be_nullable(self) -> None:
+        with pytest.raises(ValueError, match="key property 'a' must not be nullable"):
+            render_node_type("X", [("a", "String?")], key=("a",))
+
+    def test_caller_may_not_shadow_coco_key(self) -> None:
+        with pytest.raises(ValueError, match="reserved"):
+            render_node_type("X", [("a", "String"), (COCO_KEY, "String")], key=("a",))
+
+
+class TestRenderEdgeType:
+    def test_no_properties_still_gets_coco_key(self) -> None:
+        assert render_edge_type("Supports", "Source", "Claim", []) == (
+            "edge Supports: Source -> Claim {\n  coco_key: String\n}"
+        )
+
+    def test_with_properties(self) -> None:
+        assert render_edge_type(
+            "WorksAt", "Person", "Company", [("role", "String")]
+        ) == (
+            "edge WorksAt: Person -> Company {\n  role: String\n  coco_key: String\n}"
+        )
+
+
+class TestMergeTypeIntoSchema:
+    """Omnigraph's schema is applied whole-graph, not per type — applying
+    one type's fragment alone silently drops every other type (verified
+    against the engine). This merge is what makes reconciling each type
+    independently safe; it is fiddly text handling and deserves direct
+    tests rather than only a live end-to-end check."""
+
+    def test_appends_a_new_type(self) -> None:
+        existing = render_node_type("A", [("slug", "String")], key=("slug",)) + "\n"
+        b = render_node_type("B", [("slug", "String")], key=("slug",))
+        merged = merge_type_into_schema(existing, "node", "B", b)
+        assert "node A {" in merged
+        assert "node B {" in merged
+        assert merged.index("node A {") < merged.index("node B {")
+
+    def test_replaces_an_existing_type(self) -> None:
+        a1 = render_node_type("A", [("slug", "String")], key=("slug",))
+        a2 = render_node_type(
+            "A", [("slug", "String"), ("title", "String")], key=("slug",)
+        )
+        merged = merge_type_into_schema(a1 + "\n", "node", "A", a2)
+        assert merged == a2 + "\n"
+        assert "title" in merged
+
+    def test_leaves_unrelated_types_untouched(self) -> None:
+        a = render_node_type("A", [("slug", "String")], key=("slug",))
+        b = render_node_type("B", [("slug", "String")], key=("slug",))
+        existing = f"{a}\n\n{b}\n"
+        b2 = render_node_type(
+            "B", [("slug", "String"), ("title", "String")], key=("slug",)
+        )
+        merged = merge_type_into_schema(existing, "node", "B", b2)
+        assert a in merged
+        assert b2 in merged
+        assert b not in merged
+
+    def test_replaces_the_brace_less_edge_form(self) -> None:
+        """A property-less edge is legal and renders brace-less (`edge E: A
+        -> B`, no `{ }` at all) — verified against the engine, which both
+        accepts this form and reproduces it via `schema show`. This
+        connector's own builders never emit it (they always add
+        `coco_key`), but the schema being merged into can legitimately
+        contain one from elsewhere, and the merge must still find its
+        exact extent — ending at the line, not spilling into whatever
+        follows."""
+        existing = (
+            "node A {\n  slug: String @key\n  coco_key: String\n}\n\n"
+            "node B {\n  slug: String @key\n  coco_key: String\n}\n\n"
+            "edge E: A -> B\n"
+        )
+        e2 = render_edge_type("E", "A", "B", [("weight", "I64")])
+        merged = merge_type_into_schema(existing, "edge", "E", e2)
+        assert "node A {\n  slug: String @key\n  coco_key: String\n}" in merged
+        assert "node B {\n  slug: String @key\n  coco_key: String\n}" in merged
+        assert "edge E: A -> B {\n  weight: I64\n  coco_key: String\n}" in merged
+        # The old brace-less form must be gone -- not just shadowed by the
+        # new braced one, which also starts with "edge E: A -> B".
+        assert "edge E: A -> B\n" not in merged
+
+    def test_an_edge_fragment_never_touches_a_same_named_node_block(self) -> None:
+        """A `.pg` may legally hold `node Link` and `edge Link` side by side
+        — the engine accepts it (verified against the binary). Matching on
+        the name alone wrote the edge's fragment over the NODE's block,
+        silently destroying the node type and leaving TWO `edge Link`
+        blocks behind: the same whole-graph destruction class as applying a
+        single type's fragment alone, keyed on a name collision instead of
+        an omission."""
+        existing = (
+            "node Link {\n  slug: String @key\n  coco_key: String\n}\n\n"
+            "edge Link: A -> B {\n  coco_key: String\n}\n"
+        )
+        frag = render_edge_type("Link", "A", "B", [("weight", "I64?")])
+        merged = merge_type_into_schema(existing, "edge", "Link", frag)
+        assert "node Link {\n  slug: String @key\n  coco_key: String\n}" in merged
+        assert merged.count("edge Link") == 1
+        assert "weight: I64?" in merged
+
+    def test_a_node_fragment_never_touches_a_same_named_edge_block(self) -> None:
+        existing = (
+            "node Link {\n  slug: String @key\n  coco_key: String\n}\n\n"
+            "edge Link: A -> B {\n  coco_key: String\n}\n"
+        )
+        frag = render_node_type(
+            "Link", [("slug", "String"), ("title", "String?")], key=("slug",)
+        )
+        merged = merge_type_into_schema(existing, "node", "Link", frag)
+        assert "edge Link: A -> B {\n  coco_key: String\n}" in merged
+        assert merged.count("node Link") == 1
+        assert "title: String?" in merged
+
+    def test_unbalanced_braces_raise_instead_of_corrupting(self) -> None:
+        """With no closing brace the splice point used to stay at the
+        OPENING brace, so the fragment landed mid-declaration and the
+        corrupt result went straight to `schema apply`. Input is engine
+        output today, so this is defense in depth on the whole-graph write
+        path — but a bad edit there costs the entire schema."""
+        broken = "node A {\n  slug: String @key\n  coco_key: String\n"
+        with pytest.raises(ValueError, match="unbalanced braces"):
+            merge_type_into_schema(broken, "node", "A", "node A {\n}")
+
+    def test_duplicate_blocks_raise_instead_of_editing_only_the_first(self) -> None:
+        """Only the first block was ever found, so a merge rewrote one and
+        left the other as a stale duplicate, and a removal deleted one and
+        left the other behind — exactly the state the kind-blind match used
+        to create."""
+        a = render_node_type("A", [("slug", "String")], key=("slug",))
+        with pytest.raises(ValueError, match="declares node 'A' 2 times"):
+            merge_type_into_schema(a + "\n\n" + a + "\n", "node", "A", a)
+
+    def test_rejects_an_unknown_kind(self) -> None:
+        with pytest.raises(ValueError, match="must be 'node' or 'edge'"):
+            merge_type_into_schema("", "relation", "A", "node A {\n}")
+
+
+class TestRemoveTypeFromSchema:
+    """The first half of the two-step `@key`-change rebuild: the engine
+    rejects an in-place key change but accepts drop-then-re-add as two
+    separate `schema apply` calls (verified against the engine)."""
+
+    def test_removes_the_middle_block_without_doubling_the_separator(self) -> None:
+        a = render_node_type("A", [("slug", "String")], key=("slug",))
+        b = render_node_type("B", [("slug", "String")], key=("slug",))
+        c = render_node_type("C", [("slug", "String")], key=("slug",))
+        existing = f"{a}\n\n{b}\n\n{c}\n"
+        removed = remove_type_from_schema(existing, "node", "B")
+        assert a in removed
+        assert c in removed
+        assert "node B {" not in removed
+        assert "\n\n\n" not in removed
+
+    def test_removes_the_only_block(self) -> None:
+        a = render_node_type("A", [("slug", "String")], key=("slug",))
+        removed = remove_type_from_schema(a + "\n", "node", "A")
+        assert "node A" not in removed
+
+    def test_absent_type_is_a_no_op(self) -> None:
+        a = render_node_type("A", [("slug", "String")], key=("slug",))
+        existing = a + "\n"
+        assert remove_type_from_schema(existing, "node", "Z") == existing
+
+    def test_round_trips_with_merge_for_a_key_change(self) -> None:
+        """The exact rebuild sequence _apply_type_schema drives: remove the
+        old block, then merge the new definition back in — proving the two
+        functions compose into a schema with the type's key actually
+        changed and every other type still present."""
+        a1 = render_node_type("A", [("slug", "String")], key=("slug",))
+        b = render_node_type("B", [("slug", "String")], key=("slug",))
+        existing = f"{a1}\n\n{b}\n"
+        without_a = remove_type_from_schema(existing, "node", "A")
+        a2 = render_node_type(
+            "A", [("slug", "String"), ("title", "String")], key=("title",)
+        )
+        rebuilt = merge_type_into_schema(without_a, "node", "A", a2)
+        assert a2 in rebuilt
+        assert b in rebuilt
+        assert a1 not in rebuilt  # A's old (slug-keyed) definition is gone
+
+
+class TestNodeMutations:
+    def test_upsert_is_wrapped_and_parameterized(self) -> None:
+        m = build_node_upsert(
+            "Person",
+            [
+                PropertyValue("email", "String", "ada@x.com"),
+                PropertyValue("display_name", "String", "Ada"),
+            ],
+            coco_key="k1",
+        )
+        assert m.expr == (
+            "query m($p_email: String, $p_display_name: String, $p_coco_key: String) "
+            "{ insert Person { email: $p_email, display_name: $p_display_name, "
+            "coco_key: $p_coco_key } }"
+        )
+        assert m.params == {
+            "p_email": "ada@x.com",
+            "p_display_name": "Ada",
+            "p_coco_key": "k1",
+        }
+
+    def test_delete_uses_coco_key_single_predicate(self) -> None:
+        m = build_node_delete("Person", coco_key="k1")
+        assert m.expr == (
+            "query m($p_coco_key: String) { delete Person where coco_key = $p_coco_key }"
+        )
+        assert m.params == {"p_coco_key": "k1"}
+
+    def test_endpoint_stub_is_key_plus_coco_key(self) -> None:
+        m = build_endpoint_stub(
+            "Person", [PropertyValue("email", "String", "ada@x.com")], coco_key="k1"
+        )
+        assert m.expr == (
+            "query m($p_email: String, $p_coco_key: String) "
+            "{ insert Person { email: $p_email, coco_key: $p_coco_key } }"
+        )
+
+    def test_value_is_never_interpolated(self) -> None:
+        # A value containing GQ-syntax characters must not change `expr`'s
+        # shape at all — asserting the full string, not just `not in`, is
+        # what actually proves the value never reaches the query text.
+        nasty = '", role: "pwned'
+        m = build_node_upsert(
+            "Person", [PropertyValue("email", "String", nasty)], coco_key="k1"
+        )
+        assert m.expr == (
+            "query m($p_email: String, $p_coco_key: String) "
+            "{ insert Person { email: $p_email, coco_key: $p_coco_key } }"
+        )
+        assert nasty not in m.expr
+        assert m.params == {"p_email": nasty, "p_coco_key": "k1"}
+
+    def test_type_is_never_interpolated(self) -> None:
+        # Unlike `value`, `pg_type` lands directly in the signature text — it
+        # must be validated, not merely passed through unexamined.
+        evil = (
+            "String) { delete Person where coco_key = $p_coco_key } query z($x: String"
+        )
+        with pytest.raises(ValueError, match="Invalid Omnigraph property type"):
+            build_node_upsert(
+                "Person", [PropertyValue("email", evil, "v")], coco_key="k1"
+            )
+
+    def test_empty_pg_type_rejected(self) -> None:
+        with pytest.raises(ValueError, match="Invalid Omnigraph property type"):
+            build_node_upsert(
+                "Person", [PropertyValue("email", "", "v")], coco_key="k1"
+            )
+
+    def test_bad_property_name_rejected(self) -> None:
+        with pytest.raises(ValueError, match="Invalid Omnigraph property name"):
+            build_node_upsert(
+                "Person", [PropertyValue("a b", "String", 1)], coco_key="k1"
+            )
+
+    def test_coco_key_named_prop_rejected(self) -> None:
+        with pytest.raises(ValueError, match="reserved"):
+            build_node_upsert(
+                "Person", [PropertyValue(COCO_KEY, "String", "x")], coco_key="k1"
+            )
+
+    def test_duplicate_property_names_rejected(self) -> None:
+        with pytest.raises(ValueError, match="Duplicate"):
+            build_node_upsert(
+                "Person",
+                [
+                    PropertyValue("email", "String", "a"),
+                    PropertyValue("email", "String", "b"),
+                ],
+                coco_key="k1",
+            )
+
+
+class TestEdgeMutations:
+    def test_insert_carries_coco_key_not_id(self) -> None:
+        m = build_edge_insert(
+            "WorksAt",
+            PropertyValue("from", "String", "ada@x.com"),
+            PropertyValue("to", "String", "acme"),
+            [PropertyValue("role", "String", "Eng")],
+            coco_key="e1",
+        )
+        assert m.expr == (
+            "query m($e_from: String, $e_to: String, $p_role: String, $p_coco_key: String) "
+            "{ insert WorksAt { from: $e_from, to: $e_to, role: $p_role, "
+            "coco_key: $p_coco_key } }"
+        )
+        assert "id:" not in m.expr
+        assert m.params == {
+            "e_from": "ada@x.com",
+            "e_to": "acme",
+            "p_role": "Eng",
+            "p_coco_key": "e1",
+        }
+
+    def test_insert_without_properties(self) -> None:
+        m = build_edge_insert(
+            "Supports",
+            PropertyValue("from", "String", "load-test"),
+            PropertyValue("to", "String", "lower-latency"),
+            [],
+            coco_key="e2",
+        )
+        assert m.expr == (
+            "query m($e_from: String, $e_to: String, $p_coco_key: String) "
+            "{ insert Supports { from: $e_from, to: $e_to, coco_key: $p_coco_key } }"
+        )
+
+    def test_delete_uses_coco_key(self) -> None:
+        m = build_edge_delete("WorksAt", coco_key="e1")
+        assert m.expr == (
+            "query m($p_coco_key: String) { delete WorksAt where coco_key = $p_coco_key }"
+        )
+
+    def test_no_edge_update_builder_exists(self) -> None:
+        import cocoindex.connectors.omnigraph._gq as gq
+
+        assert not hasattr(gq, "build_edge_update")
+
+    def test_endpoint_type_is_never_interpolated(self) -> None:
+        evil = (
+            "String) { delete WorksAt where coco_key = $p_coco_key } query z($x: String"
+        )
+        with pytest.raises(ValueError, match="Invalid Omnigraph property type"):
+            build_edge_insert(
+                "WorksAt",
+                PropertyValue("from", evil, "ada@x.com"),
+                PropertyValue("to", "String", "acme"),
+                [],
+                coco_key="e1",
+            )
+
+    def test_coco_key_named_prop_rejected(self) -> None:
+        with pytest.raises(ValueError, match="reserved"):
+            build_edge_insert(
+                "WorksAt",
+                PropertyValue("from", "String", "a"),
+                PropertyValue("to", "String", "b"),
+                [PropertyValue(COCO_KEY, "String", "x")],
+                coco_key="e1",
+            )
+
+    def test_from_named_prop_rejected(self) -> None:
+        with pytest.raises(ValueError, match="reserved"):
+            build_edge_insert(
+                "WorksAt",
+                PropertyValue("from", "String", "a"),
+                PropertyValue("to", "String", "b"),
+                [PropertyValue("from", "String", "x")],
+                coco_key="e1",
+            )
+
+    def test_to_named_prop_rejected(self) -> None:
+        with pytest.raises(ValueError, match="reserved"):
+            build_edge_insert(
+                "WorksAt",
+                PropertyValue("from", "String", "a"),
+                PropertyValue("to", "String", "b"),
+                [PropertyValue("to", "String", "x")],
+                coco_key="e1",
+            )
+
+    def test_duplicate_property_names_rejected(self) -> None:
+        with pytest.raises(ValueError, match="Duplicate"):
+            build_edge_insert(
+                "WorksAt",
+                PropertyValue("from", "String", "a"),
+                PropertyValue("to", "String", "b"),
+                [
+                    PropertyValue("role", "String", "x"),
+                    PropertyValue("role", "String", "y"),
+                ],
+                coco_key="e1",
+            )
+
+
+class TestValidatePgType:
+    @pytest.mark.parametrize(
+        "pg_type",
+        [
+            "String",
+            "Bool",
+            "I32",
+            "I64",
+            "U32",
+            "U64",
+            "F32",
+            "F64",
+            "Date",
+            "DateTime",
+            "Blob",
+            "String?",
+            "I32?",
+            "DateTime?",
+            "Vector(768)",
+            "Vector(3)?",
+            "[String]",
+            "[I32]?",
+            "enum(a, b, c)",
+            "enum(a,b,c)?",
+            "enum(only_one)",
+        ],
+    )
+    def test_valid(self, pg_type: str) -> None:
+        validate_pg_type(pg_type)  # must not raise
+
+    @pytest.mark.parametrize(
+        "pg_type",
+        [
+            "",
+            "String) { delete Person where coco_key = $p_coco_key } query z($x: String",
+            "Strin g",
+            "Vector()",
+            "Vector(abc)",
+            "Vector(0)",
+            "[Bogus]",
+            "[String",
+            "enum()",
+            "enum(1abc)",
+            "Foo",
+            "string",
+            "String??",
+        ],
+    )
+    def test_invalid(self, pg_type: str) -> None:
+        with pytest.raises(ValueError, match="Invalid Omnigraph property type"):
+            validate_pg_type(pg_type)
+
+
+class TestDeriveCocoKey:
+    def test_deterministic(self) -> None:
+        from cocoindex.connectors.omnigraph._target import derive_coco_key
+
+        assert derive_coco_key(("a", "b")) == derive_coco_key(("a", "b"))
+
+    def test_order_matters(self) -> None:
+        from cocoindex.connectors.omnigraph._target import derive_coco_key
+
+        assert derive_coco_key(("a", "b")) != derive_coco_key(("b", "a"))
+
+    def test_no_underscore_collision(self) -> None:
+        """The neo4j connector's f"{a}_{b}_{c}_{d}" form collides here; a
+        fingerprint over the tuple must not. See spec decision 4."""
+        from cocoindex.connectors.omnigraph._target import derive_coco_key
+
+        assert derive_coco_key(("x", "y_z")) != derive_coco_key(("x_y", "z"))
+
+    def test_type_is_significant(self) -> None:
+        from cocoindex.connectors.omnigraph._target import derive_coco_key
+
+        assert derive_coco_key((1, 2)) != derive_coco_key(("1", "2"))
+
+    def test_single_part_key(self) -> None:
+        from cocoindex.connectors.omnigraph._target import derive_coco_key
+
+        assert derive_coco_key(("slug-1",)) != derive_coco_key(("slug-2",))
+
+    def test_is_hex(self) -> None:
+        from cocoindex.connectors.omnigraph._target import derive_coco_key
+
+        k = derive_coco_key(("a", "b"))
+        int(k, 16)
+        assert k.islower()
+
+
+class TestTypeMapping:
+    @pytest.mark.asyncio
+    async def test_scalar_mapping(self) -> None:
+        schema = await NodeSchema.from_class(_Doc, key="slug")
+        assert {n: p.pg_type for n, p in schema.properties.items()} == {
+            "slug": "String",
+            "title": "String",
+            "words": "I64",
+            "ratio": "F64",
+            "published": "Bool",
+            "on": "Date",
+            "at": "DateTime",
+            "note": "String?",
+        }
+
+    @pytest.mark.asyncio
+    async def test_date_and_datetime_get_isoformat_encoders(self) -> None:
+        """`PropertyDef.encoder` is what lets a `date`/`datetime` field reach
+        the transport layer without crashing `json.dumps` — verified against
+        the engine that `Date` accepts `"2026-01-01"` and `DateTime` accepts
+        ISO with or without a trailing `Z`, so `.isoformat()` suffices."""
+        schema = await NodeSchema.from_class(_Doc, key="slug")
+        on = datetime.date(2026, 1, 1)
+        at = datetime.datetime(2026, 1, 1, 12, 30)
+        assert schema.properties["on"].encoder is not None
+        assert schema.properties["on"].encoder(on) == on.isoformat()
+        assert schema.properties["at"].encoder is not None
+        assert schema.properties["at"].encoder(at) == at.isoformat()
+        assert schema.properties["slug"].encoder is None
+        assert schema.properties["note"].encoder is None
+
+    @pytest.mark.asyncio
+    async def test_key_normalised_to_tuple(self) -> None:
+        schema = await NodeSchema.from_class(_Doc, key="slug")
+        assert schema.key == ("slug",)
+
+    @pytest.mark.asyncio
+    async def test_composite_key_raises(self) -> None:
+        """Same engine limit `_gq.render_node_type` enforces (one `@key` per
+        node type), caught here so the error names the dataclass rather than
+        surfacing only later out of `.render()`."""
+
+        @dataclass
+        class _R:
+            sensor: str
+            at: datetime.datetime
+            v: float
+
+        with pytest.raises(ValueError, match="composite key"):
+            await NodeSchema.from_class(_R, key=["sensor", "at"])
+
+    @pytest.mark.asyncio
+    async def test_id_field_raises(self) -> None:
+        """`id` is reserved by Omnigraph whether the schema ends up
+        describing a node or an edge, and it's the likeliest collision in a
+        real dataclass — so it's rejected here, naming the class."""
+
+        @dataclass
+        class _WithId:
+            id: str
+            title: str
+
+        with pytest.raises(ValueError, match=r"_WithId\.id: 'id' is reserved"):
+            await NodeSchema.from_class(_WithId, key="id")
+
+    @pytest.mark.asyncio
+    async def test_empty_key_raises(self) -> None:
+        """An unkeyed node `insert` is a strict insert, not an upsert — every
+        re-run would duplicate every node. Verified against the live engine:
+        inserting the same unkeyed node twice yields two rows."""
+
+        with pytest.raises(ValueError, match="at least one key property"):
+            await NodeSchema.from_class(_Doc, key=[])
+
+    @pytest.mark.asyncio
+    async def test_nullable_key_raises_at_from_class(self) -> None:
+        """Same rule `_gq.render_node_type` enforces, but caught here so the
+        error names the dataclass and field the user actually got wrong,
+        rather than surfacing only later out of `.render()`."""
+
+        with pytest.raises(
+            ValueError, match=r"key property 'note' of _Doc must not be nullable"
+        ):
+            await NodeSchema.from_class(_Doc, key="note")
+
+    @pytest.mark.asyncio
+    async def test_annotation_override(self) -> None:
+        @dataclass
+        class _S:
+            slug: str
+            small: Annotated[int, OmnigraphType("I32")]
+
+        schema = await NodeSchema.from_class(_S, key="slug")
+        assert schema.properties["small"].pg_type == "I32"
+
+    @pytest.mark.asyncio
+    async def test_omnigraph_type_override_is_validated(self) -> None:
+        """`OmnigraphType` is a security boundary: its `pg_type` is spliced
+        directly into generated query text downstream, so a crafted value
+        must be rejected here rather than silently accepted into a schema."""
+
+        @dataclass
+        class _Evil:
+            slug: str
+            small: Annotated[
+                str,
+                OmnigraphType("String) { delete X where y = $z } query w($a: String"),
+            ]
+
+        with pytest.raises(ValueError, match="Invalid Omnigraph property type"):
+            await NodeSchema.from_class(_Evil, key="slug")
+
+    @pytest.mark.asyncio
+    async def test_nullable_list_element_raises(self) -> None:
+        """`[I64?]` is rejected by the engine with "expected core_type"."""
+
+        @dataclass
+        class _N:
+            slug: str
+            vals: list[int | None]
+
+        with pytest.raises(TypeError, match="non-nullable scalars"):
+            await NodeSchema.from_class(_N, key="slug")
+
+    @pytest.mark.asyncio
+    async def test_nested_list_raises(self) -> None:
+        """`[[String]]` is rejected by the engine with "expected base_type"."""
+
+        @dataclass
+        class _NN:
+            slug: str
+            vals: list[list[str]]
+
+        with pytest.raises(TypeError, match="non-nullable scalars"):
+            await NodeSchema.from_class(_NN, key="slug")
+
+    @pytest.mark.asyncio
+    async def test_unmapped_type_raises(self) -> None:
+        @dataclass
+        class _U:
+            slug: str
+            weird: complex
+
+        with pytest.raises(TypeError, match="no Omnigraph type mapping for"):
+            await NodeSchema.from_class(_U, key="slug")
+
+    @pytest.mark.asyncio
+    async def test_bytes_has_no_mapping(self) -> None:
+        """Omnigraph's `Blob` is an external URI reference (the engine fetches
+        a `file://` value), not inline bytes — a Python `bytes` value can
+        never be a `Blob`, so it must fall through to the generic
+        no-mapping error rather than silently being declared as one."""
+
+        @dataclass
+        class _B:
+            slug: str
+            payload: bytes
+
+        with pytest.raises(TypeError, match="no Omnigraph type mapping for"):
+            await NodeSchema.from_class(_B, key="slug")
+
+    @pytest.mark.asyncio
+    async def test_render(self) -> None:
+        @dataclass
+        class _Src:
+            slug: str
+            title: str
+
+        schema = await NodeSchema.from_class(_Src, key="slug")
+        assert schema.render("Source") == (
+            "node Source {\n  slug: String @key\n  title: String\n  coco_key: String\n}"
+        )
+
+
+def _spec(schema: NodeSchema, managed_by: ManagedBy = ManagedBy.SYSTEM) -> _TypeSpec:
+    return _TypeSpec(
+        schema=schema,
+        key=schema.key,
+        from_type=None,
+        to_type=None,
+        managed_by=managed_by,
+    )
+
+
+class TestNodeTypeReconcile:
+    @pytest.mark.asyncio
+    async def test_absent_creates(self) -> None:
+        schema = await NodeSchema.from_class(_Doc, key="slug")
+        out = _NodeTypeHandler().reconcile(
+            _TypeKey("og", "node", "Doc"), _spec(schema), [], True
+        )
+        assert out is not None
+        assert out.action.main_action == "insert"
+        assert out.child_invalidation is None
+
+    @pytest.mark.asyncio
+    async def test_unchanged_is_noop(self) -> None:
+        """A root provider that owns children must never return bare
+        `None` for "no change needed" — the engine only refreshes a
+        child's handler when reconcile()'s own output carries a fresh
+        ChildTargetDef, so bare None here would starve this type's own
+        node/edge children on the very next unchanged run."""
+        schema = await NodeSchema.from_class(_Doc, key="slug")
+        prev = _type_tracking_record_from_spec(_spec(schema))
+        out = _NodeTypeHandler().reconcile(
+            _TypeKey("og", "node", "Doc"), _spec(schema), [prev], False
+        )
+        assert out is not None
+        assert out.action.main_action is None and not out.action.property_actions
+        assert out.child_invalidation is None
+
+    @pytest.mark.asyncio
+    async def test_property_added_is_additive(self) -> None:
+        @dataclass
+        class _V1:
+            slug: str
+
+        @dataclass
+        class _V2:
+            slug: str
+            title: str | None
+
+        prev = _type_tracking_record_from_spec(
+            _spec(await NodeSchema.from_class(_V1, key="slug"))
+        )
+        out = _NodeTypeHandler().reconcile(
+            _TypeKey("og", "node", "Doc"),
+            _spec(await NodeSchema.from_class(_V2, key="slug")),
+            [prev],
+            False,
+        )
+        assert out is not None
+        assert out.action.main_action is None
+        assert out.action.property_actions == {"prop:title": "insert"}
+        assert out.child_invalidation is None
+
+    @pytest.mark.asyncio
+    async def test_non_nullable_property_added_raises(self) -> None:
+        """Engine rejects this via schema apply (OG-MF-103); fail in Python instead."""
+
+        @dataclass
+        class _V1:
+            slug: str
+
+        @dataclass
+        class _V2:
+            slug: str
+            title: str  # non-nullable addition
+
+        prev = _type_tracking_record_from_spec(
+            _spec(await NodeSchema.from_class(_V1, key="slug"))
+        )
+        with pytest.raises(ValueError, match="non-nullable"):
+            _NodeTypeHandler().reconcile(
+                _TypeKey("og", "node", "Doc"),
+                _spec(await NodeSchema.from_class(_V2, key="slug")),
+                [prev],
+                False,
+            )
+
+    @pytest.mark.asyncio
+    async def test_nullable_property_added_is_additive(self) -> None:
+        @dataclass
+        class _V1:
+            slug: str
+
+        @dataclass
+        class _V2:
+            slug: str
+            title: str | None
+
+        prev = _type_tracking_record_from_spec(
+            _spec(await NodeSchema.from_class(_V1, key="slug"))
+        )
+        out = _NodeTypeHandler().reconcile(
+            _TypeKey("og", "node", "Doc"),
+            _spec(await NodeSchema.from_class(_V2, key="slug")),
+            [prev],
+            False,
+        )
+        assert out is not None
+        assert out.action.main_action is None
+        assert out.action.property_actions == {"prop:title": "insert"}
+        assert out.child_invalidation is None
+
+    @pytest.mark.asyncio
+    async def test_property_dropped_is_lossy(self) -> None:
+        @dataclass
+        class _V1:
+            slug: str
+            title: str
+
+        @dataclass
+        class _V2:
+            slug: str
+
+        prev = _type_tracking_record_from_spec(
+            _spec(await NodeSchema.from_class(_V1, key="slug"))
+        )
+        out = _NodeTypeHandler().reconcile(
+            _TypeKey("og", "node", "Doc"),
+            _spec(await NodeSchema.from_class(_V2, key="slug")),
+            [prev],
+            False,
+        )
+        assert out is not None
+        assert out.child_invalidation == "lossy"
+
+    @pytest.mark.asyncio
+    async def test_key_change_is_destructive(self) -> None:
+        @dataclass
+        class _V:
+            slug: str
+            title: str
+
+        prev = _type_tracking_record_from_spec(
+            _spec(await NodeSchema.from_class(_V, key="slug"))
+        )
+        out = _NodeTypeHandler().reconcile(
+            _TypeKey("og", "node", "Doc"),
+            _spec(await NodeSchema.from_class(_V, key="title")),
+            [prev],
+            False,
+        )
+        assert out is not None
+        assert out.action.main_action == "replace"
+        assert out.child_invalidation == "destructive"
+
+    @pytest.mark.asyncio
+    async def test_user_managed_mismatch_raises(self) -> None:
+        """A non-nullable addition on a managed_by=user type must raise the
+        managed_by message, not the non-nullable-guard message: the connector
+        never alters or rebuilds a user-managed type itself, so the guard's
+        advice ("make it optional, or drop and recreate") doesn't apply, and
+        must not fire ahead of (or instead of) the managed_by mismatch."""
+
+        @dataclass
+        class _V1:
+            slug: str
+
+        @dataclass
+        class _V2:
+            slug: str
+            title: str  # non-nullable addition
+
+        prev = _type_tracking_record_from_spec(
+            _spec(await NodeSchema.from_class(_V1, key="slug"), ManagedBy.USER)
+        )
+        with pytest.raises(ValueError, match="managed_by=user"):
+            _NodeTypeHandler().reconcile(
+                _TypeKey("og", "node", "Doc"),
+                _spec(await NodeSchema.from_class(_V2, key="slug"), ManagedBy.USER),
+                [prev],
+                False,
+            )
+
+    @pytest.mark.asyncio
+    async def test_user_managed_first_run_adopts(self) -> None:
+        """The first run of a managed_by=user type has NO tracking records,
+        so the tracked diff is empty and there is nothing to disagree with.
+        This used to raise, making the mode unusable on run one even against
+        a perfectly matching graph, and with an error text ("differs from the
+        tracked one") that misdescribed the cause. Nothing is tracked yet;
+        there is nothing to differ from."""
+        out = _NodeTypeHandler().reconcile(
+            _TypeKey("og", "node", "Doc"),
+            _spec(await NodeSchema.from_class(_Doc, key="slug"), ManagedBy.USER),
+            [],
+            True,
+        )
+        assert out is not None
+        # No schema write, but a child handler all the same -- node/edge
+        # upserts must still flow into a user-managed type.
+        assert out.action.main_action is None and not out.action.property_actions
+        assert out.child_invalidation is None
+
+    @pytest.mark.asyncio
+    async def test_user_managed_first_run_adopts_with_a_plain_string(self) -> None:
+        """`ManagedBy` is a StrEnum, so `managed_by="user"` compares equal but
+        is NOT identical. Under an `is` check it fell through to full SYSTEM
+        management — the connector would rewrite a schema the user declared
+        they own. Same expectation as the enum case above."""
+        out = _NodeTypeHandler().reconcile(
+            _TypeKey("og", "node", "Doc"),
+            _spec(
+                await NodeSchema.from_class(_Doc, key="slug"), cast(ManagedBy, "user")
+            ),
+            [],
+            True,
+        )
+        assert out is not None
+        assert out.action.main_action is None and not out.action.property_actions
+
+    @pytest.mark.asyncio
+    async def test_user_managed_unchanged_is_noop(self) -> None:
+        """The second run: tracked, unchanged, still no schema write. This is
+        the second of the two bare-`None` sites `_noop_output` replaced, and
+        it had no coverage."""
+        spec = _spec(await NodeSchema.from_class(_Doc, key="slug"), ManagedBy.USER)
+        prev = _type_tracking_record_from_spec(spec)
+        out = _NodeTypeHandler().reconcile(
+            _TypeKey("og", "node", "Doc"), spec, [prev], False
+        )
+        assert out is not None
+        assert out.action.main_action is None and not out.action.property_actions
+
+    @pytest.mark.asyncio
+    async def test_undeclaring_a_user_managed_type_does_not_drop_it(self) -> None:
+        """Un-declaring a `managed_by=user` type must be a no-op, not a drop.
+
+        The connector did not create the type and does not own it, so pulling
+        the mount out of the app is a statement about the app, not about the
+        graph. Dropping the block here deletes the user's type AND every row
+        in it -- the one irreversible thing this connector can do to data it
+        was explicitly told it does not manage. `omnigraph.mdx` promises
+        exactly this ("Removing a `managed_by="user"` type from your app is
+        also never destructive") and nothing enforced it: the drop path never
+        consulted ownership, and structurally could not, because the desired
+        state is NON_EXISTENCE and the tracking record did not persist
+        `managed_by` at all.
+        """
+        spec = _spec(await NodeSchema.from_class(_Doc, key="slug"), ManagedBy.USER)
+        prev = _type_tracking_record_from_spec(spec)
+        assert (
+            _NodeTypeHandler().reconcile(
+                _TypeKey("og", "node", "Doc"), coco.NON_EXISTENCE, [prev], False
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_multiple_divergent_prev_records_forces_action(self) -> None:
+        """`prev_possible_records` can hold more than one candidate after an
+        interrupted update. Picking one arbitrarily (as opposed to requiring
+        every candidate to agree with `desired` before treating state as
+        converged) can silently skip reconciliation: here `desired` matches
+        the first candidate exactly but diverges from the second, so an
+        action must still be emitted."""
+
+        @dataclass
+        class _Narrow:
+            slug: str
+
+        @dataclass
+        class _Wide:
+            slug: str
+            title: str
+
+        narrow_schema = await NodeSchema.from_class(_Narrow, key="slug")
+        wide_schema = await NodeSchema.from_class(_Wide, key="slug")
+        matching_prev = _type_tracking_record_from_spec(_spec(narrow_schema))
+        divergent_prev = _type_tracking_record_from_spec(_spec(wide_schema))
+
+        out = _NodeTypeHandler().reconcile(
+            _TypeKey("og", "node", "Doc"),
+            _spec(narrow_schema),
+            [matching_prev, divergent_prev],
+            False,
+        )
+        assert out is not None
+        assert out.action.main_action is None
+        assert out.action.property_actions == {"prop:title": "delete"}
+        assert out.child_invalidation == "lossy"
+
+
+def _edge_spec(
+    schema: NodeSchema,
+    from_type: str = "Source",
+    to_type: str = "Claim",
+    managed_by: ManagedBy = ManagedBy.SYSTEM,
+) -> _TypeSpec:
+    return _TypeSpec(
+        schema=schema,
+        key=(),
+        from_type=from_type,
+        to_type=to_type,
+        managed_by=managed_by,
+    )
+
+
+class TestEdgeTypeReconcile:
+    @pytest.mark.asyncio
+    async def test_absent_creates(self) -> None:
+        @dataclass
+        class _Props:
+            role: str
+
+        schema = await NodeSchema.from_class(_Props, key="role")
+        out = _EdgeTypeHandler().reconcile(
+            _TypeKey("og", "edge", "WorksAt"), _edge_spec(schema), [], True
+        )
+        assert out is not None
+        assert out.action.main_action == "insert"
+        assert out.child_invalidation is None
+
+    @pytest.mark.asyncio
+    async def test_unchanged_is_noop(self) -> None:
+        """See TestNodeTypeReconcile.test_unchanged_is_noop: bare None
+        here would starve this edge type's own child entities."""
+
+        @dataclass
+        class _Props:
+            role: str
+
+        schema = await NodeSchema.from_class(_Props, key="role")
+        prev = _type_tracking_record_from_spec(_edge_spec(schema))
+        out = _EdgeTypeHandler().reconcile(
+            _TypeKey("og", "edge", "WorksAt"), _edge_spec(schema), [prev], False
+        )
+        assert out is not None
+        assert out.action.main_action is None and not out.action.property_actions
+        assert out.child_invalidation is None
+
+    @pytest.mark.asyncio
+    async def test_property_added_is_additive(self) -> None:
+        @dataclass
+        class _V1:
+            role: str
+
+        @dataclass
+        class _V2:
+            role: str
+            since: str | None
+
+        prev = _type_tracking_record_from_spec(
+            _edge_spec(await NodeSchema.from_class(_V1, key="role"))
+        )
+        out = _EdgeTypeHandler().reconcile(
+            _TypeKey("og", "edge", "WorksAt"),
+            _edge_spec(await NodeSchema.from_class(_V2, key="role")),
+            [prev],
+            False,
+        )
+        assert out is not None
+        assert out.action.main_action is None
+        assert out.action.property_actions == {"prop:since": "insert"}
+        assert out.child_invalidation is None
+
+    @pytest.mark.asyncio
+    async def test_non_nullable_property_added_raises(self) -> None:
+        @dataclass
+        class _V1:
+            role: str
+
+        @dataclass
+        class _V2:
+            role: str
+            since: str  # non-nullable addition
+
+        prev = _type_tracking_record_from_spec(
+            _edge_spec(await NodeSchema.from_class(_V1, key="role"))
+        )
+        with pytest.raises(ValueError, match="non-nullable"):
+            _EdgeTypeHandler().reconcile(
+                _TypeKey("og", "edge", "WorksAt"),
+                _edge_spec(await NodeSchema.from_class(_V2, key="role")),
+                [prev],
+                False,
+            )
+
+    @pytest.mark.asyncio
+    async def test_property_dropped_is_lossy(self) -> None:
+        @dataclass
+        class _V1:
+            role: str
+            since: str
+
+        @dataclass
+        class _V2:
+            role: str
+
+        prev = _type_tracking_record_from_spec(
+            _edge_spec(await NodeSchema.from_class(_V1, key="role"))
+        )
+        out = _EdgeTypeHandler().reconcile(
+            _TypeKey("og", "edge", "WorksAt"),
+            _edge_spec(await NodeSchema.from_class(_V2, key="role")),
+            [prev],
+            False,
+        )
+        assert out is not None
+        assert out.child_invalidation == "lossy"
+
+    @pytest.mark.asyncio
+    async def test_from_type_change_is_destructive(self) -> None:
+        @dataclass
+        class _Props:
+            role: str
+
+        schema = await NodeSchema.from_class(_Props, key="role")
+        prev = _type_tracking_record_from_spec(
+            _edge_spec(schema, from_type="Source", to_type="Claim")
+        )
+        out = _EdgeTypeHandler().reconcile(
+            _TypeKey("og", "edge", "WorksAt"),
+            _edge_spec(schema, from_type="Person", to_type="Claim"),
+            [prev],
+            False,
+        )
+        assert out is not None
+        assert out.action.main_action == "replace"
+        assert out.child_invalidation == "destructive"
+
+    @pytest.mark.asyncio
+    async def test_to_type_change_is_destructive(self) -> None:
+        @dataclass
+        class _Props:
+            role: str
+
+        schema = await NodeSchema.from_class(_Props, key="role")
+        prev = _type_tracking_record_from_spec(
+            _edge_spec(schema, from_type="Source", to_type="Claim")
+        )
+        out = _EdgeTypeHandler().reconcile(
+            _TypeKey("og", "edge", "WorksAt"),
+            _edge_spec(schema, from_type="Source", to_type="Report"),
+            [prev],
+            False,
+        )
+        assert out is not None
+        assert out.action.main_action == "replace"
+        assert out.child_invalidation == "destructive"
+
+
+class TestTypeOwnershipMatrix:
+    """Every combination of tracked ownership and declared ownership.
+
+    Twelve cases, small enough to be exhaustive: the previous state is
+    nothing / system-managed / user-managed / one of each (an interrupted
+    update leaves several candidates behind), crossed with a declaration that
+    is system-managed, user-managed, or absent. None of this was answerable
+    before `managed_by` started riding on the persisted tracking record.
+    """
+
+    @staticmethod
+    async def _prev(
+        ownerships: list[ManagedBy],
+    ) -> list[ogt._TypeTrackingRecord]:
+        """Previous records that differ ONLY in ownership, so each case below
+        isolates the ownership decision from any schema difference."""
+        schema = await NodeSchema.from_class(_Doc, key="slug")
+        return [_type_tracking_record_from_spec(_spec(schema, m)) for m in ownerships]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("prev_ownerships", "writes"),
+        [
+            ([], True),
+            ([ManagedBy.SYSTEM], False),
+            ([ManagedBy.USER], False),
+            ([ManagedBy.SYSTEM, ManagedBy.USER], False),
+        ],
+        ids=["no-prev", "system", "user", "mixed"],
+    )
+    async def test_declared_system_managed(
+        self, prev_ownerships: list[ManagedBy], writes: bool
+    ) -> None:
+        """A system-managed declaration writes DDL only when the graph might
+        not already match it: on a first run, where nothing is tracked and the
+        engine reports `prev_may_be_missing`. A tracked record already
+        carrying this exact schema means there is nothing to apply, whoever
+        owned it."""
+        schema = await NodeSchema.from_class(_Doc, key="slug")
+        out = _NodeTypeHandler().reconcile(
+            _TypeKey("og", "node", "Doc"),
+            _spec(schema, ManagedBy.SYSTEM),
+            await self._prev(prev_ownerships),
+            not prev_ownerships,
+        )
+        assert out is not None
+        assert bool(out.action.main_action or out.action.property_actions) is writes
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "prev_ownerships",
+        [[], [ManagedBy.SYSTEM], [ManagedBy.USER], [ManagedBy.SYSTEM, ManagedBy.USER]],
+        ids=["no-prev", "system", "user", "mixed"],
+    )
+    async def test_declared_user_managed(
+        self, prev_ownerships: list[ManagedBy]
+    ) -> None:
+        """A user-managed declaration never writes DDL, whatever is tracked --
+        including a type this connector used to manage itself. Handing a type
+        over is allowed; what is not allowed is touching `.pg` afterwards."""
+        schema = await NodeSchema.from_class(_Doc, key="slug")
+        out = _NodeTypeHandler().reconcile(
+            _TypeKey("og", "node", "Doc"),
+            _spec(schema, ManagedBy.USER),
+            await self._prev(prev_ownerships),
+            not prev_ownerships,
+        )
+        assert out is not None
+        assert out.action.main_action is None and not out.action.property_actions
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("prev_ownerships", "drops"),
+        [
+            ([], False),
+            ([ManagedBy.SYSTEM], True),
+            ([ManagedBy.USER], False),
+            ([ManagedBy.SYSTEM, ManagedBy.USER], False),
+        ],
+        ids=["no-prev", "system", "user", "mixed"],
+    )
+    async def test_undeclared(
+        self, prev_ownerships: list[ManagedBy], drops: bool
+    ) -> None:
+        """Removal is the case that matters, because it is the irreversible
+        one. The connector drops only what it owns outright, and a single
+        user-managed candidate vetoes the drop: after an interrupted update we
+        do not get to pick which candidate is the engine's real state, and
+        guessing wrong deletes rows the connector never created."""
+        out = _NodeTypeHandler().reconcile(
+            _TypeKey("og", "node", "Doc"),
+            coco.NON_EXISTENCE,
+            await self._prev(prev_ownerships),
+            False,
+        )
+        if not drops:
+            assert out is None
+            return
+        assert out is not None
+        assert coco.is_non_existence(out.action.spec)
+        assert out.action.main_action == "delete"
+
+
+class TestGuardsUnderPrevMayBeMissing:
+    """Both guards read a diff computed with `prev_may_be_missing=False`, and
+    these two tests are what pin that.
+
+    Collapsing the two diffs into one looks like a simplification and
+    silently disables both guards: with `prev_may_be_missing` set (a
+    `--reprocess`, or internal state lost while the graph persists) the main
+    action becomes "upsert", which empties `property_actions` and leaves them
+    nothing to fire on. The failure mode is not a wrong error message -- it is
+    the raw `OG-MF-103` engine error coming back, and a user-managed schema
+    silently diverging.
+    """
+
+    @pytest.mark.asyncio
+    async def test_user_managed_mismatch_still_raises(self) -> None:
+        @dataclass
+        class _V1:
+            slug: str
+
+        @dataclass
+        class _V2:
+            slug: str
+            title: str | None
+
+        prev = _type_tracking_record_from_spec(
+            _spec(await NodeSchema.from_class(_V1, key="slug"), ManagedBy.USER)
+        )
+        with pytest.raises(ValueError, match="managed_by=user"):
+            _NodeTypeHandler().reconcile(
+                _TypeKey("og", "node", "Doc"),
+                _spec(await NodeSchema.from_class(_V2, key="slug"), ManagedBy.USER),
+                [prev],
+                True,
+            )
+
+    @pytest.mark.asyncio
+    async def test_non_nullable_addition_still_raises(self) -> None:
+        @dataclass
+        class _V1:
+            slug: str
+
+        @dataclass
+        class _V2:
+            slug: str
+            title: str  # non-nullable addition
+
+        prev = _type_tracking_record_from_spec(
+            _spec(await NodeSchema.from_class(_V1, key="slug"))
+        )
+        with pytest.raises(ValueError, match="non-nullable"):
+            _NodeTypeHandler().reconcile(
+                _TypeKey("og", "node", "Doc"),
+                _spec(await NodeSchema.from_class(_V2, key="slug")),
+                [prev],
+                True,
+            )
+
+    @pytest.mark.asyncio
+    async def test_property_on_only_some_prev_records_is_lossy(self) -> None:
+        """An accepted behaviour change from the statediff port.
+
+        A nullable property that only SOME candidate previous states carry
+        used to be classified as a plain additive alter; it is lossy now.
+        More conservative, matches neo4j and falkordb, and reachable only
+        after an interrupted update left several candidates behind -- exactly
+        the moment when guessing "additive" is least safe.
+        """
+
+        @dataclass
+        class _V1:
+            slug: str
+
+        @dataclass
+        class _V2:
+            slug: str
+            title: str | None
+
+        narrow = await NodeSchema.from_class(_V1, key="slug")
+        wide = await NodeSchema.from_class(_V2, key="slug")
+        out = _NodeTypeHandler().reconcile(
+            _TypeKey("og", "node", "Doc"),
+            _spec(wide),
+            [
+                _type_tracking_record_from_spec(_spec(narrow)),
+                _type_tracking_record_from_spec(_spec(wide)),
+            ],
+            False,
+        )
+        assert out is not None
+        assert out.action.property_actions == {"prop:title": "upsert"}
+        assert out.child_invalidation == "lossy"
+
+
+class TestTypeTrackingRecordRoundTrip:
+    @pytest.mark.asyncio
+    async def test_managed_by_survives_the_engine_decoder(self) -> None:
+        """`managed_by` is only worth persisting if it comes back.
+
+        The engine stores whatever `reconcile` returns and hands it back as
+        `prev_possible_records` on the next run, decoded against this
+        handler's own annotation. Refusing to drop a user-managed type is
+        decided entirely from that restored flag, so a record that
+        round-trips without it silently reinstates the drop.
+        """
+        from cocoindex._internal import serde
+
+        schema = await NodeSchema.from_class(_Doc, key="slug")
+        out = _NodeTypeHandler().reconcile(
+            _TypeKey("og", "node", "Doc"), _spec(schema, ManagedBy.USER), [], True
+        )
+        assert out is not None
+        assert not coco.is_non_existence(out.tracking_record)
+
+        hint = serde.unwrap_element_type(
+            serde.get_param_annotation(_NodeTypeHandler().reconcile, 2)
+        )
+        restored = serde.make_deserialize_fn(hint)(serde.serialize(out.tracking_record))
+        assert restored == out.tracking_record
+        assert restored.managed_by == ManagedBy.USER
+
+        # And the restored record really is enough to veto the drop.
+        assert (
+            _NodeTypeHandler().reconcile(
+                _TypeKey("og", "node", "Doc"), coco.NON_EXISTENCE, [restored], False
+            )
+            is None
+        )
+
+
+_NK = _TypeKey("og", "node", "Source")
+_EK = _TypeKey("og", "edge", "Supports")
+
+
+_SOURCE_PROPS = {
+    "slug": PropertyDef("slug", "String"),
+    "title": PropertyDef("title", "String"),
+}
+_SUPPORTS_PROPS = {"w": PropertyDef("w", "I64")}
+
+
+def _node_handler() -> _NodeHandler:
+    return _NodeHandler("Source", ("slug",), _NK, _SOURCE_PROPS)
+
+
+def _edge_handler() -> _EdgeHandler:
+    return _EdgeHandler(
+        "Supports", _EK, "Source", "Claim", ("slug",), ("slug",), _SUPPORTS_PROPS
+    )
+
+
+class TestNodeReconcile:
+    def test_new_node_upserts(self) -> None:
+        out = _node_handler().reconcile(
+            "s1", _NodeValue({"slug": "s1", "title": "T"}), [], False
+        )
+        assert out is not None and out.action.op == "upsert"
+
+    def test_unchanged_is_noop(self) -> None:
+        h, v = _node_handler(), _NodeValue({"slug": "s1", "title": "T"})
+        first = h.reconcile("s1", v, [], False)
+        assert first is not None
+        assert not isinstance(first.tracking_record, coco.NonExistenceType)
+        assert h.reconcile("s1", v, [first.tracking_record], False) is None
+
+    def test_changed_reupserts(self) -> None:
+        h = _node_handler()
+        first = h.reconcile("s1", _NodeValue({"slug": "s1", "title": "T"}), [], False)
+        assert first is not None
+        assert not isinstance(first.tracking_record, coco.NonExistenceType)
+        out = h.reconcile(
+            "s1",
+            _NodeValue({"slug": "s1", "title": "T2"}),
+            [first.tracking_record],
+            False,
+        )
+        assert out is not None and out.action.op == "upsert"
+
+    def test_prev_may_be_missing_forces_write(self) -> None:
+        h, v = _node_handler(), _NodeValue({"slug": "s1", "title": "T"})
+        first = h.reconcile("s1", v, [], False)
+        assert first is not None
+        assert not isinstance(first.tracking_record, coco.NonExistenceType)
+        out = h.reconcile("s1", v, [first.tracking_record], True)
+        assert out is not None and out.action.op == "upsert"
+
+    def test_undeclared_deletes(self) -> None:
+        h = _node_handler()
+        first = h.reconcile("s1", _NodeValue({"slug": "s1", "title": "T"}), [], False)
+        assert first is not None
+        assert not isinstance(first.tracking_record, coco.NonExistenceType)
+        out = h.reconcile("s1", coco.NON_EXISTENCE, [first.tracking_record], False)
+        assert out is not None and out.action.op == "delete"
+
+    def test_undeclared_and_never_written_is_noop(self) -> None:
+        assert _node_handler().reconcile("s1", coco.NON_EXISTENCE, [], False) is None
+
+    def test_undeclared_with_uncertain_prev_still_deletes(self) -> None:
+        """`prev_possible_records=[]` with `prev_may_be_missing` does NOT mean
+        the entity was never written — it means we lost track of it.
+
+        The engine reports that state after a `--reprocess`, after internal
+        state is lost while the graph persists, and when a prior delete's
+        tracking record was dropped before the delete itself landed. Treating
+        it as "never existed" orphans the row in the graph forever: nothing
+        else ever deletes it, and nothing tracks it any more.
+
+        Deleting by `coco_key` is a documented no-op when the entity isn't
+        there, so emitting the delete is safe even if it turns out to be
+        unnecessary. This is the guard every sibling connector uses, and it is
+        the same reasoning the insert path already applies one method below —
+        which is why the two must not disagree.
+        """
+        out = _node_handler().reconcile("s1", coco.NON_EXISTENCE, [], True)
+        assert out is not None and out.action.op == "delete"
+
+    def test_coco_key_is_derived_from_the_key_tuple(self) -> None:
+        out = _node_handler().reconcile("s1", _NodeValue({"slug": "s1"}), [], False)
+        assert out is not None
+        assert out.action.coco_key == derive_coco_key(("s1",))
+
+    def test_scalar_key_equals_singleton_tuple_key(self) -> None:
+        """A single-field key may arrive as a bare scalar or as a 1-tuple;
+        both must zip identically against `key_fields` and yield the same
+        `coco_key`."""
+        h = _node_handler()
+        scalar_out = h.reconcile("s1", _NodeValue({"slug": "s1"}), [], False)
+        tuple_out = h.reconcile(("s1",), _NodeValue({"slug": "s1"}), [], False)
+        assert scalar_out is not None and tuple_out is not None
+        assert scalar_out.action.coco_key == tuple_out.action.coco_key
+
+
+class TestEdgeReconcile:
+    def test_new_edge_inserts(self) -> None:
+        out = _edge_handler().reconcile(("a", "b"), _EdgeValue("a", "b", {}), [], False)
+        assert out is not None and out.action.op == "insert"
+
+    def test_unchanged_is_noop(self) -> None:
+        h, v = _edge_handler(), _EdgeValue("a", "b", {"w": 1})
+        first = h.reconcile(("a", "b"), v, [], False)
+        assert first is not None
+        assert not isinstance(first.tracking_record, coco.NonExistenceType)
+        assert h.reconcile(("a", "b"), v, [first.tracking_record], False) is None
+
+    def test_changed_edge_is_replace_not_insert(self) -> None:
+        """A strict insert would duplicate; there is no edge update. Must be replace."""
+        h = _edge_handler()
+        first = h.reconcile(("a", "b"), _EdgeValue("a", "b", {"w": 1}), [], False)
+        assert first is not None
+        assert not isinstance(first.tracking_record, coco.NonExistenceType)
+        out = h.reconcile(
+            ("a", "b"), _EdgeValue("a", "b", {"w": 2}), [first.tracking_record], False
+        )
+        assert out is not None and out.action.op == "replace"
+
+    def test_prev_may_be_missing_forces_replace(self) -> None:
+        h, v = _edge_handler(), _EdgeValue("a", "b", {})
+        first = h.reconcile(("a", "b"), v, [], False)
+        assert first is not None
+        assert not isinstance(first.tracking_record, coco.NonExistenceType)
+        out = h.reconcile(("a", "b"), v, [first.tracking_record], True)
+        assert out is not None and out.action.op == "replace"
+
+    def test_undeclared_deletes(self) -> None:
+        h = _edge_handler()
+        first = h.reconcile(("a", "b"), _EdgeValue("a", "b", {}), [], False)
+        assert first is not None
+        assert not isinstance(first.tracking_record, coco.NonExistenceType)
+        out = h.reconcile(
+            ("a", "b"), coco.NON_EXISTENCE, [first.tracking_record], False
+        )
+        assert out is not None and out.action.op == "delete"
+
+    def test_undeclared_with_uncertain_prev_still_deletes(self) -> None:
+        """Edge counterpart of the node case: an edge whose tracking was lost
+        must still be deleted, or it survives in the graph untracked forever.
+
+        `_EdgeHandler.reconcile` already refuses to trust `(prev=[],
+        prev_may_be_missing=True)` on the insert side — it forces "replace"
+        there precisely because the edge might still be live. The delete side
+        must read that same signal the same way.
+        """
+        out = _edge_handler().reconcile(("a", "b"), coco.NON_EXISTENCE, [], True)
+        assert out is not None and out.action.op == "delete"
+
+    def test_repointing_changes_coco_key(self) -> None:
+        h = _edge_handler()
+        a = h.reconcile(("s1", "c1"), _EdgeValue("s1", "c1", {}), [], False)
+        b = h.reconcile(("s1", "c2"), _EdgeValue("s1", "c2", {}), [], False)
+        assert a is not None and b is not None
+        assert a.action.coco_key != b.action.coco_key
+
+    def test_endpoint_metadata_is_carried_for_stubs(self) -> None:
+        """The sink emits key-only endpoint stubs, so it needs the types and key fields."""
+        out = _edge_handler().reconcile(("a", "b"), _EdgeValue("a", "b", {}), [], False)
+        assert out is not None
+        assert out.action.from_type == "Source" and out.action.to_type == "Claim"
+        assert out.action.from_key_fields == ("slug",)
+
+    def test_empty_and_prev_may_be_missing_is_replace_not_insert(self) -> None:
+        """Empty `prev_possible_records` does not mean the edge is absent: the
+        engine reports (empty, prev_may_be_missing=True) both when a prior
+        delete's tracking record was dropped before the delete itself landed,
+        and when internal state was lost outright while the target persists
+        (e.g. db_path repointed). A bare insert in either case would silently
+        duplicate a still-live edge. Must fall through to replace — deleting
+        a nonexistent edge by coco_key is a no-op, so replace is safe even if
+        the edge turns out not to have existed."""
+        out = _edge_handler().reconcile(("a", "b"), _EdgeValue("a", "b", {}), [], True)
+        assert out is not None and out.action.op == "replace"
+
+
+def _client() -> _CliClient:
+    return _CliClient(ConnectionFactory(store="file:///tmp/g.omni"))
+
+
+#: Stands in wherever `_apply_type_schema` needs a spec that merely exists.
+_PLACEHOLDER_SPEC = _TypeSpec(
+    schema=None, key=(), from_type=None, to_type=None, managed_by=ManagedBy.SYSTEM
+)
+
+
+def _type_action(
+    main_action: statediff.DiffAction | None,
+    type_name: str,
+    fragment: str | None,
+    *,
+    type_kind: str = "node",
+    property_actions: dict[str, statediff.DiffAction] | None = None,
+) -> ogt._TypeAction:
+    """A `_TypeAction` carrying only what `_apply_type_schema` reads — whether
+    anything has to be written at all (`main_action`/`property_actions`),
+    whether the type is being removed (`spec`), the type name, and the
+    fragment.
+
+    `spec`'s *contents* are what the sink needs to build a child handler and
+    are never consulted on the schema path, so a placeholder stands in for
+    every action but a removal — which the path detects with
+    `coco.is_non_existence(spec)`, and which `_reconcile_removal` is the only
+    producer of, always paired with `main_action="delete"`.
+    """
+    return ogt._TypeAction(
+        key=_TypeKey("og", type_kind, type_name),
+        spec=coco.NON_EXISTENCE if main_action == "delete" else _PLACEHOLDER_SPEC,
+        pg_fragment=fragment,
+        main_action=main_action,
+        property_actions=property_actions or {},
+    )
+
+
+class TestCliArgv:
+    def test_mutate_argv_passes_payloads_by_file(self) -> None:
+        """Neither the GQ source nor the params may appear IN argv.
+
+        A commit is a whole component's writes — at the 8,192-entity cap
+        that is ~1.3 MB of expression and ~1.0 MB of params, past darwin's
+        1 MB ARG_MAX and far past Linux's 128 KiB per-argument limit (which
+        caps the expression alone at ~800 entities). `create_subprocess_exec`
+        then raises `OSError: [Errno 7] Argument list too long`, which is
+        not an `OmnigraphCliError` and is caught nowhere.
+        """
+        argv = _client()._mutate_argv("/tmp/q.gq", "/tmp/p.json", branch="main")
+        assert argv[:2] == ["omnigraph", "mutate"]
+        assert argv[argv.index("--query") + 1] == "/tmp/q.gq"
+        assert argv[argv.index("--params-file") + 1] == "/tmp/p.json"
+        # The inline forms are what put a payload in argv -- none of them.
+        assert "--expr" not in argv
+        assert "-e" not in argv
+        assert "--query-string" not in argv
+        assert "--params" not in argv
+        assert argv[argv.index("--store") + 1] == "file:///tmp/g.omni"
+        assert "--branch" in argv and "main" in argv
+        assert "--json" in argv and "--quiet" in argv
+
+    @pytest.mark.asyncio
+    async def test_mutate_writes_expr_and_params_to_the_files_it_names(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The argv test above pins the shape; this pins that the files
+        those paths point at actually hold the mutation, read back from
+        disk while the call is in flight."""
+        seen: dict[str, str] = {}
+
+        async def fake_run(self: object, argv: list[str]) -> dict[str, object]:
+            seen["query"] = Path(argv[argv.index("--query") + 1]).read_text()
+            seen["params"] = Path(argv[argv.index("--params-file") + 1]).read_text()
+            return {}
+
+        monkeypatch.setattr(_CliClient, "_run", fake_run)
+        m = Mutation("query m($p_a: String) { insert P { a: $p_a } }", {"p_a": "1"})
+        await _client().mutate(m, branch="main")
+        assert seen["query"] == m.expr
+        assert json.loads(seen["params"]) == {"p_a": "1"}
+
+    def test_merge_argv_has_no_cas_flag(self) -> None:
+        argv = _client()._merge_argv("scratch", into="main")
+        assert "--if-commit" not in argv
+        assert "branch" in argv and "merge" in argv
+
+    def test_init_takes_uri_positionally(self) -> None:
+        argv = _client()._init_argv("/tmp/s.pg")
+        assert "--schema" in argv and "/tmp/s.pg" in argv
+        assert argv[-1] == "file:///tmp/g.omni"  # positional, not --store
+        assert "--store" not in argv
+
+
+def _node(op: str, slug: str, name: str = "Source") -> ogt._NodeAction:
+    return ogt._NodeAction(
+        op,
+        _TypeKey("og", "node", name),
+        name,
+        (PropertyValue("slug", "String", slug),),
+        derive_coco_key((slug,)),
+    )
+
+
+def _edge(op: str, a: str, b: str) -> ogt._EdgeAction:
+    return ogt._EdgeAction(
+        op,
+        _TypeKey("og", "edge", "Supports"),
+        "Supports",
+        derive_coco_key((a, b)),
+        a,
+        b,
+        (),
+        "Source",
+        "Claim",
+        ("slug",),
+        ("slug",),
+    )
+
+
+class TestCombineMutations:
+    def test_single_is_unchanged_in_effect(self) -> None:
+        m = combine_mutations(
+            [
+                Mutation(
+                    "query m($p_a: String) { insert P { a: $p_a } }",
+                    {"p_a": "1"},
+                    (("p_a", "String"),),
+                    "insert P { a: $p_a }",
+                )
+            ]
+        )
+        assert m.params == {"s0_p_a": "1"}
+        assert m.expr == "query m($s0_p_a: String) { insert P { a: $s0_p_a } }"
+
+    def test_colliding_param_names_are_reprefixed(self) -> None:
+        one = Mutation(
+            "",
+            {"p_coco_key": "A"},
+            (("p_coco_key", "String"),),
+            "insert P { coco_key: $p_coco_key }",
+        )
+        two = Mutation(
+            "",
+            {"p_coco_key": "B"},
+            (("p_coco_key", "String"),),
+            "insert P { coco_key: $p_coco_key }",
+        )
+        m = combine_mutations([one, two])
+        assert m.params == {"s0_p_coco_key": "A", "s1_p_coco_key": "B"}
+        assert "$s0_p_coco_key" in m.expr and "$s1_p_coco_key" in m.expr
+        assert m.expr.count("insert P") == 2
+        assert m.expr.count("query m(") == 1
+
+    def test_empty_raises(self) -> None:
+        with pytest.raises(ValueError):
+            combine_mutations([])
+
+
+class TestPlanCommits:
+    def test_upsert_only_is_one_commit(self) -> None:
+        assert len(plan_commits([_node("upsert", f"s{i}") for i in range(5)])) == 1
+
+    def test_upserts_and_deletes_never_share_a_commit(self) -> None:
+        commits = plan_commits([_node("upsert", "a"), _node("delete", "gone")])
+        assert len(commits) == 2
+        for c in commits:
+            assert not ("insert" in c.expr and "delete" in c.expr)
+
+    def test_replace_deletes_before_it_inserts(self) -> None:
+        """Delete selects on coco_key and the replacement reuses it — insert-first
+        would delete the new edge too. Verified against the engine."""
+        commits = plan_commits([_edge("replace", "a", "b")])
+        exprs = [c.expr for c in commits]
+        del_i = next(i for i, e in enumerate(exprs) if "delete Supports" in e)
+        ins_i = next(i for i, e in enumerate(exprs) if "insert Supports" in e)
+        assert del_i < ins_i
+
+    def test_three_phases_when_replace_and_removal_coexist(self) -> None:
+        commits = plan_commits([_edge("replace", "a", "b"), _node("delete", "gone")])
+        assert len(commits) == 3
+
+    def test_edge_insert_has_no_endpoint_stubs(self) -> None:
+        """Endpoint stubs are no longer emitted unconditionally by
+        plan_commits — a keyed insert is a full-record replace in Omnigraph
+        (verified against the engine), so stubbing every edge's endpoints
+        would silently null out a node's other nullable properties. The
+        sink builds a stub reactively, only after an insert fails with a
+        "not found" error for that specific endpoint — see
+        TestEndpointRetryLive."""
+        (commit,) = plan_commits([_edge("insert", "a", "b")])
+        assert "insert Source" not in commit.expr
+        assert "insert Claim" not in commit.expr
+        assert "insert Supports" in commit.expr
+
+    def test_node_upserts_precede_edge_inserts_whatever_the_action_order(
+        self,
+    ) -> None:
+        """Actions reach `plan_commits` in reconcile order, which is not the
+        commit order they need: here the edge is listed first, and both its
+        endpoints' upserts are listed after it. Appending in arrival order
+        would emit the edge insert ahead of the nodes it references, inside
+        the same commit, and the engine would refuse it."""
+        commits = plan_commits(
+            [
+                _edge("insert", "a", "b"),
+                _node("upsert", "a"),
+                _node("upsert", "b", name="Claim"),
+            ]
+        )
+        (phase_b,) = commits
+        assert phase_b.expr.index("insert Source") < phase_b.expr.index(
+            "insert Supports"
+        )
+        assert phase_b.expr.index("insert Claim") < phase_b.expr.index(
+            "insert Supports"
+        )
+
+    def test_endpoint_refs_are_always_string(self) -> None:
+        """An edge's `from`/`to` holds the endpoint's node `id`, which is a
+        String whatever the key's declared type is: passing an `I64` for an
+        `I64`-keyed endpoint is refused outright ("cannot assign/compare I64
+        with String for property `to`", verified against the engine). The
+        pg_type used to be inferred from the value's Python type, so any
+        non-string-keyed endpoint — an int-keyed Meeting, say — failed on
+        every edge insert."""
+        action = ogt._EdgeAction(
+            "insert",
+            _TypeKey("og", "edge", "Attended"),
+            "Attended",
+            derive_coco_key(("Ada", 7)),
+            "Ada",
+            7,
+            (),
+            "Person",
+            "Meeting",
+            ("name",),
+            ("meeting_id",),
+        )
+        (commit,) = plan_commits([action])
+        assert "$s0_e_to: String" in commit.expr
+        assert "$s0_e_to: I64" not in commit.expr
+        assert commit.params["s0_e_to"] == "7"
+        assert commit.params["s0_e_from"] == "Ada"
+        # ...but the coco_key still derives from the ORIGINAL values, so it
+        # matches what `_EdgeHandler` tracked and what a later delete selects.
+        assert commit.params["s0_p_coco_key"] == derive_coco_key(("Ada", 7))
+
+    def test_edge_deletes_precede_node_deletes(self) -> None:
+        commits = plan_commits([_edge("delete", "a", "b"), _node("delete", "a")])
+        joined = " || ".join(c.expr for c in commits)
+        assert joined.index("delete Supports") < joined.index("delete Source")
+
+    def test_chunks_when_over_the_cap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(ogt, "_MAX_ENTITIES_PER_TYPE", 4)
+        assert len(plan_commits([_node("upsert", f"s{i}") for i in range(10)])) == 3
+
+    def test_cap_is_per_type_not_global(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(ogt, "_MAX_ENTITIES_PER_TYPE", 4)
+        actions = [_node("upsert", f"s{i}") for i in range(3)]
+        actions += [_node("upsert", f"c{i}", name="Claim") for i in range(3)]
+        assert len(plan_commits(actions)) == 1
+
+    def test_a_total_cap_bounds_the_commit_across_types(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The per-type cap is deliberate, but on its own it bounded nothing:
+        N types each at the cap produced ONE commit of N x cap entities
+        (10 types measured at ~9.5 MB of GQ), and
+        `_mutate_with_endpoint_retry` re-sends the whole commit on every
+        endpoint-stub retry.
+        """
+        monkeypatch.setattr(ogt, "_MAX_ENTITIES_PER_TYPE", 4)
+        monkeypatch.setattr(ogt, "_MAX_ENTITIES_PER_COMMIT", 5)
+        actions = [_node("upsert", f"s{i}") for i in range(3)]
+        actions += [_node("upsert", f"c{i}", name="Claim") for i in range(3)]
+        commits = plan_commits(actions)
+        assert len(commits) > 1
+        assert max(c.expr.count("insert ") for c in commits) <= 5
+
+    def test_mixed_workload_respects_all_phase_invariants(self) -> None:
+        """One call exercising all four action kinds together — a node
+        upsert, an edge replace, an edge removal, and a node removal — the
+        exact combination the three-phase design exists to keep safe. The
+        commit sequence must never delete something it just wrote, and
+        never write something it is about to delete; verified directly via
+        each mutation's own bound coco_key, not just by argument."""
+        replace_coco_key = derive_coco_key(("r1", "r2"))
+        removed_edge_coco_key = derive_coco_key(("d1", "d2"))
+        removed_node_coco_key = derive_coco_key(("gone",))
+
+        actions = [
+            _node("upsert", "keep"),
+            _edge("replace", "r1", "r2"),
+            _edge("delete", "d1", "d2"),
+            _node("delete", "gone"),
+        ]
+        commits = plan_commits(actions)
+        assert len(commits) == 3
+        phase_a, phase_b, phase_c = commits
+
+        # Phase A: only the replace's own delete — nothing written yet.
+        assert "delete Supports" in phase_a.expr
+        assert "insert" not in phase_a.expr
+        assert replace_coco_key in phase_a.params.values()
+
+        # Phase B: the kept node's upsert and the replace's re-insert,
+        # under the SAME coco_key phase A just deleted — never landing
+        # without that delete having already applied ahead of it.
+        assert "insert Source" in phase_b.expr
+        assert "insert Supports" in phase_b.expr
+        assert "delete" not in phase_b.expr
+        assert replace_coco_key in phase_b.params.values()
+        # ...and the node comes FIRST. Statements in a combined query
+        # execute in the order written, so an edge insert ahead of its own
+        # endpoint's upsert would fail "not found" and force the sink's
+        # stub-and-retry recovery on every single run.
+        assert phase_b.expr.index("insert Source") < phase_b.expr.index(
+            "insert Supports"
+        )
+
+        # Phase C: the two removals, edge before node, under coco_keys that
+        # never appear in phase B — nothing here was just written.
+        assert phase_c.expr.index("delete Supports") < phase_c.expr.index(
+            "delete Source"
+        )
+        assert removed_edge_coco_key in phase_c.params.values()
+        assert removed_node_coco_key in phase_c.params.values()
+        assert replace_coco_key not in phase_c.params.values()
+        assert not set(phase_c.params.values()) & set(phase_b.params.values())
+
+
+class TestPlanCommitsEncoding:
+    @pytest.mark.asyncio
+    async def test_date_and_datetime_properties_survive_json_dumps(self) -> None:
+        """A dataclass with date/datetime/optional fields must round-trip
+        through plan_commits into a Mutation whose params survive
+        json.dumps — this is what _CliClient._mutate_argv does with them."""
+
+        @dataclass
+        class _Event:
+            slug: str
+            on: datetime.date
+            at: datetime.datetime
+            note: str | None
+
+        schema = await NodeSchema.from_class(_Event, key="slug")
+        handler = _NodeHandler(
+            "Event", ("slug",), _TypeKey("og", "node", "Event"), schema.properties
+        )
+        out = handler.reconcile(
+            "e1",
+            _NodeValue(
+                {
+                    "slug": "e1",
+                    "on": datetime.date(2026, 1, 1),
+                    "at": datetime.datetime(2026, 1, 1, 12, 0),
+                    "note": None,
+                }
+            ),
+            [],
+            False,
+        )
+        assert out is not None
+        (commit,) = plan_commits([out.action])
+        json.dumps(commit.params)  # must not raise
+        # plan_commits always runs a chunk through combine_mutations, even a
+        # single one — so params carry the `s0_` commit prefix.
+        assert commit.params["s0_p_on"] == "2026-01-01"
+        assert commit.params["s0_p_at"] == "2026-01-01T12:00:00"
+        assert commit.params["s0_p_note"] is None
+
+
+class TestBuildEndpointStub:
+    def test_delete_actions_are_not_stub_candidates(self) -> None:
+        """A delete `_EdgeAction` carries `from_id=None`/`to_id=None`, so
+        `str(action.from_id)` is the literal `"None"`.
+
+        A node whose key value is the string `"None"` therefore matched a
+        delete action, and `_stub_key_ref(None)` raised `TypeError: no
+        Omnigraph type mapping for <class 'NoneType'>` from inside the sink —
+        an uncaught TypeError rather than an `OmnigraphCliError`, aborting the
+        whole component's sync mid-scratch-branch. A delete needs no endpoints
+        anyway: deleting by `coco_key` never touches them.
+        """
+        h = _edge_handler()
+        first = h.reconcile(("a", "b"), _EdgeValue("a", "b", {}), [], False)
+        assert first is not None
+        assert not isinstance(first.tracking_record, coco.NonExistenceType)
+        deleted = h.reconcile(
+            ("a", "b"), coco.NON_EXISTENCE, [first.tracking_record], False
+        )
+        assert deleted is not None and deleted.action.op == "delete"
+
+        assert (
+            ogt._build_endpoint_stub("src", "None", "Source", [deleted.action]) is None
+        )
+
+
+class TestApplyEntityActions:
+    @pytest.mark.asyncio
+    async def test_branch_create_failure_propagates_original_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Cleanup must never mask the original failure: if branch_create
+        itself fails, branch_delete(scratch) has nothing to delete and
+        raises too — that second error must be suppressed so the original
+        branch_create failure is what actually propagates."""
+
+        async def fake_branch_create(self: object, name: str, *, frm: str) -> None:
+            raise OmnigraphCliError("branch create failed: disk full")
+
+        async def fake_branch_delete(self: object, name: str) -> None:
+            raise OmnigraphCliError(f"branch {name!r} does not exist")
+
+        monkeypatch.setattr(_CliClient, "branch_create", fake_branch_create)
+        monkeypatch.setattr(_CliClient, "branch_delete", fake_branch_delete)
+
+        db = ContextKey[ConnectionFactory](f"test_db_{uuid.uuid4().hex}")
+        cp = ContextProvider()
+        cp.provide(db, ConnectionFactory(store="file:///tmp/whatever.omni"))
+
+        key = _TypeKey(db.key, "node", "Source")
+        actions: list[ogt._NodeAction | ogt._EdgeAction] = [
+            ogt._NodeAction(
+                "upsert",
+                key,
+                "Source",
+                (PropertyValue("slug", "String", "a"),),
+                derive_coco_key(("a",)),
+            ),
+            ogt._NodeAction(
+                "delete",
+                key,
+                "Source",
+                (),
+                derive_coco_key(("gone",)),
+            ),
+        ]
+        with pytest.raises(OmnigraphCliError, match="branch create failed"):
+            await ogt._apply_entity_actions(cp, actions)
+
+    @pytest.mark.asyncio
+    async def test_single_commit_skips_the_scratch_branch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A batch that plans down to exactly one commit must go straight to
+        `mutate` on the real branch — no branch_create/branch_merge at all."""
+        calls: list[str] = []
+
+        async def fake_mutate(self: object, mutation: Mutation, *, branch: str) -> None:
+            calls.append(f"mutate:{branch}")
+
+        async def fake_branch_create(self: object, name: str, *, frm: str) -> None:
+            calls.append("branch_create")
+
+        monkeypatch.setattr(_CliClient, "mutate", fake_mutate)
+        monkeypatch.setattr(_CliClient, "branch_create", fake_branch_create)
+
+        db = ContextKey[ConnectionFactory](f"test_db_{uuid.uuid4().hex}")
+        cp = ContextProvider()
+        cp.provide(
+            db, ConnectionFactory(store="file:///tmp/whatever.omni", branch="main")
+        )
+
+        key = _TypeKey(db.key, "node", "Source")
+        actions: list[ogt._NodeAction | ogt._EdgeAction] = [
+            ogt._NodeAction(
+                "upsert",
+                key,
+                "Source",
+                (PropertyValue("slug", "String", "a"),),
+                derive_coco_key(("a",)),
+            ),
+        ]
+        await ogt._apply_entity_actions(cp, actions)
+        assert calls == ["mutate:main"]
+
+    @pytest.mark.asyncio
+    async def test_missing_endpoint_escalates_a_single_commit_to_a_branch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Recovering a missing endpoint takes TWO commits — the stub, then
+        the retried commit — so doing it on the live branch would leave an
+        orphan stub node behind, untracked and visible to readers, if the
+        retry then failed. The single-commit fast path therefore escalates
+        to the scratch branch the moment it sees a "not found", rather than
+        stubbing in place. Nothing is lost by the failed first attempt: a
+        failed mutation applies nothing."""
+        calls: list[str] = []
+
+        async def fake_mutate(self: object, mutation: Mutation, *, branch: str) -> None:
+            calls.append(f"mutate:{branch}")
+            if branch == "main":
+                raise OmnigraphCliError("dst 'c1' not found in Claim")
+
+        async def fake_branch_create(self: object, name: str, *, frm: str) -> None:
+            calls.append("branch_create")
+
+        async def fake_branch_merge(self: object, name: str, *, into: str) -> None:
+            calls.append("branch_merge")
+
+        async def fake_branch_delete(self: object, name: str) -> None:
+            calls.append("branch_delete")
+
+        monkeypatch.setattr(_CliClient, "mutate", fake_mutate)
+        monkeypatch.setattr(_CliClient, "branch_create", fake_branch_create)
+        monkeypatch.setattr(_CliClient, "branch_merge", fake_branch_merge)
+        monkeypatch.setattr(_CliClient, "branch_delete", fake_branch_delete)
+
+        db = ContextKey[ConnectionFactory](f"test_db_{uuid.uuid4().hex}")
+        cp = ContextProvider()
+        cp.provide(
+            db, ConnectionFactory(store="file:///tmp/whatever.omni", branch="main")
+        )
+
+        key = _TypeKey(db.key, "edge", "Supports")
+        actions: list[ogt._NodeAction | ogt._EdgeAction] = [
+            ogt._EdgeAction(
+                "insert",
+                key,
+                "Supports",
+                derive_coco_key(("s1", "c1")),
+                "s1",
+                "c1",
+                (),
+                "Source",
+                "Claim",
+                ("slug",),
+                ("slug",),
+            ),
+        ]
+        await ogt._apply_entity_actions(cp, actions)
+
+        # The failed live attempt, then the whole thing redone on scratch.
+        assert calls[0] == "mutate:main"
+        assert calls[1] == "branch_create"
+        assert "mutate:main" not in calls[1:]  # no stub written to the live branch
+        assert "branch_merge" in calls and calls[-1] == "branch_delete"
+
+
+class TestReadSchema:
+    """Unit coverage for read_schema's not-found detection, mocked so it
+    doesn't need the live binary — TestApplyTypeActionsLive below is what
+    proves it against the engine's actual wording."""
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_the_actual_dataset_not_found_wording(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Verified against the binary: the real message is `storage:
+        Dataset at path <path> was not found: Not found: ...` — "Dataset"
+        and "not found" are not adjacent, so a naive `"dataset not found"`
+        substring check would never match this."""
+
+        async def fake_run(self: object, argv: list[str]) -> dict[str, object]:
+            raise OmnigraphCliError(
+                "omnigraph schema show exited 1: Error: \n   0: storage: "
+                "Dataset at path /tmp/g.omni/__manifest was not found: "
+                "Not found: /tmp/g.omni/__manifest/_versions"
+            )
+
+        monkeypatch.setattr(_CliClient, "_run", fake_run)
+        assert await _client().read_schema() is None
+
+    @pytest.mark.asyncio
+    async def test_unrelated_error_propagates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unrelated failure that happens to say "not found" (a bad type
+        reference, say) must propagate as-is, not be read as "uninitialized"."""
+
+        async def fake_run(self: object, argv: list[str]) -> dict[str, object]:
+            raise OmnigraphCliError(
+                "omnigraph schema show exited 1: Error: \n   0: type "
+                "'Ghost' referenced in edge definition not found in schema"
+            )
+
+        monkeypatch.setattr(_CliClient, "_run", fake_run)
+        with pytest.raises(OmnigraphCliError, match="Ghost"):
+            await _client().read_schema()
+
+    @pytest.mark.asyncio
+    async def test_a_store_path_containing_dataset_is_not_read_as_uninitialized(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The store URI is echoed into the CLI's error text (verified against
+        the binary), so a store living under `~/datasets/` hands the word
+        "dataset" to *every* failure it ever reports.
+
+        Testing for "dataset" and "not found" as independent substrings
+        therefore misread any unrelated not-found failure on such a store as
+        "graph not initialized" — and `_apply_type_schema` would then take the
+        `init_graph` branch against a populated store. Match the engine's
+        actual phrasing instead.
+        """
+
+        async def fake_run(self: object, argv: list[str]) -> dict[str, object]:
+            raise OmnigraphCliError(
+                "omnigraph schema show exited 1: Error: \n   0: type 'Ghost' "
+                "referenced in edge definition not found in schema "
+                "(store file:///Users/me/datasets/kg.omni)"
+            )
+
+        monkeypatch.setattr(_CliClient, "_run", fake_run)
+        with pytest.raises(OmnigraphCliError, match="Ghost"):
+            await _client().read_schema()
+
+
+class TestApplyTypeSchema:
+    """Unit coverage for _apply_type_schema's init-vs-merge branching,
+    mocked so it doesn't need the live binary."""
+
+    @pytest.mark.asyncio
+    async def test_inits_when_graph_absent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[str] = []
+
+        async def fake_read_schema(self: object) -> str | None:
+            return None
+
+        async def fake_init_graph(self: object, pg_fragment: str) -> None:
+            calls.append(f"init:{pg_fragment}")
+
+        async def fake_apply_schema(self: object, pg_fragment: str) -> None:
+            calls.append(f"apply:{pg_fragment}")
+
+        monkeypatch.setattr(_CliClient, "read_schema", fake_read_schema)
+        monkeypatch.setattr(_CliClient, "init_graph", fake_init_graph)
+        monkeypatch.setattr(_CliClient, "apply_schema", fake_apply_schema)
+
+        fragment = "node A {\n  slug: String @key\n  coco_key: String\n}"
+        await ogt._apply_type_schema(_client(), [_type_action("insert", "A", fragment)])
+        assert calls == [f"init:{fragment}\n"]
+
+    @pytest.mark.asyncio
+    async def test_merges_when_graph_already_exists(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The exact bug this fix closes: a second type must be merged into
+        the existing schema, not applied alone (which would silently wipe
+        every other type — verified live) or re-inited (which fails
+        outright on an already-initialized store)."""
+        calls: list[str] = []
+        existing = "node A {\n  slug: String @key\n  coco_key: String\n}\n"
+
+        async def fake_read_schema(self: object) -> str | None:
+            return existing
+
+        async def fake_init_graph(self: object, pg_fragment: str) -> None:
+            raise AssertionError("must not re-init an already-initialized graph")
+
+        async def fake_apply_schema(self: object, pg_fragment: str) -> None:
+            calls.append(pg_fragment)
+
+        monkeypatch.setattr(_CliClient, "read_schema", fake_read_schema)
+        monkeypatch.setattr(_CliClient, "init_graph", fake_init_graph)
+        monkeypatch.setattr(_CliClient, "apply_schema", fake_apply_schema)
+
+        b_fragment = "node B {\n  slug: String @key\n  coco_key: String\n}"
+        await ogt._apply_type_schema(
+            _client(), [_type_action("insert", "B", b_fragment)]
+        )
+        (applied,) = calls
+        assert "node A {" in applied
+        assert "node B {" in applied
+
+    @pytest.mark.asyncio
+    async def test_replace_drops_then_re_adds_instead_of_merging_in_place(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A `@key` change can't go through the ordinary single-call merge
+        — the engine rejects it outright, verified live — so "replace"
+        must drive two separate `apply_schema` calls: one with the type's
+        block removed, one with it re-added under its new definition.
+        Other types must survive both calls untouched."""
+        calls: list[str] = []
+        a_old = "node A {\n  slug: String @key\n  coco_key: String\n}\n"
+        b = "node B {\n  slug: String @key\n  coco_key: String\n}\n"
+        existing = a_old + "\n" + b
+
+        async def fake_read_schema(self: object) -> str | None:
+            return existing
+
+        async def fake_init_graph(self: object, pg_fragment: str) -> None:
+            raise AssertionError("replace must not init")
+
+        async def fake_apply_schema(self: object, pg_fragment: str) -> None:
+            calls.append(pg_fragment)
+
+        monkeypatch.setattr(_CliClient, "read_schema", fake_read_schema)
+        monkeypatch.setattr(_CliClient, "init_graph", fake_init_graph)
+        monkeypatch.setattr(_CliClient, "apply_schema", fake_apply_schema)
+
+        a_new = "node A {\n  title: String @key\n  coco_key: String\n}"
+        await ogt._apply_type_schema(_client(), [_type_action("replace", "A", a_new)])
+
+        assert len(calls) == 2
+        drop_call, readd_call = calls
+        assert "node A" not in drop_call
+        assert "node B {" in drop_call
+        assert a_new in readd_call
+        assert "node B {" in readd_call
+
+    @pytest.mark.asyncio
+    async def test_removing_an_edge_leaves_a_same_named_node_alone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The removal half of the same collision: dropping the edge used
+        to delete the NODE's block and leave the edge in place."""
+        calls: list[str] = []
+        existing = (
+            "node Link {\n  slug: String @key\n  coco_key: String\n}\n\n"
+            "edge Link: A -> B {\n  coco_key: String\n}\n"
+        )
+
+        async def fake_read_schema(self: object) -> str | None:
+            return existing
+
+        async def fake_apply_schema(self: object, pg_fragment: str) -> None:
+            calls.append(pg_fragment)
+
+        monkeypatch.setattr(_CliClient, "read_schema", fake_read_schema)
+        monkeypatch.setattr(_CliClient, "apply_schema", fake_apply_schema)
+
+        await ogt._apply_type_schema(
+            _client(), [_type_action("delete", "Link", None, type_kind="edge")]
+        )
+        (applied,) = calls
+        assert "node Link {" in applied
+        assert "edge Link" not in applied
+
+    @pytest.mark.asyncio
+    async def test_a_name_used_as_both_kinds_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`schema apply` accepts `node Link` and `edge Link` together, but
+        a mutation resolves the name to the NODE type alone — `insert Link
+        { from: ..., to: ... }` fails with "type `Link` has no property
+        `from`" (verified against the binary). The edge type would exist and
+        be unwritable, so declaring the second one has to fail loudly."""
+
+        async def fake_read_schema(self: object) -> str | None:
+            return "node Link {\n  slug: String @key\n  coco_key: String\n}\n"
+
+        async def fail_apply(self: object, pg_fragment: str) -> None:
+            raise AssertionError("must not write a schema with a clashing name")
+
+        monkeypatch.setattr(_CliClient, "read_schema", fake_read_schema)
+        monkeypatch.setattr(_CliClient, "apply_schema", fail_apply)
+
+        frag = render_edge_type("Link", "A", "B", [])
+        with pytest.raises(ValueError, match="already used by a node type"):
+            await ogt._apply_type_schema(
+                _client(), [_type_action("insert", "Link", frag, type_kind="edge")]
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_name_used_as_both_kinds_in_one_batch_is_refused_on_a_fresh_graph(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The clash check used to sit AFTER the uninitialized-graph early
+        return, so on a fresh graph it was never reached at all — the sink
+        happily `init`ed a schema containing both `node Link` and `edge Link`,
+        creating the permanently-unwritable edge type the check exists to
+        prevent."""
+
+        async def fake_read_schema(self: object) -> str | None:
+            return None
+
+        async def fail_init(self: object, pg_fragment: str) -> None:
+            raise AssertionError("must not init a schema with a clashing name")
+
+        monkeypatch.setattr(_CliClient, "read_schema", fake_read_schema)
+        monkeypatch.setattr(_CliClient, "init_graph", fail_init)
+
+        with pytest.raises(ValueError, match="both a node and an edge"):
+            await ogt._apply_type_schema(
+                _client(),
+                [
+                    _type_action(
+                        "insert", "Link", "node Link {\n  slug: String @key\n}"
+                    ),
+                    _type_action(
+                        "insert",
+                        "Link",
+                        render_edge_type("Link", "A", "B", []),
+                        type_kind="edge",
+                    ),
+                ],
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_name_used_as_both_kinds_in_one_batch_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The live-schema check can only see types ALREADY in the graph, so
+        a node and an edge of the same name arriving together in one sync slip
+        past it — neither is in `existing` yet."""
+
+        async def fake_read_schema(self: object) -> str | None:
+            return "node Other {\n  slug: String @key\n  coco_key: String\n}\n"
+
+        async def fail_apply(self: object, pg_fragment: str) -> None:
+            raise AssertionError("must not write a schema with a clashing name")
+
+        monkeypatch.setattr(_CliClient, "read_schema", fake_read_schema)
+        monkeypatch.setattr(_CliClient, "apply_schema", fail_apply)
+
+        with pytest.raises(ValueError, match="both a node and an edge"):
+            await ogt._apply_type_schema(
+                _client(),
+                [
+                    _type_action(
+                        "insert", "Link", "node Link {\n  slug: String @key\n}"
+                    ),
+                    _type_action(
+                        "insert",
+                        "Link",
+                        render_edge_type("Link", "A", "B", []),
+                        type_kind="edge",
+                    ),
+                ],
+            )
+
+    @pytest.mark.asyncio
+    async def test_drop_removes_the_type_block(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A "drop" used to be a silent no-op: the sink returned no child
+        handler and wrote nothing. But when a container target state
+        disappears the engine emits no per-child deletes, so this apply is
+        the ONLY thing that removes a dropped type's rows — without it, the
+        type and every node in it persist forever, untracked and
+        unreachable."""
+        calls: list[str] = []
+        existing = (
+            "node A {\n  slug: String @key\n  coco_key: String\n}\n\n"
+            "node B {\n  slug: String @key\n  coco_key: String\n}\n"
+        )
+
+        async def fake_read_schema(self: object) -> str | None:
+            return existing
+
+        async def fake_apply_schema(self: object, pg_fragment: str) -> None:
+            calls.append(pg_fragment)
+
+        monkeypatch.setattr(_CliClient, "read_schema", fake_read_schema)
+        monkeypatch.setattr(_CliClient, "apply_schema", fake_apply_schema)
+
+        await ogt._apply_type_schema(_client(), [_type_action("delete", "A", None)])
+        (applied,) = calls
+        assert "node A" not in applied
+        assert "node B {" in applied
+
+    @pytest.mark.asyncio
+    async def test_batch_reads_once_and_writes_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every type action for one graph arrives in a single sink call, so
+        the batch costs one read-merge-write, not one per action. Folding
+        them in memory is also what makes the result correct: each fragment
+        merges into the previous fold rather than into a stale re-read."""
+        reads, applies = [0], []
+        existing = "node A {\n  slug: String @key\n  coco_key: String\n}\n"
+
+        async def fake_read_schema(self: object) -> str | None:
+            reads[0] += 1
+            return existing
+
+        async def fake_apply_schema(self: object, pg_fragment: str) -> None:
+            applies.append(pg_fragment)
+
+        monkeypatch.setattr(_CliClient, "read_schema", fake_read_schema)
+        monkeypatch.setattr(_CliClient, "apply_schema", fake_apply_schema)
+
+        await ogt._apply_type_schema(
+            _client(),
+            [
+                _type_action(
+                    "insert",
+                    "B",
+                    "node B {\n  slug: String @key\n  coco_key: String\n}",
+                ),
+                _type_action(
+                    "insert",
+                    "C",
+                    "node C {\n  slug: String @key\n  coco_key: String\n}",
+                ),
+                _type_action("delete", "A", None),
+            ],
+        )
+        assert reads == [1]
+        assert len(applies) == 1
+        assert "node A" not in applies[0]
+        assert "node B {" in applies[0] and "node C {" in applies[0]
+
+    @pytest.mark.asyncio
+    async def test_noop_batch_does_not_touch_the_schema(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An all-noop batch must not even read the schema — an unchanged
+        run is the common case and should cost zero CLI invocations."""
+
+        async def fail(self: object, *args: object) -> None:
+            raise AssertionError("a noop batch must issue no schema calls")
+
+        monkeypatch.setattr(_CliClient, "read_schema", fail)
+        monkeypatch.setattr(_CliClient, "apply_schema", fail)
+        monkeypatch.setattr(_CliClient, "init_graph", fail)
+
+        await ogt._apply_type_schema(_client(), [_type_action(None, "A", "node A {}")])
+
+    @pytest.mark.asyncio
+    async def test_batch_with_a_replace_lands_the_removal_first(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The one case that still needs two writes: a replaced type must be
+        gone from a COMMITTED schema before it comes back under its new
+        definition. Types changing alongside it ride along in the second
+        apply, not a third."""
+        calls: list[str] = []
+        existing = (
+            "node A {\n  slug: String @key\n  coco_key: String\n}\n\n"
+            "node B {\n  slug: String @key\n  coco_key: String\n}\n"
+        )
+
+        async def fake_read_schema(self: object) -> str | None:
+            return existing
+
+        async def fake_apply_schema(self: object, pg_fragment: str) -> None:
+            calls.append(pg_fragment)
+
+        monkeypatch.setattr(_CliClient, "read_schema", fake_read_schema)
+        monkeypatch.setattr(_CliClient, "apply_schema", fake_apply_schema)
+
+        a_new = "node A {\n  title: String @key\n  coco_key: String\n}"
+        b_new = "node B {\n  slug: String @key\n  note: String?\n  coco_key: String\n}"
+        await ogt._apply_type_schema(
+            _client(),
+            [
+                _type_action("replace", "A", a_new),
+                _type_action(None, "B", b_new, property_actions={"prop:x": "insert"}),
+            ],
+        )
+
+        assert len(calls) == 2
+        removal, final = calls
+        assert "node A" not in removal
+        assert "node B {" in removal
+        assert a_new in final
+        assert "note: String?" in final
+
+
+# ---------------------------------------------------------------------------
+# Public API surface: NodeTarget/EdgeTarget, the twelve entry points, aliases.
+# ---------------------------------------------------------------------------
+
+
+class TestOrphanedEdgeEndpoints:
+    """Removing a node type that an edge type still points at.
+
+    The engine rejects the resulting schema outright (`catalog error: edge
+    'WorksAt' has an unresolved endpoint`, verified against the binary), and
+    edge types reconcile under a separate provider so they are never in the
+    same batch to be removed alongside.
+    """
+
+    SCHEMA = (
+        "node Person {\n  slug: String @key\n  coco_key: String\n}\n"
+        "node Company {\n  slug: String @key\n  coco_key: String\n}\n"
+        "edge WorksAt: Person -> Company {\n  coco_key: String\n}\n"
+    )
+
+    @staticmethod
+    def _mock(monkeypatch: pytest.MonkeyPatch, schema: str) -> None:
+        async def fake_read_schema(self: object) -> str | None:
+            return schema
+
+        async def fail_apply(self: object, pg_fragment: str) -> None:
+            raise AssertionError("must not write a schema with a dangling endpoint")
+
+        monkeypatch.setattr(_CliClient, "read_schema", fake_read_schema)
+        monkeypatch.setattr(_CliClient, "apply_schema", fail_apply)
+
+    @pytest.mark.asyncio
+    async def test_dropping_a_referenced_node_type_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._mock(monkeypatch, self.SCHEMA)
+        with pytest.raises(ValueError, match="WorksAt"):
+            await ogt._apply_type_schema(
+                _client(), [_type_action("delete", "Person", None)]
+            )
+
+    @pytest.mark.asyncio
+    async def test_key_changing_a_referenced_node_type_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A `@key` change is a drop-and-recreate: the FIRST of its two
+        applies lands the schema with the node type removed, so the dangling
+        endpoint appears there even though the final schema would be sound."""
+        self._mock(monkeypatch, self.SCHEMA)
+        with pytest.raises(ValueError, match="WorksAt"):
+            await ogt._apply_type_schema(
+                _client(),
+                [
+                    _type_action(
+                        "replace",
+                        "Person",
+                        "node Person {\n  email: String @key\n  coco_key: String\n}",
+                    )
+                ],
+            )
+
+    @pytest.mark.asyncio
+    async def test_dropping_the_edge_type_too_is_allowed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Removing both together leaves nothing dangling, so it must pass."""
+        applied: list[str] = []
+
+        async def fake_read_schema(self: object) -> str | None:
+            return self_schema
+
+        self_schema = self.SCHEMA
+
+        async def record_apply(self: object, pg_fragment: str) -> None:
+            applied.append(pg_fragment)
+
+        monkeypatch.setattr(_CliClient, "read_schema", fake_read_schema)
+        monkeypatch.setattr(_CliClient, "apply_schema", record_apply)
+
+        await ogt._apply_type_schema(
+            _client(),
+            [
+                _type_action("delete", "WorksAt", None, type_kind="edge"),
+                _type_action("delete", "Person", None),
+            ],
+        )
+        assert applied and "Person" not in applied[-1]
+        assert "WorksAt" not in applied[-1]
+
+
+class TestPublicSurface:
+    def test_aliases_are_the_same_objects(self) -> None:
+        assert omnigraph.TableTarget is omnigraph.NodeTarget
+        assert omnigraph.RelationTarget is omnigraph.EdgeTarget
+        assert omnigraph.TableSchema is omnigraph.NodeSchema
+        assert omnigraph.ColumnDef is omnigraph.PropertyDef
+        assert omnigraph.mount_table_target is omnigraph.mount_node_target
+        assert omnigraph.mount_relation_target is omnigraph.mount_edge_target
+        assert omnigraph.declare_table_target is omnigraph.declare_node_target
+        assert omnigraph.declare_relation_target is omnigraph.declare_edge_target
+        assert omnigraph.table_target is omnigraph.node_target
+        assert omnigraph.relation_target is omnigraph.edge_target
+
+    def test_method_aliases(self) -> None:
+        # mypy can't statically resolve a bound-method identity check through
+        # a generic class accessed via the class itself (rather than an
+        # instance) — the objects are the same regardless of instantiation.
+        assert omnigraph.NodeTarget.declare_record is omnigraph.NodeTarget.declare_node  # type: ignore[misc]
+        assert (
+            omnigraph.EdgeTarget.declare_relation  # type: ignore[misc]
+            is omnigraph.EdgeTarget.declare_edge
+        )
+
+    def test_all_is_sorted_and_complete(self) -> None:
+        assert omnigraph.__all__ == sorted(omnigraph.__all__)
+        for name in omnigraph.__all__:
+            assert hasattr(omnigraph, name), name
+
+
+# ---------------------------------------------------------------------------
+# Endpoint key-field wiring: Task 9's stub-and-retry recovery reads
+# `_EdgeAction.from_key_fields`/`to_key_fields`, sourced from
+# `_TypeSpec.from_key_fields`/`to_key_fields`. Nothing populated those until
+# `edge_target()` (this task) does — without this wiring the fields silently
+# default to `()` and the recovery mechanism never fires. See
+# `test_endpoint_metadata_is_carried_for_stubs` above for the handler-level
+# half of this same contract.
+# ---------------------------------------------------------------------------
+
+
+def _bare_node_target(schema: NodeSchema, type_name: str) -> omnigraph.NodeTarget[Any]:
+    """A NodeTarget with no real provider — valid for tests that only read
+    `.schema`/`.type_name` (spec construction, validation) and never declare
+    an actual node through it."""
+    return omnigraph.NodeTarget(None, schema, type_name)  # type: ignore[arg-type]
+
+
+class TestNodeTargetKeyValidation:
+    def test_keyless_schema_is_refused(self) -> None:
+        """A hand-built `NodeSchema` with an empty key must be refused at
+        mount, not silently collapse every row onto one target state.
+
+        `NodeSchema` is public and in `__all__`; only `from_class` enforces a
+        non-empty key, and the optional `key=` kwarg is only cross-checked
+        when supplied. Without this guard the type renders with no `@key`,
+        every row derives the SAME `coco_key` from the empty key tuple, all
+        rows share one StableKey (last write wins in tracking), and an
+        unkeyed Omnigraph insert is a strict insert that duplicates on every
+        re-run. `_validate_edge_endpoint` already has this guard — but only
+        for types used as endpoints.
+        """
+        db = ContextKey[ConnectionFactory]("og_keyless")
+        schema = NodeSchema(properties={"slug": PropertyDef("slug", "String")}, key=())
+        with pytest.raises(ValueError, match="must declare a key"):
+            omnigraph.node_target(db, "Node", schema)
+
+
+class TestRecordToDict:
+    """`_record_to_dict` is the seam every declared row passes through, so a
+    field name it silently mishandles becomes an opaque engine error."""
+
+    @staticmethod
+    def _schema() -> NodeSchema:
+        return NodeSchema(
+            properties={
+                "slug": PropertyDef("slug", "String"),
+                "title": PropertyDef("title", "String?"),
+                "note": PropertyDef("note", "String"),
+            },
+            key=("slug",),
+        )
+
+    def test_unknown_dict_key_is_refused(self) -> None:
+        """A misspelled field used to vanish: every declared property came
+        back `None`, the key's `coco_key` was derived from `None`, and the
+        engine rejected a null into a non-nullable `@key` column with nothing
+        naming the typo."""
+        with pytest.raises(ValueError, match="slgu"):
+            ogt._record_to_dict({"slgu": "a", "note": "n"}, self._schema())
+
+    def test_missing_non_nullable_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="note"):
+            ogt._record_to_dict({"slug": "a"}, self._schema())
+
+    def test_missing_nullable_defaults_to_none(self) -> None:
+        """Omitting a nullable property is legitimate — that is what nullable
+        means — so only non-nullable omissions are an error."""
+        assert ogt._record_to_dict({"slug": "a", "note": "n"}, self._schema()) == {
+            "slug": "a",
+            "title": None,
+            "note": "n",
+        }
+
+
+class TestEdgeTargetKeyFieldWiring:
+    def test_edge_target_populates_endpoint_key_fields(self) -> None:
+        # Key-only schemas — this test is about key-field wiring, not the
+        # stub-compatibility guard (see test_mount_edge_rejects_unstubbable_
+        # endpoint below for that), so neither endpoint may carry a
+        # non-nullable non-key property or `_build_edge_spec` would raise
+        # before we get there.
+        source = _bare_node_target(
+            NodeSchema(
+                properties={"slug": PropertyDef("slug", "String")}, key=("slug",)
+            ),
+            "Source",
+        )
+        claim = _bare_node_target(
+            NodeSchema(
+                properties={"slug": PropertyDef("slug", "String")}, key=("slug",)
+            ),
+            "Claim",
+        )
+        # `_build_edge_spec` is the pure seam `edge_target()` uses to build
+        # its `_TypeSpec` — asserting on it directly (rather than reaching
+        # into `coco.TargetState`'s private value) proves the wiring without
+        # depending on coco internals.
+        spec = ogt._build_edge_spec(
+            NodeSchema(properties=_SUPPORTS_PROPS, key=()),
+            source,
+            claim,
+            ManagedBy.SYSTEM,
+        )
+        assert spec.from_key_fields == ("slug",)
+        assert spec.to_key_fields == ("slug",)
+
+        # Reconcile the spec through the real handler chain, exactly as the
+        # engine would, to prove the field actually reaches `_EdgeAction` —
+        # not just `_TypeSpec`.
+        out = _EdgeTypeHandler().reconcile(_EK, spec, [], False)
+        assert out is not None
+        assert not coco.is_non_existence(out.action.spec)
+        assert out.action.spec.from_key_fields == ("slug",)
+        assert out.action.spec.to_key_fields == ("slug",)
+
+        handler = _EdgeHandler(
+            "Supports",
+            _EK,
+            "Source",
+            "Claim",
+            out.action.spec.from_key_fields,
+            out.action.spec.to_key_fields,
+            _SUPPORTS_PROPS,
+        )
+        edge_out = handler.reconcile(
+            ("s1", "c1"), _EdgeValue("s1", "c1", {}), [], False
+        )
+        assert edge_out is not None
+        assert edge_out.action.from_key_fields == ("slug",)
+        assert edge_out.action.to_key_fields == ("slug",)
+
+
+# ---------------------------------------------------------------------------
+# mount-time validation: an endpoint type with a non-nullable, non-key
+# property can never be stubbed, so referencing it as an edge endpoint must
+# fail at mount time, not mid-sync from an unrelated component.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _Strict:
+    slug: str
+    required: str  # non-null, outside the key -> stub would be rejected
+
+
+@dataclass
+class _StubbableClaim:
+    slug: str
+
+
+async def _declare_bad_edge(db: coco.ContextKey[ConnectionFactory]) -> None:
+    strict = omnigraph.declare_node_target(
+        db, "Strict", await omnigraph.NodeSchema.from_class(_Strict, key="slug")
+    )
+    claims = omnigraph.declare_node_target(
+        db, "Claim", await omnigraph.NodeSchema.from_class(_StubbableClaim, key="slug")
+    )
+    # `strict`/`claims` are PendingS (declared, not yet synced) — fine for
+    # this test, since the guard only reads `.schema`/`.type_name`, both
+    # already in hand at declare time. `mount_edge_target`'s endpoint params
+    # default to ResolvedS, so mypy flags the mismatch even though nothing
+    # here depends on the endpoints having actually synced.
+    await omnigraph.mount_edge_target(db, "Bad", strict, claims)  # type: ignore[arg-type]
+
+
+def test_mount_edge_rejects_unstubbable_endpoint() -> None:
+    """Endpoint validation must fire before any I/O — `declare_node_target`
+    only registers a declaration (no store touched, no CLI invoked), so this
+    needs no live binary and no OMNIGRAPH_TEST_STORE gate."""
+    db = coco.ContextKey[ConnectionFactory](f"test_unstubbable_{uuid.uuid4().hex}")
+    coco_env.context_provider.provide(
+        db, ConnectionFactory(store="file:///tmp/never-touched-by-this-test.omni")
+    )
+    app = coco.App(
+        coco.AppConfig(
+            name="test_mount_edge_rejects_unstubbable_endpoint", environment=coco_env
+        ),
+        _declare_bad_edge,
+        db,
+    )
+    with pytest.raises(ValueError, match="cannot be referenced as an edge endpoint"):
+        app.update_blocking()
+
+
+@dataclass
+class _DateKeyed:
+    day: datetime.date
+
+
+async def _declare_date_keyed_edge(db: coco.ContextKey[ConnectionFactory]) -> None:
+    days = omnigraph.declare_node_target(
+        db, "Day", await omnigraph.NodeSchema.from_class(_DateKeyed, key="day")
+    )
+    claims = omnigraph.declare_node_target(
+        db, "Claim", await omnigraph.NodeSchema.from_class(_StubbableClaim, key="slug")
+    )
+    await omnigraph.mount_edge_target(db, "On", claims, days)  # type: ignore[arg-type]
+
+
+def test_mount_edge_rejects_an_endpoint_key_it_cannot_render() -> None:
+    """An edge addresses an endpoint by the node's `id`, a String rendering
+    of the key value — and the engine's rendering of a `Date` key is days
+    since the epoch (2026-01-05 -> `"20458"`), which nothing on the Python
+    side reproduces. Refuse the type at mount time rather than emit an
+    endpoint reference that silently matches no node."""
+    db = coco.ContextKey[ConnectionFactory](f"test_datekey_{uuid.uuid4().hex}")
+    coco_env.context_provider.provide(
+        db, ConnectionFactory(store="file:///tmp/never-touched-by-this-test.omni")
+    )
+    app = coco.App(
+        coco.AppConfig(name="test_mount_edge_date_key", environment=coco_env),
+        _declare_date_keyed_edge,
+        db,
+    )
+    with pytest.raises(ValueError, match=r"its key 'day' is Date"):
+        app.update_blocking()
+
+
+# ---------------------------------------------------------------------------
+# declare_node/declare_edge behavioral coverage: nothing previously called
+# these as instance methods through a real coco.App run — TestPublicSurface
+# only checks method identity off the *class*, and every other test in this
+# file bypasses them by hand-building `_NodeAction`/`_EdgeAction` directly.
+# So `_record_to_dict` (dict-vs-dataclass extraction) and `declare_node`'s
+# key-tuple construction from `self._schema.key` had zero coverage. These
+# drive the real declarative pipeline (mount -> declare -> reconcile ->
+# sink) with the CLI client's I/O methods mocked out, and assert on the
+# actual `Mutation` that would be sent — the concrete, observable form of
+# "what reaches the target state" — rather than on any internal method.
+# ---------------------------------------------------------------------------
+
+
+async def _noop_schema_call(self: object, schema_pg: str) -> None:
+    return None
+
+
+async def _noop_read_schema(self: object) -> str | None:
+    # `None` reads as "graph not yet initialized", routing every one of
+    # these tests through the (also mocked) `init_graph` path — irrelevant
+    # to what's under test here, which is the declarative layer, not the
+    # create-vs-alter transport decision.
+    return None
+
+
+def _patch_cli_schema_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_CliClient, "init_graph", _noop_schema_call)
+    monkeypatch.setattr(_CliClient, "apply_schema", _noop_schema_call)
+    monkeypatch.setattr(_CliClient, "read_schema", _noop_read_schema)
+
+
+def _capture_mutations(monkeypatch: pytest.MonkeyPatch) -> list[Mutation]:
+    captured: list[Mutation] = []
+
+    async def fake_mutate(self: object, mutation: Mutation, *, branch: str) -> None:
+        captured.append(mutation)
+
+    monkeypatch.setattr(_CliClient, "mutate", fake_mutate)
+    return captured
+
+
+def _patch_cli_branch_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A brand-new declaration through a real `coco.App` run reports
+    `prev_may_be_missing=True` (there's genuinely no tracked history yet —
+    see `test_dicts_data_together_insert` in test_component_target_states.py
+    for the same behavior on an unrelated target), so a first-ever edge
+    goes through `_EdgeHandler`'s "replace" path (delete-then-insert, two
+    commits applied via a scratch branch) rather than a bare insert. These
+    no-op the scratch-branch machinery so it doesn't touch a real process;
+    `_capture_mutations` still sees both commits."""
+
+    async def noop_branch_create(self: object, name: str, *, frm: str) -> None:
+        return None
+
+    async def noop_branch_merge(self: object, name: str, *, into: str) -> None:
+        return None
+
+    async def noop_branch_delete(self: object, name: str) -> None:
+        return None
+
+    monkeypatch.setattr(_CliClient, "branch_create", noop_branch_create)
+    monkeypatch.setattr(_CliClient, "branch_merge", noop_branch_merge)
+    monkeypatch.setattr(_CliClient, "branch_delete", noop_branch_delete)
+
+
+def _fresh_db(label: str) -> coco.ContextKey[ConnectionFactory]:
+    db = coco.ContextKey[ConnectionFactory](f"test_{label}_{uuid.uuid4().hex}")
+    coco_env.context_provider.provide(
+        db, ConnectionFactory(store="file:///tmp/never-touched-by-this-test.omni")
+    )
+    return db
+
+
+@dataclass
+class _Article:
+    slug: str
+    title: str
+    published: datetime.date
+
+
+async def _declare_article_from_dataclass(
+    db: coco.ContextKey[ConnectionFactory],
+) -> None:
+    schema = await NodeSchema.from_class(_Article, key="slug")
+    target = await omnigraph.mount_node_target(db, "Article", schema)
+    target.declare_node(
+        node=_Article(slug="a1", title="Hello", published=datetime.date(2026, 1, 1))
+    )
+
+
+def test_declare_node_from_dataclass_reaches_the_target_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercises the encoder path too: `published` is a `datetime.date`,
+    which would blow up at `json.dumps` if `_record_to_dict` skipped the
+    schema-driven extraction and the raw `date` object reached the mutation
+    unencoded."""
+    _patch_cli_schema_calls(monkeypatch)
+    captured = _capture_mutations(monkeypatch)
+    db = _fresh_db("declare_node_dataclass")
+
+    app = coco.App(
+        coco.AppConfig(
+            name="test_declare_node_from_dataclass_reaches_the_target_state",
+            environment=coco_env,
+        ),
+        _declare_article_from_dataclass,
+        db,
+    )
+    app.update_blocking()
+
+    assert len(captured) == 1
+    m = captured[0]
+    assert "insert Article" in m.expr
+    assert m.params["s0_p_slug"] == "a1"
+    assert m.params["s0_p_title"] == "Hello"
+    assert m.params["s0_p_published"] == "2026-01-01"  # encoder applied
+    assert m.params["s0_p_coco_key"] == derive_coco_key(("a1",))
+
+
+async def _declare_article_from_dict(db: coco.ContextKey[ConnectionFactory]) -> None:
+    schema = await NodeSchema.from_class(_Article, key="slug")
+    target = await omnigraph.mount_node_target(db, "Article", schema)
+    target.declare_node(
+        node={"slug": "a2", "title": "World", "published": datetime.date(2026, 2, 2)}
+    )
+
+
+def test_declare_node_from_dict_reaches_the_target_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same schema, same assertions, a plain dict instead of a dataclass
+    instance — `_record_to_dict` must handle both shapes equivalently."""
+    _patch_cli_schema_calls(monkeypatch)
+    captured = _capture_mutations(monkeypatch)
+    db = _fresh_db("declare_node_dict")
+
+    app = coco.App(
+        coco.AppConfig(
+            name="test_declare_node_from_dict_reaches_the_target_state",
+            environment=coco_env,
+        ),
+        _declare_article_from_dict,
+        db,
+    )
+    app.update_blocking()
+
+    assert len(captured) == 1
+    m = captured[0]
+    assert "insert Article" in m.expr
+    assert m.params["s0_p_slug"] == "a2"
+    assert m.params["s0_p_title"] == "World"
+    assert m.params["s0_p_published"] == "2026-02-02"
+    assert m.params["s0_p_coco_key"] == derive_coco_key(("a2",))
+
+
+@dataclass
+class _KeyOnlyNode:
+    slug: str
+
+
+@dataclass
+class _EdgeProps:
+    weight: int
+
+
+async def _declare_supports_edge(db: coco.ContextKey[ConnectionFactory]) -> None:
+    node_schema = await NodeSchema.from_class(_KeyOnlyNode, key="slug")
+    source = await omnigraph.mount_node_target(db, "Source", node_schema)
+    claim = await omnigraph.mount_node_target(db, "Claim", node_schema)
+    edge_schema = await NodeSchema.from_class(_EdgeProps, key="weight")
+    edge = await omnigraph.mount_edge_target(db, "Supports", source, claim, edge_schema)
+    edge.declare_edge(from_id="s1", to_id="c1", record=_EdgeProps(weight=7))
+
+
+def test_declare_edge_reaches_the_target_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`coco_key` for an edge is derived from `(from_id, to_id)`, not from
+    any property — verifies `declare_edge`'s own key construction, not just
+    `_EdgeHandler.reconcile`'s (already covered elsewhere).
+
+    A first-ever edge declaration through a real `coco.App` run reports
+    `prev_may_be_missing=True`, so this lands as a "replace" (delete then
+    insert, two commits) rather than a bare insert — see
+    `_patch_cli_branch_calls`. Only the insert commit is asserted on."""
+    _patch_cli_schema_calls(monkeypatch)
+    _patch_cli_branch_calls(monkeypatch)
+    captured = _capture_mutations(monkeypatch)
+    db = _fresh_db("declare_edge")
+
+    app = coco.App(
+        coco.AppConfig(
+            name="test_declare_edge_reaches_the_target_state", environment=coco_env
+        ),
+        _declare_supports_edge,
+        db,
+    )
+    app.update_blocking()
+
+    inserts = [m for m in captured if "insert Supports" in m.expr]
+    assert len(inserts) == 1, captured
+    m = inserts[0]
+    assert m.params["s0_e_from"] == "s1"
+    assert m.params["s0_e_to"] == "c1"
+    assert m.params["s0_p_weight"] == 7
+    assert m.params["s0_p_coco_key"] == derive_coco_key(("s1", "c1"))
+
+
+@dataclass
+class _Reading:
+    sensor: str
+    at: str
+    v: float
+
+
+async def _declare_reading(db: coco.ContextKey[ConnectionFactory]) -> None:
+    schema = await NodeSchema.from_class(_Reading, key="at")
+    target = await omnigraph.mount_node_target(db, "Reading", schema)
+    target.declare_node(node=_Reading(sensor="s1", at="2026-01-01", v=1.5))
+
+
+def test_declare_node_keys_on_the_schema_key_not_the_first_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`declare_node`'s `key = tuple(properties[k] for k in self._schema.key)`
+    reads the key out of the record by the schema's declared key field. A
+    wrong implementation — taking the first field, say — would still produce
+    *a* key, just the wrong one, so `_Reading` is deliberately keyed on its
+    SECOND field: `derive_coco_key(("2026-01-01",))` and
+    `derive_coco_key(("s1",))` are different values."""
+    _patch_cli_schema_calls(monkeypatch)
+    captured = _capture_mutations(monkeypatch)
+    db = _fresh_db("declare_node_key_field")
+
+    app = coco.App(
+        coco.AppConfig(name="test_declare_node_key_field", environment=coco_env),
+        _declare_reading,
+        db,
+    )
+    app.update_blocking()
+
+    assert len(captured) == 1
+    m = captured[0]
+    assert "insert Reading" in m.expr
+    assert m.params["s0_p_sensor"] == "s1"
+    assert m.params["s0_p_at"] == "2026-01-01"
+    assert m.params["s0_p_v"] == 1.5
+    assert m.params["s0_p_coco_key"] == derive_coco_key(("2026-01-01",))
+    assert m.params["s0_p_coco_key"] != derive_coco_key(("s1",))
+
+
+@dataclass
+class _AttendedRel:
+    is_organizer: bool
+
+
+def test_declare_edge_rejects_a_non_scalar_endpoint_id() -> None:
+    """An endpoint is addressed by the node's single key value. A tuple (the
+    shape a composite key would have had) has no `.pg` type at all, so it
+    used to surface as a bare `no Omnigraph type mapping for <class 'tuple'>`
+    out of `plan_commits`, with nothing naming the declaration."""
+    target: omnigraph.EdgeTarget[Any, Any] = omnigraph.EdgeTarget(
+        cast(Any, None),
+        None,
+        "ATTENDED",
+        _bare_node_target(
+            NodeSchema(
+                properties={"slug": PropertyDef("slug", "String")}, key=("slug",)
+            ),
+            "Person",
+        ),
+        _bare_node_target(
+            NodeSchema(
+                properties={"slug": PropertyDef("slug", "String")}, key=("slug",)
+            ),
+            "Meeting",
+        ),
+    )
+    with pytest.raises(TypeError, match=r"to_id=\('m', 1\) is not usable"):
+        target.declare_edge(from_id="p", to_id=("m", 1))
+    # A date maps to a `.pg` type but not to one the endpoint id rendering
+    # can reproduce, so it is refused here for the same reason
+    # `mount_edge_target` refuses a Date-keyed endpoint type.
+    with pytest.raises(TypeError, match="single string or integer"):
+        target.declare_edge(from_id="p", to_id=datetime.date(2026, 1, 5))
+
+
+def test_declare_edge_without_a_schema_rejects_a_record() -> None:
+    """A schema-less edge type declares no properties in `.pg`, and the
+    engine refuses an insert naming one it doesn't have ("type `X` has no
+    property `y`") — so a record here can never be written. It used to reach
+    `_encode_properties` and die on a bare `KeyError` deep in the sink, long
+    after the mistake was made.
+
+    This is the one genuine semantic gap between Omnigraph and the Neo4j
+    connector a ported app hits: Neo4j's MERGE creates relationship
+    properties on the fly, so the same call works there.
+    """
+    target: omnigraph.EdgeTarget[_AttendedRel, Any] = omnigraph.EdgeTarget(
+        cast(Any, None),
+        None,
+        "ATTENDED",
+        _bare_node_target(
+            NodeSchema(
+                properties={"slug": PropertyDef("slug", "String")}, key=("slug",)
+            ),
+            "Person",
+        ),
+        _bare_node_target(
+            NodeSchema(
+                properties={"slug": PropertyDef("slug", "String")}, key=("slug",)
+            ),
+            "Meeting",
+        ),
+    )
+    with pytest.raises(TypeError, match="mounted without a schema"):
+        target.declare_edge(
+            from_id="p", to_id="m", record=_AttendedRel(is_organizer=True)
+        )
+
+
+def test_declare_edge_without_a_record_rejects_a_non_nullable_schema() -> None:
+    """The mirror of the guard above, and the gap it left open: a schema with
+    no record.
+
+    `declare_edge` checked "record but no schema" and not "schema but no
+    record", so an edge type declaring non-nullable properties -- exactly the
+    example app's `AttendedRel(is_organizer: bool)` -- planned `insert
+    ATTENDED { from: ..., to: ..., coco_key: ... }` with every declared
+    property missing. Omnigraph rejects that ("must provide non-nullable
+    property"), naming neither this call nor the omitted argument.
+    """
+    schema = NodeSchema(
+        properties={"is_organizer": PropertyDef("is_organizer", "Bool")}, key=()
+    )
+    target: omnigraph.EdgeTarget[_AttendedRel, Any] = omnigraph.EdgeTarget(
+        cast(Any, None),
+        schema,
+        "ATTENDED",
+        _bare_node_target(
+            NodeSchema(
+                properties={"slug": PropertyDef("slug", "String")}, key=("slug",)
+            ),
+            "Person",
+        ),
+        _bare_node_target(
+            NodeSchema(
+                properties={"slug": PropertyDef("slug", "String")}, key=("slug",)
+            ),
+            "Meeting",
+        ),
+    )
+    with pytest.raises(TypeError, match="is_organizer"):
+        target.declare_edge(from_id="p", to_id="m")
+
+
+# ---------------------------------------------------------------------------
+# `declare_node`'s `row=` compatibility alias: table-shaped sibling
+# connectors (neo4j, falkordb, surrealdb) call `declare_record(row=...)`.
+# Since `declare_record = declare_node` is the same function object (not a
+# wrapper), that call previously raised `TypeError: declare_node() got an
+# unexpected keyword argument 'row'` — the one keyword mismatch the
+# meeting-notes-graph example port surfaced. See declare_node's docstring.
+# ---------------------------------------------------------------------------
+
+
+def test_declare_node_requires_exactly_one_of_node_or_row() -> None:
+    """Pure argument validation, ahead of any provider access — runs against
+    a bare `NodeTarget` (no live coco.App needed) exactly like the analogous
+    checks in TestEdgeTargetKeyFieldWiring above."""
+    schema = NodeSchema(
+        properties={"slug": PropertyDef("slug", "String")}, key=("slug",)
+    )
+    target = _bare_node_target(schema, "Foo")
+
+    with pytest.raises(TypeError, match="exactly one of `node` or `row`"):
+        target.declare_node()
+    with pytest.raises(TypeError, match="exactly one of `node` or `row`"):
+        target.declare_node(node={"slug": "a"}, row={"slug": "a"})
+
+
+async def _declare_article_from_row_alias(
+    db: coco.ContextKey[ConnectionFactory],
+) -> None:
+    schema = await NodeSchema.from_class(_Article, key="slug")
+    target = await omnigraph.mount_node_target(db, "Article", schema)
+    target.declare_record(
+        row=_Article(slug="a3", title="Row alias", published=datetime.date(2026, 3, 3))
+    )
+
+
+def test_declare_record_with_row_reaches_the_target_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`declare_record(row=...)` — the exact call shape a ported neo4j app
+    uses — must reach the target state the same way `declare_node(node=...)`
+    does in test_declare_node_from_dataclass_reaches_the_target_state above."""
+    _patch_cli_schema_calls(monkeypatch)
+    captured = _capture_mutations(monkeypatch)
+    db = _fresh_db("declare_record_row_alias")
+
+    app = coco.App(
+        coco.AppConfig(
+            name="test_declare_record_with_row_reaches_the_target_state",
+            environment=coco_env,
+        ),
+        _declare_article_from_row_alias,
+        db,
+    )
+    app.update_blocking()
+
+    assert len(captured) == 1
+    m = captured[0]
+    assert "insert Article" in m.expr
+    assert m.params["s0_p_slug"] == "a3"
+    assert m.params["s0_p_title"] == "Row alias"
+    assert m.params["s0_p_coco_key"] == derive_coco_key(("a3",))
+
+
+# ---------------------------------------------------------------------------
+# `mount_node_target`'s optional `key=` — redundant validation for parity
+# with the sibling connectors' `primary_key=`, per the design spec's API
+# surface example (`mount_node_target(OG, "Source", schema, key="slug")`).
+# ---------------------------------------------------------------------------
+
+
+async def _mount_with_matching_key(db: coco.ContextKey[ConnectionFactory]) -> None:
+    schema = await NodeSchema.from_class(_Article, key="slug")
+    target = await omnigraph.mount_node_target(db, "Article", schema, key="slug")
+    target.declare_node(
+        node=_Article(slug="a4", title="Key ok", published=datetime.date(2026, 4, 4))
+    )
+
+
+def test_mount_node_accepts_matching_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_cli_schema_calls(monkeypatch)
+    captured = _capture_mutations(monkeypatch)
+    db = _fresh_db("mount_node_key_matches")
+
+    app = coco.App(
+        coco.AppConfig(
+            name="test_mount_node_accepts_matching_key", environment=coco_env
+        ),
+        _mount_with_matching_key,
+        db,
+    )
+    app.update_blocking()
+
+    assert len(captured) == 1
+    assert captured[0].params["s0_p_slug"] == "a4"
+
+
+async def _mount_with_mismatched_key(db: coco.ContextKey[ConnectionFactory]) -> None:
+    schema = await NodeSchema.from_class(_Article, key="slug")
+    await omnigraph.mount_node_target(db, "Article", schema, key="title")
+
+
+def test_mount_node_rejects_mismatched_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_cli_schema_calls(monkeypatch)
+    db = _fresh_db("mount_node_key_mismatch")
+
+    app = coco.App(
+        coco.AppConfig(
+            name="test_mount_node_rejects_mismatched_key", environment=coco_env
+        ),
+        _mount_with_mismatched_key,
+        db,
+    )
+    with pytest.raises(ValueError, match="does not match the schema's declared key"):
+        app.update_blocking()
+
+
+# ---------------------------------------------------------------------------
+# Live-engine tests: require the omnigraph CLI binary. Gated on
+# OMNIGRAPH_TEST_STORE=1 since the binary is a local, git-ignored install
+# (`test/bin/omnigraph`), not something CI has on PATH.
+# ---------------------------------------------------------------------------
+
+_OMNIGRAPH_BIN = str(Path(__file__).resolve().parents[3] / "test" / "bin" / "omnigraph")
+
+_live = pytest.mark.skipif(
+    os.environ.get("OMNIGRAPH_TEST_STORE") != "1",
+    reason="requires the omnigraph CLI binary; set OMNIGRAPH_TEST_STORE=1",
+)
+
+
+def _live_conn(store_dir: Path) -> ConnectionFactory:
+    return ConnectionFactory(store=f"file://{store_dir}", cli=_OMNIGRAPH_BIN)
+
+
+def _live_context(conn: ConnectionFactory) -> tuple[ContextProvider, str]:
+    db = ContextKey[ConnectionFactory](f"test_db_{uuid.uuid4().hex}")
+    cp = ContextProvider()
+    cp.provide(db, conn)
+    return cp, db.key
+
+
+def _init_live(store_dir: Path, schema_pg: str) -> subprocess.CompletedProcess[str]:
+    """Run `omnigraph init` with `schema_pg` and hand back the raw result, so
+    a test can assert on the engine's own refusal rather than on ours."""
+    with tempfile.NamedTemporaryFile("w", suffix=".pg", encoding="utf-8") as f:
+        f.write(schema_pg)
+        f.flush()
+        return subprocess.run(
+            [
+                _OMNIGRAPH_BIN,
+                "init",
+                "--schema",
+                f.name,
+                "--quiet",
+                f"file://{store_dir}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+
+def _mutate_live(
+    store: str, mutation: Mutation, *, check: bool = True
+) -> subprocess.CompletedProcess[str]:
+    r = subprocess.run(
+        [
+            _OMNIGRAPH_BIN,
+            "mutate",
+            "--store",
+            store,
+            "--branch",
+            "main",
+            "--json",
+            "--quiet",
+            "-e",
+            mutation.expr,
+            "--params",
+            json.dumps(mutation.params),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if check:
+        assert r.returncode == 0, r.stderr
+    return r
+
+
+@_live
+class TestEngineSchemaLimitsLive:
+    """The engine-side facts three Python-side guards rest on. Each guard
+    exists only because the engine refuses the schema outright, so if a
+    future Omnigraph release starts accepting one of these, the guard is the
+    thing that's now wrong — and these tests are what say so."""
+
+    def test_two_keys_are_rejected(self, tmp_path: Path) -> None:
+        r = _init_live(
+            tmp_path / "g.omni",
+            (
+                "node Reading {\n"
+                "  sensor: String @key\n"
+                "  at: String @key\n"
+                "  coco_key: String\n"
+                "}\n"
+            ),
+        )
+        assert r.returncode != 0
+        assert "multiple @key constraints" in r.stderr
+
+    def test_id_property_is_rejected_on_a_node(self, tmp_path: Path) -> None:
+        r = _init_live(
+            tmp_path / "g.omni",
+            ("node Meeting {\n  slug: String @key\n  id: I64\n  coco_key: String\n}\n"),
+        )
+        assert r.returncode != 0
+        assert "exactly one top-level `id` field" in r.stderr
+
+    def test_a_node_and_an_edge_may_share_a_name_but_only_one_is_addressable(
+        self, tmp_path: Path
+    ) -> None:
+        """Both halves of the collision, from the engine itself.
+
+        `schema apply` ACCEPTS `node Link` alongside `edge Link` — which is
+        why `_find_type_block` must match on kind, or an edge's fragment
+        overwrites the node's block. But a mutation resolves the bare name
+        to the NODE type, so the edge is unwritable — which is why
+        `_check_no_kind_clash` refuses to create the situation at all. If a
+        future release changes either half, this is what says so.
+        """
+        store_dir = tmp_path / "g.omni"
+        assert (
+            _init_live(
+                store_dir,
+                (
+                    "node A {\n  slug: String @key\n  coco_key: String\n}\n\n"
+                    "node B {\n  slug: String @key\n  coco_key: String\n}\n\n"
+                    "node Link {\n  slug: String @key\n  coco_key: String\n}\n\n"
+                    "edge Link: A -> B {\n  coco_key: String\n}\n"
+                ),
+            ).returncode
+            == 0
+        )
+
+        store = f"file://{store_dir}"
+        _mutate_live(
+            store,
+            combine_mutations(
+                [
+                    build_node_upsert(
+                        "A", (PropertyValue("slug", "String", "a1"),), "ck-a"
+                    ),
+                    build_node_upsert(
+                        "B", (PropertyValue("slug", "String", "b1"),), "ck-b"
+                    ),
+                ]
+            ),
+        )
+        r = _mutate_live(
+            store,
+            build_edge_insert(
+                "Link",
+                PropertyValue("ref", "String", "a1"),
+                PropertyValue("ref", "String", "b1"),
+                (),
+                "ck-e",
+            ),
+            check=False,
+        )
+        assert r.returncode != 0
+        assert "type `Link` has no property `from`" in r.stderr
+
+    def test_key_only_stub_needs_every_non_nullable_property(
+        self, tmp_path: Path
+    ) -> None:
+        """The premise behind `_validate_edge_endpoint`: the key-only stub
+        the sink inserts for a missing edge endpoint cannot satisfy a
+        non-nullable property outside the key, so referencing such a type as
+        an endpoint has to be refused at mount time."""
+        store_dir = tmp_path / "g.omni"
+        assert (
+            _init_live(
+                store_dir,
+                (
+                    "node Meeting {\n"
+                    "  slug: String @key\n"
+                    "  note_file: String\n"
+                    "  coco_key: String\n"
+                    "}\n"
+                ),
+            ).returncode
+            == 0
+        )
+        r = subprocess.run(
+            [
+                _OMNIGRAPH_BIN,
+                "mutate",
+                "--store",
+                f"file://{store_dir}",
+                "--branch",
+                "main",
+                "--json",
+                "--quiet",
+                "-e",
+                "query m($p_slug: String, $p_coco_key: String) "
+                "{ insert Meeting { slug: $p_slug, coco_key: $p_coco_key } }",
+                "--params",
+                '{"p_slug": "m1", "p_coco_key": "ck1"}',
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode != 0
+        assert "must provide non-nullable property `note_file`" in r.stderr
+
+
+@_live
+class TestFullCapCommitLive:
+    """A commit at the full `_MAX_ENTITIES_PER_TYPE` must actually reach the
+    engine.
+
+    Nothing exercised this: every chunking test monkeypatches the cap DOWN
+    (to 4), so the suite only ever built commits three orders of magnitude
+    smaller than the one a real component produces. At the real cap the
+    payload is ~1.3 MB of GQ plus ~1.0 MB of params, and passing those
+    inline put both in argv — `OSError: [Errno 7] Argument list too long`
+    on darwin, and on Linux the 128 KiB-per-argument limit would have
+    failed the expression alone somewhere near 800 entities.
+
+    Deliberately the real cap, not a scaled-down stand-in: the number that
+    matters is the one the connector ships with, and the whole defect was
+    that nobody multiplied it by the bytes per entity.
+    """
+
+    def test_a_commit_at_the_entity_cap_applies(self, tmp_path: Path) -> None:
+        store = f"file://{tmp_path / 'cap.omni'}"
+        assert (
+            _init_live(
+                tmp_path / "cap.omni",
+                (
+                    "node Source {\n  slug: String @key\n  title: String?\n"
+                    "  coco_key: String\n}\n"
+                ),
+            ).returncode
+            == 0
+        )
+
+        n = ogt._MAX_ENTITIES_PER_TYPE
+        commit = combine_mutations(
+            [
+                build_node_upsert(
+                    "Source",
+                    (
+                        PropertyValue("slug", "String", f"s{i:06d}"),
+                        PropertyValue("title", "String?", f"Title {i}"),
+                    ),
+                    derive_coco_key((f"s{i:06d}",)),
+                )
+                for i in range(n)
+            ]
+        )
+        # The payload really is past the argv limits, so this is not a
+        # hypothetical: if it ever shrinks below them the test stops
+        # covering what it exists to cover.
+        assert len(commit.expr) > 131072, "expression no longer exceeds MAX_ARG_STRLEN"
+        assert len(commit.expr) + len(json.dumps(commit.params)) > 1048576
+
+        conn = ConnectionFactory(store=store, cli=_OMNIGRAPH_BIN)
+        asyncio.run(_CliClient(conn).mutate(commit, branch="main"))
+
+        rows = _export_rows(store)
+        assert len([r for r in rows if r.get("type") == "Source"]) == n
+
+
+@_live
+class TestMutationAtomicityLive:
+    """A failed multi-statement `mutate` must apply NOTHING.
+
+    Everything above rests on this and nothing pinned it. `combine_mutations`
+    merges N statements into one query precisely to get one commit, and
+    `_mutate_with_endpoint_retry` re-runs the WHOLE commit after stubbing a
+    missing endpoint — so if a failed invocation left its earlier statements
+    applied, every edge before the failure point would be inserted a second
+    time on the retry. Edge insert is strict and never deduplicates, and the
+    duplicate would carry the same `coco_key` as the original, making it
+    invisible to tracking and unreachable by `delete ... where coco_key = $x`
+    (which removes one row). The three endpoint-retry tests each carry
+    exactly one edge insert, so none of them can tell the two worlds apart.
+    """
+
+    @staticmethod
+    def _seeded(tmp_path: Path) -> str:
+        store = f"file://{tmp_path / 'atomic.omni'}"
+        assert (
+            _init_live(
+                tmp_path / "atomic.omni",
+                (
+                    "node Source {\n  slug: String @key\n  title: String?\n"
+                    "  coco_key: String\n}\n\n"
+                    "node Claim {\n  slug: String @key\n  coco_key: String\n}\n\n"
+                    "edge Supports: Source -> Claim {\n  coco_key: String\n}\n"
+                ),
+            ).returncode
+            == 0
+        )
+        _mutate_live(
+            store,
+            combine_mutations(
+                [
+                    build_node_upsert(
+                        "Source", (PropertyValue("slug", "String", "s1"),), "ck-s1"
+                    ),
+                    build_node_upsert(
+                        "Claim", (PropertyValue("slug", "String", "c1"),), "ck-c1"
+                    ),
+                ]
+            ),
+        )
+        return store
+
+    def test_earlier_statements_do_not_land_when_a_later_one_fails(
+        self, tmp_path: Path
+    ) -> None:
+        store = self._seeded(tmp_path)
+        before = _commit_count(store)
+
+        good = build_edge_insert(
+            "Supports",
+            PropertyValue("ref", "String", "s1"),
+            PropertyValue("ref", "String", "c1"),
+            (),
+            "ck-e1",
+        )
+        # Fails at execution time (not parse time) on a missing endpoint --
+        # the same failure mode `_mutate_with_endpoint_retry` recovers from.
+        doomed = build_edge_insert(
+            "Supports",
+            PropertyValue("ref", "String", "s1"),
+            PropertyValue("ref", "String", "GHOST"),
+            (),
+            "ck-e2",
+        )
+        r = _mutate_live(store, combine_mutations([good, doomed]), check=False)
+        assert r.returncode != 0
+        assert "not found in Claim" in r.stderr
+
+        rows = _export_rows(store)
+        assert [r for r in rows if r.get("type") == "Supports"] == []
+        assert _commit_count(store) == before
+
+    def test_a_failed_upsert_batch_leaves_prior_values_untouched(
+        self, tmp_path: Path
+    ) -> None:
+        """The node half of the same property: a node upsert combined ahead
+        of a failing statement must not have overwritten anything."""
+        store = self._seeded(tmp_path)
+
+        r = _mutate_live(
+            store,
+            combine_mutations(
+                [
+                    build_node_upsert(
+                        "Source",
+                        (
+                            PropertyValue("slug", "String", "s1"),
+                            PropertyValue("title", "String?", "OVERWRITTEN"),
+                        ),
+                        "ck-s1",
+                    ),
+                    build_node_upsert(
+                        "Claim", (PropertyValue("slug", "String", "c2"),), "ck-c2"
+                    ),
+                    build_edge_insert(
+                        "Supports",
+                        PropertyValue("ref", "String", "GHOST"),
+                        PropertyValue("ref", "String", "c1"),
+                        (),
+                        "ck-e3",
+                    ),
+                ]
+            ),
+            check=False,
+        )
+        assert r.returncode != 0
+
+        rows = _export_rows(store)
+        assert [r["data"]["title"] for r in rows if r.get("type") == "Source"] == [None]
+        assert [r["data"]["slug"] for r in rows if r.get("type") == "Claim"] == ["c1"]
+
+
+@dataclass
+class _SimpleNode:
+    slug: str
+    title: str | None
+
+
+@_live
+class TestApplyTypeActionsLive:
+    @pytest.mark.asyncio
+    async def test_alter_recreates_a_graph_whose_directory_was_deleted(
+        self, tmp_path: Path
+    ) -> None:
+        """`read_schema()` against a graph that was never `init`'d returns
+        `None` — happens for real when a run is interrupted between a
+        type's pre_commit and its `create` action landing.
+        `_apply_type_actions` must `init_graph` in that case and succeed
+        rather than raising."""
+        store_dir = tmp_path / "g.omni"
+        conn = _live_conn(store_dir)
+        db = ContextKey[ConnectionFactory](f"test_db_{uuid.uuid4().hex}")
+        cp = ContextProvider()
+        cp.provide(db, conn)
+
+        schema = await NodeSchema.from_class(_SimpleNode, key="slug")
+        spec = _TypeSpec(
+            schema=schema,
+            key=schema.key,
+            from_type=None,
+            to_type=None,
+            managed_by=ManagedBy.SYSTEM,
+        )
+        key = _TypeKey(db.key, "node", "Simple")
+        pg_fragment = schema.render("Simple")
+
+        create_action = ogt._TypeAction(key, spec, pg_fragment, "insert", {})
+        out = await ogt._apply_type_actions(cp, [create_action])
+        assert out[0] is not None
+        assert store_dir.exists()
+
+        shutil.rmtree(store_dir)  # simulate a run interrupted before create landed
+        assert not store_dir.exists()
+
+        # What the engine really emits after an interrupted run: the record
+        # still matches, but `prev_may_be_missing` forces a write anyway.
+        upsert_action = ogt._TypeAction(key, spec, pg_fragment, "upsert", {})
+        out2 = await ogt._apply_type_actions(cp, [upsert_action])
+        assert out2[0] is not None
+        assert store_dir.exists()
+
+    @pytest.mark.asyncio
+    async def test_a_second_type_is_merged_not_wiping_the_first(
+        self, tmp_path: Path
+    ) -> None:
+        """The bug this reopening exists to fix, reproduced and then
+        proven closed: Omnigraph's schema is applied whole-graph, not per
+        type, so a naive per-type apply of the *second* type's fragment
+        alone silently dropped the first. `init` a graph with one type,
+        then drive a fresh `create` action for a second type — which Task
+        6 always decides as `"create"` regardless of whether it's the
+        graph's first type or its Nth — through the real sink, and assert
+        `schema show` afterward has BOTH types. Fails hard against the old
+        code: `init_graph` refuses an already-initialized store outright,
+        and a bare `apply_schema` of just the second type's fragment wipes
+        the first (both verified independently against the binary)."""
+        store_dir = tmp_path / "g.omni"
+        conn = _live_conn(store_dir)
+        client = _CliClient(conn)
+        db = ContextKey[ConnectionFactory](f"test_db_{uuid.uuid4().hex}")
+        cp = ContextProvider()
+        cp.provide(db, conn)
+
+        a_schema = await NodeSchema.from_class(_SimpleNode, key="slug")
+        a_spec = _TypeSpec(
+            schema=a_schema,
+            key=a_schema.key,
+            from_type=None,
+            to_type=None,
+            managed_by=ManagedBy.SYSTEM,
+        )
+        await ogt._apply_type_actions(
+            cp,
+            [
+                ogt._TypeAction(
+                    _TypeKey(db.key, "node", "A"),
+                    a_spec,
+                    a_schema.render("A"),
+                    "insert",
+                    {},
+                ),
+            ],
+        )
+
+        b_schema = await NodeSchema.from_class(_SimpleNode, key="slug")
+        b_spec = _TypeSpec(
+            schema=b_schema,
+            key=b_schema.key,
+            from_type=None,
+            to_type=None,
+            managed_by=ManagedBy.SYSTEM,
+        )
+        out = await ogt._apply_type_actions(
+            cp,
+            [
+                ogt._TypeAction(
+                    _TypeKey(db.key, "node", "B"),
+                    b_spec,
+                    b_schema.render("B"),
+                    "insert",
+                    {},
+                ),
+            ],
+        )
+        assert out[0] is not None
+
+        schema_source = await client.read_schema()
+        assert schema_source is not None
+        assert "node A {" in schema_source
+        assert "node B {" in schema_source
+
+
+def _export_rows(store_uri: str) -> list[dict[str, Any]]:
+    result = subprocess.run(
+        [_OMNIGRAPH_BIN, "export", "--store", store_uri, "--branch", "main"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+
+
+def _basic_pg(source_extra: str = "") -> str:
+    return (
+        f"node Source {{\n  slug: String @key\n{source_extra}  coco_key: String\n}}\n\n"
+        "node Claim {\n  slug: String @key\n  coco_key: String\n}\n\n"
+        "edge Supports: Source -> Claim {\n  weight: I64\n  coco_key: String\n}"
+    )
+
+
+def _upsert(
+    db_key: str, type_name: str, slug: str, extra: PropertyValue | None = None
+) -> ogt._NodeAction:
+    props = (PropertyValue("slug", "String", slug),) + ((extra,) if extra else ())
+    return ogt._NodeAction(
+        "upsert",
+        _TypeKey(db_key, "node", type_name),
+        type_name,
+        props,
+        derive_coco_key((slug,)),
+    )
+
+
+@_live
+class TestReplaceOrderingLive:
+    @pytest.mark.asyncio
+    async def test_replace_leaves_exactly_one_edge_with_new_value(
+        self, tmp_path: Path
+    ) -> None:
+        """The check that would have caught the original draft's ordering
+        bug: if phase A (the replaced edge's delete) ran after phase B (its
+        re-insert) instead of before, this would see zero edges survive —
+        insert-then-delete on one coco_key removes both."""
+        store_dir = tmp_path / "g.omni"
+        conn = _live_conn(store_dir)
+        store_uri = f"file://{store_dir}"
+        client = _CliClient(conn)
+        cp, db_key = _live_context(conn)
+        await client.init_graph(_basic_pg())
+
+        # Both endpoints already exist, so the edge insert below needs no
+        # retry — that path is exercised separately in TestEndpointRetryLive.
+        await ogt._apply_entity_actions(
+            cp, [_upsert(db_key, "Source", "s1"), _upsert(db_key, "Claim", "c1")]
+        )
+
+        edge_key = _TypeKey(db_key, "edge", "Supports")
+        edge_coco_key = derive_coco_key(("s1", "c1"))
+
+        insert_action = ogt._EdgeAction(
+            "insert",
+            edge_key,
+            "Supports",
+            edge_coco_key,
+            "s1",
+            "c1",
+            (PropertyValue("weight", "I64", 1),),
+            "Source",
+            "Claim",
+            ("slug",),
+            ("slug",),
+        )
+        await ogt._apply_entity_actions(cp, [insert_action])
+
+        rows = _export_rows(store_uri)
+        edges = [r for r in rows if r.get("edge") == "Supports"]
+        assert len(edges) == 1
+        assert edges[0]["data"]["weight"] == 1
+
+        replace_action = ogt._EdgeAction(
+            "replace",
+            edge_key,
+            "Supports",
+            edge_coco_key,
+            "s1",
+            "c1",
+            (PropertyValue("weight", "I64", 2),),
+            "Source",
+            "Claim",
+            ("slug",),
+            ("slug",),
+        )
+        commits = plan_commits([replace_action])
+        assert len(commits) == 2  # phase A (delete) + phase B (insert)
+        await ogt._apply_entity_actions(cp, [replace_action])
+
+        rows = _export_rows(store_uri)
+        edges = [r for r in rows if r.get("edge") == "Supports"]
+        assert len(edges) == 1
+        assert edges[0]["data"]["weight"] == 2
+
+
+@_live
+class TestEndpointRetryLive:
+    @pytest.mark.asyncio
+    async def test_edge_insert_retries_after_creating_missing_endpoint(
+        self, tmp_path: Path
+    ) -> None:
+        """An edge referencing an endpoint no other component has written
+        yet must still succeed: the sink builds a stub for just that
+        endpoint after the engine reports it missing, then retries. Only
+        one endpoint (Source) is missing here, so this only needs the
+        first of the two retries the sink budgets — see
+        test_edge_insert_retries_after_creating_both_missing_endpoints for
+        the case that needs both."""
+        store_dir = tmp_path / "g.omni"
+        conn = _live_conn(store_dir)
+        store_uri = f"file://{store_dir}"
+        client = _CliClient(conn)
+        cp, db_key = _live_context(conn)
+        await client.init_graph(_basic_pg())
+
+        await ogt._apply_entity_actions(cp, [_upsert(db_key, "Claim", "c1")])
+
+        edge_key = _TypeKey(db_key, "edge", "Supports")
+        insert_action = ogt._EdgeAction(
+            "insert",
+            edge_key,
+            "Supports",
+            derive_coco_key(("s1", "c1")),
+            "s1",
+            "c1",
+            (PropertyValue("weight", "I64", 1),),
+            "Source",
+            "Claim",
+            ("slug",),
+            ("slug",),
+        )
+        await ogt._apply_entity_actions(cp, [insert_action])
+
+        rows = _export_rows(store_uri)
+        assert len([r for r in rows if r.get("edge") == "Supports"]) == 1
+        sources = [r for r in rows if r.get("type") == "Source"]
+        assert len(sources) == 1
+        assert sources[0]["data"]["slug"] == "s1"
+
+    @pytest.mark.asyncio
+    async def test_edge_insert_does_not_wipe_existing_nullable_property(
+        self, tmp_path: Path
+    ) -> None:
+        """The regression this redesign exists to fix. Both endpoints
+        already exist, so the edge insert must succeed on the FIRST try,
+        with no stub ever touching Source — and Source's own nullable
+        `title`, already written by its owning component, must survive.
+        This fails against the old unconditional-stub design, which nulled
+        `title` out on every edge insert (verified against the engine)."""
+        store_dir = tmp_path / "g.omni"
+        conn = _live_conn(store_dir)
+        store_uri = f"file://{store_dir}"
+        client = _CliClient(conn)
+        cp, db_key = _live_context(conn)
+        await client.init_graph(_basic_pg(source_extra="  title: String?\n"))
+
+        await ogt._apply_entity_actions(
+            cp,
+            [
+                _upsert(
+                    db_key,
+                    "Source",
+                    "s1",
+                    PropertyValue("title", "String", "Real Title"),
+                ),
+                _upsert(db_key, "Claim", "c1"),
+            ],
+        )
+
+        edge_key = _TypeKey(db_key, "edge", "Supports")
+        insert_action = ogt._EdgeAction(
+            "insert",
+            edge_key,
+            "Supports",
+            derive_coco_key(("s1", "c1")),
+            "s1",
+            "c1",
+            (PropertyValue("weight", "I64", 1),),
+            "Source",
+            "Claim",
+            ("slug",),
+            ("slug",),
+        )
+        await ogt._apply_entity_actions(cp, [insert_action])
+
+        rows = _export_rows(store_uri)
+        assert len([r for r in rows if r.get("edge") == "Supports"]) == 1
+        sources = [r for r in rows if r.get("type") == "Source"]
+        assert len(sources) == 1
+        assert sources[0]["data"]["title"] == "Real Title"
+
+    @pytest.mark.asyncio
+    async def test_edge_insert_retries_after_creating_both_missing_endpoints(
+        self, tmp_path: Path
+    ) -> None:
+        """Both endpoints absent is ordinary, not exotic: CocoIndex runs up
+        to 1024 components concurrently, so an edge component can easily
+        precede both of the components that own its endpoints. The engine
+        reports only the first missing endpoint per attempt (`src` before
+        `dst`), so a single retry isn't enough — this needs both of the
+        sink's two retries. Fails against a single-retry implementation:
+        the first retry fixes `src`, the second attempt then fails on
+        `dst`, and that would propagate instead of getting its own stub."""
+        store_dir = tmp_path / "g.omni"
+        conn = _live_conn(store_dir)
+        store_uri = f"file://{store_dir}"
+        client = _CliClient(conn)
+        cp, db_key = _live_context(conn)
+        await client.init_graph(_basic_pg())
+
+        # Neither Source nor Claim has been written by any other component.
+        edge_key = _TypeKey(db_key, "edge", "Supports")
+        insert_action = ogt._EdgeAction(
+            "insert",
+            edge_key,
+            "Supports",
+            derive_coco_key(("s1", "c1")),
+            "s1",
+            "c1",
+            (PropertyValue("weight", "I64", 1),),
+            "Source",
+            "Claim",
+            ("slug",),
+            ("slug",),
+        )
+        await ogt._apply_entity_actions(cp, [insert_action])
+
+        rows = _export_rows(store_uri)
+        assert len([r for r in rows if r.get("edge") == "Supports"]) == 1
+        assert len([r for r in rows if r.get("type") == "Source"]) == 1
+        assert len([r for r in rows if r.get("type") == "Claim"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# End-to-end acceptance tests: drive a real coco.App against a real store,
+# the way a user actually would, rather than calling _apply_entity_actions
+# or _apply_type_actions directly (as the live tests above do). Every
+# scenario declares Source, Claim, and (except where noted) a Supports edge
+# TOGETHER in the same run, never a single type in isolation -- the two
+# worst defects found while building this connector were both invisible to
+# single-type coverage: a keyed insert that turned out to be a full-record
+# replace (silently wiping a node's other properties via an endpoint stub),
+# and a whole-graph schema apply (a second type's apply alone wiping the
+# first). Both only show up once more than one type is in play at once.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _ScSourceNarrow:
+    slug: str
+    # `title` is nullable so Source stays usable as an edge endpoint (see
+    # test_mount_edge_rejects_unstubbable_endpoint above): the endpoint
+    # stub the sink builds when an edge races ahead of its node's own
+    # component can only ever populate the key, so any other non-nullable
+    # property makes the type unstubbable.
+    title: str | None
+
+
+@dataclass
+class _ScSourceWide:
+    slug: str
+    title: str | None
+    note: str | None
+
+
+@dataclass
+class _ScClaim:
+    slug: str
+
+
+@dataclass
+class _ScEdgeProps:
+    weight: int
+
+
+@dataclass
+class _ScMeeting:
+    """An INTEGER-keyed endpoint, the shape the meeting-notes example uses
+    (a generated numeric meeting id). Every other e2e type here is
+    string-keyed, and the endpoint reference bug this covers was invisible
+    to all of them."""
+
+    meeting_id: int
+    note: str | None
+
+
+@dataclass
+class _KcSource:
+    """Dedicated to test_key_change_rebuilds: `title` must be non-nullable
+    here so it's legal to use as the new `@key` (NodeSchema.from_class
+    rejects a nullable key field) -- unlike _ScSourceNarrow, this type is
+    never used as an edge endpoint, so it doesn't need the nullability the
+    stub-compatibility guard would otherwise require."""
+
+    slug: str
+    title: str
+
+
+def _e2e_db(store: str, label: str) -> ContextKey[ConnectionFactory]:
+    db = ContextKey[ConnectionFactory](f"e2e_{label}_{uuid.uuid4().hex}")
+    coco_env.context_provider.provide(
+        db, ConnectionFactory(store=store, cli=_OMNIGRAPH_BIN)
+    )
+    return db
+
+
+def _commit_count(store: str, branch: str = "main") -> int:
+    out = subprocess.run(
+        [
+            _OMNIGRAPH_BIN,
+            "commit",
+            "list",
+            "--store",
+            store,
+            "--branch",
+            branch,
+            "--json",
+            "--quiet",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return len(json.loads(out.stdout)["commits"])
+
+
+def _read_schema_source(store: str) -> str:
+    out = subprocess.run(
+        [_OMNIGRAPH_BIN, "schema", "show", "--store", store, "--json", "--quiet"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return str(json.loads(out.stdout)["schema_source"])
+
+
+def _branch_names(store: str) -> list[str]:
+    out = subprocess.run(
+        [_OMNIGRAPH_BIN, "branch", "list", "--store", store, "--json", "--quiet"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return list(json.loads(out.stdout)["branches"])
+
+
+@pytest.fixture
+def store(tmp_path: Path) -> str:
+    """A `file://` URI for a graph that does not exist yet -- the
+    connector's own type sink creates it (via `init_graph`) on the first
+    sync, exactly as it would happen for a real user's first
+    `app.update()`."""
+    return f"file://{tmp_path / 'e2e.omni'}"
+
+
+@_live
+class TestEndToEnd:
+    """Seven acceptance cases, one per design decision in the spec. Each
+    drives a real `coco.App` -- reused across repeated `update_blocking()`
+    calls exactly as a real app would be -- and asserts against the store
+    via `_export_rows`/`_commit_count`/`_branch_names`, never against the
+    connector's own internal types."""
+
+    def test_property_added_is_additive(self, store: str) -> None:
+        """Re-mount Source with a wider dataclass; the already-written
+        node's existing property must survive the alter, and Claim/Supports
+        -- declared in the SAME run but otherwise untouched -- must come
+        through unaffected, which is exactly what a whole-graph-schema
+        regression would break."""
+        db = _e2e_db(store, "prop_added")
+        wide = {"on": False}
+
+        async def main() -> None:
+            source_schema = await NodeSchema.from_class(
+                _ScSourceWide if wide["on"] else _ScSourceNarrow, key="slug"
+            )
+            claim_schema = await NodeSchema.from_class(_ScClaim, key="slug")
+            edge_schema = await NodeSchema.from_class(_ScEdgeProps, key="weight")
+
+            sources = await omnigraph.mount_node_target(db, "Source", source_schema)
+            claims = await omnigraph.mount_node_target(db, "Claim", claim_schema)
+            supports = await omnigraph.mount_edge_target(
+                db, "Supports", sources, claims, edge_schema
+            )
+            node: Any = (
+                _ScSourceWide(slug="a", title="A", note=None)
+                if wide["on"]
+                else _ScSourceNarrow(slug="a", title="A")
+            )
+            sources.declare_node(node=node)
+            claims.declare_node(node=_ScClaim(slug="c1"))
+            supports.declare_edge(
+                from_id="a", to_id="c1", record=_ScEdgeProps(weight=1)
+            )
+
+        app = coco.App(
+            coco.AppConfig(name="e2e_prop_added", environment=coco_env), main
+        )
+        app.update_blocking()
+
+        rows = _export_rows(store)
+        assert [r["data"]["title"] for r in rows if r.get("type") == "Source"] == ["A"]
+        assert len([r for r in rows if r.get("type") == "Claim"]) == 1
+        assert len([r for r in rows if r.get("edge") == "Supports"]) == 1
+
+        wide["on"] = True
+        app.update_blocking()
+
+        rows = _export_rows(store)
+        (source,) = [r for r in rows if r.get("type") == "Source"]
+        assert source["data"]["title"] == "A"  # old value survived the alter
+        assert source["data"]["note"] is None  # new column present
+        assert len([r for r in rows if r.get("type") == "Claim"]) == 1  # untouched
+        assert len([r for r in rows if r.get("edge") == "Supports"]) == 1  # untouched
+
+    def test_property_dropped_forces_reupsert(self, store: str) -> None:
+        """Dropping a property is lossy: the design says every existing
+        node of that type must be re-upserted, not merely the type's own
+        schema altered. Two Source rows, so a bug that rewrites zero (or
+        only one) of them is distinguishable from rewriting both -- proven
+        via the commit count, not just the resulting values, since
+        Omnigraph's soft-drop already hides a dropped property from
+        `export` on its own, so row contents alone can't tell "dropped and
+        re-upserted" apart from "dropped and left alone"."""
+        db = _e2e_db(store, "prop_dropped")
+        narrow = {"on": False}
+
+        async def main() -> None:
+            source_schema = await NodeSchema.from_class(
+                _ScSourceNarrow if narrow["on"] else _ScSourceWide, key="slug"
+            )
+            claim_schema = await NodeSchema.from_class(_ScClaim, key="slug")
+            edge_schema = await NodeSchema.from_class(_ScEdgeProps, key="weight")
+
+            sources = await omnigraph.mount_node_target(db, "Source", source_schema)
+            claims = await omnigraph.mount_node_target(db, "Claim", claim_schema)
+            supports = await omnigraph.mount_edge_target(
+                db, "Supports", sources, claims, edge_schema
+            )
+            for slug, title, note in [("a", "A", "nA"), ("b", "B", "nB")]:
+                node: Any = (
+                    _ScSourceNarrow(slug=slug, title=title)
+                    if narrow["on"]
+                    else _ScSourceWide(slug=slug, title=title, note=note)
+                )
+                sources.declare_node(node=node)
+            claims.declare_node(node=_ScClaim(slug="c1"))
+            supports.declare_edge(
+                from_id="a", to_id="c1", record=_ScEdgeProps(weight=1)
+            )
+
+        app = coco.App(
+            coco.AppConfig(name="e2e_prop_dropped", environment=coco_env), main
+        )
+        app.update_blocking()
+
+        rows = _export_rows(store)
+        sources_before = {
+            r["data"]["slug"]: r["data"] for r in rows if r.get("type") == "Source"
+        }
+        assert sources_before["a"]["note"] == "nA"
+        assert sources_before["b"]["note"] == "nB"
+
+        before = _commit_count(store)
+        narrow["on"] = True
+        app.update_blocking()
+        after = _commit_count(store)
+
+        # One commit for Source's own schema alter (drops the column), one
+        # for the batched re-upsert of both rows -- upserts of the same
+        # type always land in a single commit (see
+        # test_upsert_only_is_one_commit), so this delta is exact: if
+        # either row were skipped, or if only the schema changed without a
+        # re-upsert, the delta would be 1, not 2.
+        assert after - before == 2
+
+        rows = _export_rows(store)
+        sources_after = {
+            r["data"]["slug"]: r["data"] for r in rows if r.get("type") == "Source"
+        }
+        assert set(sources_after) == {"a", "b"}
+        assert (
+            sources_after["a"]["title"] == "A"
+            and sources_after["a"].get("note") is None
+        )
+        assert (
+            sources_after["b"]["title"] == "B"
+            and sources_after["b"].get("note") is None
+        )
+        assert len([r for r in rows if r.get("type") == "Claim"]) == 1  # untouched
+        assert len([r for r in rows if r.get("edge") == "Supports"]) == 1  # untouched
+
+    def test_key_change_rebuilds(self, store: str) -> None:
+        """`@key` changing is destructive: the type action is decided as a
+        `replace` specifically because an in-place `alter` can't legally
+        change which property is the key, and existing nodes must be
+        re-declared under the new key rather than left as orphaned rows
+        nothing tracks. Claim and a Claim -> Claim `Cites` edge are
+        declared alongside Source and must survive the replace untouched."""
+        db = _e2e_db(store, "key_change")
+        keyed_by_title = {"on": False}
+
+        async def main() -> None:
+            source_schema = await NodeSchema.from_class(
+                _KcSource, key=("title" if keyed_by_title["on"] else "slug")
+            )
+            claim_schema = await NodeSchema.from_class(_ScClaim, key="slug")
+            edge_schema = await NodeSchema.from_class(_ScEdgeProps, key="weight")
+
+            sources = await omnigraph.mount_node_target(db, "Source", source_schema)
+            claims = await omnigraph.mount_node_target(db, "Claim", claim_schema)
+            cites = await omnigraph.mount_edge_target(
+                db, "Cites", claims, claims, edge_schema
+            )
+            sources.declare_node(node=_KcSource(slug="a", title="A"))
+            claims.declare_node(node=_ScClaim(slug="c1"))
+            claims.declare_node(node=_ScClaim(slug="c2"))
+            cites.declare_edge(from_id="c1", to_id="c2", record=_ScEdgeProps(weight=1))
+
+        app = coco.App(
+            coco.AppConfig(name="e2e_key_change", environment=coco_env), main
+        )
+        app.update_blocking()
+
+        rows = _export_rows(store)
+        (before_source,) = [r for r in rows if r.get("type") == "Source"]
+        assert before_source["data"]["slug"] == "a"
+        assert before_source["data"]["title"] == "A"
+
+        keyed_by_title["on"] = True
+        app.update_blocking()
+
+        rows = _export_rows(store)
+        sources_after = [r for r in rows if r.get("type") == "Source"]
+        assert len(sources_after) == 1  # rebuilt in place, not duplicated
+        (after_source,) = sources_after
+        assert after_source["data"]["slug"] == "a"
+        assert after_source["data"]["title"] == "A"
+        assert after_source["data"]["coco_key"] != before_source["data"]["coco_key"]
+
+        assert len([r for r in rows if r.get("type") == "Claim"]) == 2  # untouched
+        assert len([r for r in rows if r.get("edge") == "Cites"]) == 1  # untouched
+
+    def test_edge_repointed(self, store: str) -> None:
+        """Edges have no update mutation -- a changed edge is delete-then-
+        insert on the same coco_key (plan_commits' phase ordering). Point
+        a -> c1, then repoint the same source to c2: exactly one edge must
+        survive, pointing at the new target, not two edges and not the
+        deleted one."""
+        db = _e2e_db(store, "edge_repointed")
+        target = {"claim": "c1"}
+
+        async def main() -> None:
+            source_schema = await NodeSchema.from_class(_ScSourceNarrow, key="slug")
+            claim_schema = await NodeSchema.from_class(_ScClaim, key="slug")
+            edge_schema = await NodeSchema.from_class(_ScEdgeProps, key="weight")
+
+            sources = await omnigraph.mount_node_target(db, "Source", source_schema)
+            claims = await omnigraph.mount_node_target(db, "Claim", claim_schema)
+            supports = await omnigraph.mount_edge_target(
+                db, "Supports", sources, claims, edge_schema
+            )
+            sources.declare_node(node=_ScSourceNarrow(slug="a", title="A"))
+            claims.declare_node(node=_ScClaim(slug="c1"))
+            claims.declare_node(node=_ScClaim(slug="c2"))
+            supports.declare_edge(
+                from_id="a", to_id=target["claim"], record=_ScEdgeProps(weight=1)
+            )
+
+        app = coco.App(
+            coco.AppConfig(name="e2e_edge_repointed", environment=coco_env), main
+        )
+        app.update_blocking()
+
+        rows = _export_rows(store)
+        (edge,) = [r for r in rows if r.get("edge") == "Supports"]
+        assert edge["to"] == "c1"
+
+        target["claim"] = "c2"
+        app.update_blocking()
+
+        rows = _export_rows(store)
+        edges = [r for r in rows if r.get("edge") == "Supports"]
+        assert len(edges) == 1
+        assert edges[0]["from"] == "a" and edges[0]["to"] == "c2"
+        assert (
+            len([r for r in rows if r.get("type") == "Claim"]) == 2
+        )  # both endpoints remain
+
+    def test_node_deleted_cascades_to_its_edges(self, store: str) -> None:
+        """Undeclaring a node must also remove the edges that reference it.
+        This isn't ordinary CocoIndex parent-child cleanup -- Source and
+        Supports are independent target-state trees, so nothing
+        automatically knows an edge references a node from a SEPARATE
+        component going away. It's `plan_commits`' own edge-before-node
+        delete ordering (see test_edge_deletes_precede_node_deletes) that
+        makes this safe against the real engine, which this proves live:
+        two Source nodes, each with an edge to the same Claim, so deleting
+        one leaves the other's node and edge provably untouched."""
+        db = _e2e_db(store, "node_deleted")
+        keep_b = {"on": True}
+
+        async def main() -> None:
+            source_schema = await NodeSchema.from_class(_ScSourceNarrow, key="slug")
+            claim_schema = await NodeSchema.from_class(_ScClaim, key="slug")
+            edge_schema = await NodeSchema.from_class(_ScEdgeProps, key="weight")
+
+            sources = await omnigraph.mount_node_target(db, "Source", source_schema)
+            claims = await omnigraph.mount_node_target(db, "Claim", claim_schema)
+            supports = await omnigraph.mount_edge_target(
+                db, "Supports", sources, claims, edge_schema
+            )
+            claims.declare_node(node=_ScClaim(slug="c1"))
+            sources.declare_node(node=_ScSourceNarrow(slug="a", title="A"))
+            supports.declare_edge(
+                from_id="a", to_id="c1", record=_ScEdgeProps(weight=1)
+            )
+            if keep_b["on"]:
+                sources.declare_node(node=_ScSourceNarrow(slug="b", title="B"))
+                supports.declare_edge(
+                    from_id="b", to_id="c1", record=_ScEdgeProps(weight=2)
+                )
+
+        app = coco.App(
+            coco.AppConfig(name="e2e_node_deleted", environment=coco_env), main
+        )
+        app.update_blocking()
+
+        rows = _export_rows(store)
+        assert len([r for r in rows if r.get("type") == "Source"]) == 2
+        assert len([r for r in rows if r.get("edge") == "Supports"]) == 2
+
+        keep_b["on"] = False
+        app.update_blocking()
+
+        rows = _export_rows(store)
+        sources_after = [r for r in rows if r.get("type") == "Source"]
+        assert [r["data"]["slug"] for r in sources_after] == ["a"]
+        edges_after = [r for r in rows if r.get("edge") == "Supports"]
+        assert len(edges_after) == 1
+        assert edges_after[0]["from"] == "a" and edges_after[0]["to"] == "c1"
+
+    def test_unchanged_issues_no_writes(self, store: str) -> None:
+        """The single most important case: CocoIndex's whole incrementality
+        promise rests on an unchanged source producing zero writes. Checked
+        via the commit count, not by trusting an absence of exceptions -- a
+        silently reissued no-op upsert would still pass a weaker check.
+        Three types declared together so a memoization bug in one type
+        can't hide behind a passing check on another."""
+        db = _e2e_db(store, "unchanged")
+
+        async def main() -> None:
+            source_schema = await NodeSchema.from_class(_ScSourceNarrow, key="slug")
+            claim_schema = await NodeSchema.from_class(_ScClaim, key="slug")
+            edge_schema = await NodeSchema.from_class(_ScEdgeProps, key="weight")
+
+            sources = await omnigraph.mount_node_target(db, "Source", source_schema)
+            claims = await omnigraph.mount_node_target(db, "Claim", claim_schema)
+            supports = await omnigraph.mount_edge_target(
+                db, "Supports", sources, claims, edge_schema
+            )
+            sources.declare_node(node=_ScSourceNarrow(slug="a", title="A"))
+            claims.declare_node(node=_ScClaim(slug="c1"))
+            supports.declare_edge(
+                from_id="a", to_id="c1", record=_ScEdgeProps(weight=1)
+            )
+
+        app = coco.App(coco.AppConfig(name="e2e_unchanged", environment=coco_env), main)
+        app.update_blocking()
+
+        before = _commit_count(store)
+        app.update_blocking()
+        after = _commit_count(store)
+
+        assert after == before
+
+    def test_oversized_component_uses_branch(
+        self, store: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Force the per-type chunking cap down so a batch of new Source
+        rows plans into multiple upsert commits (plan_commits' chunking via
+        _MAX_ENTITIES_PER_TYPE). More than one commit for a single sync
+        must land on `main` as ONE commit, via a scratch branch merged in
+        and cleaned up afterward -- not as several commits applied directly
+        to `main`, and not with a stray coco_scratch_* branch left behind.
+        Warms the store up with 2 Source rows (under the cap) first, so the
+        commit-count delta measured across the second run isolates the
+        chunked entity phase from the type-creation commits, which are a
+        separate, unconditional code path covered elsewhere. A sibling
+        Claim row, declared and left unchanged in both runs, proves the
+        scratch-branch path doesn't disturb it."""
+        monkeypatch.setattr(ogt, "_MAX_ENTITIES_PER_TYPE", 4)
+        db = _e2e_db(store, "oversized")
+        row_count = {"n": 2}
+
+        async def main() -> None:
+            source_schema = await NodeSchema.from_class(_ScSourceNarrow, key="slug")
+            claim_schema = await NodeSchema.from_class(_ScClaim, key="slug")
+
+            sources = await omnigraph.mount_node_target(db, "Source", source_schema)
+            claims = await omnigraph.mount_node_target(db, "Claim", claim_schema)
+            for i in range(row_count["n"]):
+                sources.declare_node(node=_ScSourceNarrow(slug=f"s{i}", title=f"S{i}"))
+            claims.declare_node(node=_ScClaim(slug="c1"))
+
+        app = coco.App(coco.AppConfig(name="e2e_oversized", environment=coco_env), main)
+        app.update_blocking()  # warm-up: creates both types, 2 Source rows, 1 Claim row
+
+        before = _commit_count(store)
+        row_count["n"] = 10  # 8 new rows -> 2 upsert chunks of 4 at cap=4
+        app.update_blocking()
+        after = _commit_count(store)
+
+        assert after - before == 1  # one merge commit, not two direct commits
+        assert _branch_names(store) == ["main"]  # no coco_scratch_* branch left behind
+
+        rows = _export_rows(store)
+        assert len([r for r in rows if r.get("type") == "Source"]) == 10
+        assert len([r for r in rows if r.get("type") == "Claim"]) == 1
+
+    def test_user_managed_first_run_writes_rows_without_touching_the_schema(
+        self, store: str
+    ) -> None:
+        """`managed_by=USER` on a graph this app has never tracked. The type
+        already exists (created here the way a user's own `omnigraph init`
+        would), and the app's job is only to keep rows in sync.
+
+        On run one there are no tracking records, so the tracked diff is
+        empty — which used to raise, making the mode unusable at exactly the
+        moment it's meant to be used. The docs advertise it as working.
+        """
+        store_dir = Path(store[len("file://") :])
+        assert (
+            _init_live(
+                store_dir,
+                (
+                    "node Source {\n  slug: String @key\n  title: String?\n"
+                    "  coco_key: String\n}\n"
+                ),
+            ).returncode
+            == 0
+        )
+        schema_before = _read_schema_source(store)
+
+        db = _e2e_db(store, "user_managed")
+        rows_to_write = {"n": 2}
+
+        async def main() -> None:
+            sources = await omnigraph.mount_node_target(
+                db,
+                "Source",
+                await NodeSchema.from_class(_ScSourceNarrow, key="slug"),
+                managed_by=ManagedBy.USER,
+            )
+            for i in range(rows_to_write["n"]):
+                sources.declare_node(node=_ScSourceNarrow(slug=f"s{i}", title=f"S{i}"))
+
+        app = coco.App(
+            coco.AppConfig(name="e2e_user_managed", environment=coco_env), main
+        )
+        app.update_blocking()
+
+        rows = _export_rows(store)
+        assert sorted(r["data"]["slug"] for r in rows if r.get("type") == "Source") == [
+            "s0",
+            "s1",
+        ]
+        # Never rewritten: byte-identical to what the user applied.
+        assert _read_schema_source(store) == schema_before
+
+        # Run two: rows still reconcile normally, schema still untouched.
+        rows_to_write["n"] = 1
+        app.update_blocking()
+        rows = _export_rows(store)
+        assert [r["data"]["slug"] for r in rows if r.get("type") == "Source"] == ["s0"]
+        assert _read_schema_source(store) == schema_before
+
+    def test_undeclared_type_is_dropped_with_its_rows(self, store: str) -> None:
+        """Stop mounting a node type and it must disappear from the graph,
+        rows included.
+
+        This is the only thing that removes them: the engine emits no
+        per-child deletes when a container target state goes away, so a
+        "drop" that wrote nothing left the type and every node in it behind
+        forever — still in `schema show`, still in `export`, and no longer
+        tracked by anything that could ever clean them up.
+        """
+        db = _e2e_db(store, "type_dropped")
+        keep_extra = {"on": True}
+
+        async def main() -> None:
+            claims = await omnigraph.mount_node_target(
+                db, "Claim", await NodeSchema.from_class(_ScClaim, key="slug")
+            )
+            claims.declare_node(node=_ScClaim(slug="c1"))
+            if keep_extra["on"]:
+                sources = await omnigraph.mount_node_target(
+                    db,
+                    "Source",
+                    await NodeSchema.from_class(_ScSourceNarrow, key="slug"),
+                )
+                sources.declare_node(node=_ScSourceNarrow(slug="s1", title="S1"))
+
+        app = coco.App(
+            coco.AppConfig(name="e2e_type_dropped", environment=coco_env), main
+        )
+        app.update_blocking()
+
+        rows = _export_rows(store)
+        assert len([r for r in rows if r.get("type") == "Source"]) == 1
+        assert "node Source" in _read_schema_source(store)
+
+        keep_extra["on"] = False
+        app.update_blocking()
+
+        rows = _export_rows(store)
+        assert [r for r in rows if r.get("type") == "Source"] == []
+        assert "node Source" not in _read_schema_source(store)
+        # The type that stayed declared is untouched by the other's drop.
+        assert len([r for r in rows if r.get("type") == "Claim"]) == 1
+        assert "node Claim" in _read_schema_source(store)
+
+    def test_undeclared_user_managed_type_survives_with_its_rows(
+        self, store: str
+    ) -> None:
+        """The `managed_by=USER` counterpart of the test above: stop mounting
+        the type and BOTH its schema block and its rows must survive.
+
+        Same app-level edit as the drop test, opposite required outcome. The
+        connector did not create this type, so it does not get to delete it,
+        and deleting it takes the user's own rows with it -- unrecoverable,
+        and the exact opposite of what the docs promise.
+        """
+        store_dir = Path(store[len("file://") :])
+        assert (
+            _init_live(
+                store_dir,
+                (
+                    "node Source {\n  slug: String @key\n  title: String?\n"
+                    "  coco_key: String\n}\n"
+                ),
+            ).returncode
+            == 0
+        )
+
+        db = _e2e_db(store, "user_managed_undeclared")
+        keep_extra = {"on": True}
+
+        async def main() -> None:
+            claims = await omnigraph.mount_node_target(
+                db, "Claim", await NodeSchema.from_class(_ScClaim, key="slug")
+            )
+            claims.declare_node(node=_ScClaim(slug="c1"))
+            if keep_extra["on"]:
+                sources = await omnigraph.mount_node_target(
+                    db,
+                    "Source",
+                    await NodeSchema.from_class(_ScSourceNarrow, key="slug"),
+                    managed_by=ManagedBy.USER,
+                )
+                sources.declare_node(node=_ScSourceNarrow(slug="s1", title="S1"))
+
+        app = coco.App(
+            coco.AppConfig(name="e2e_user_managed_undeclared", environment=coco_env),
+            main,
+        )
+        app.update_blocking()
+
+        rows = _export_rows(store)
+        assert [r["data"]["slug"] for r in rows if r.get("type") == "Source"] == ["s1"]
+        assert "node Source" in _read_schema_source(store)
+
+        keep_extra["on"] = False
+        app.update_blocking()
+
+        # The user owns this type: the block stays, and so does its row.
+        rows = _export_rows(store)
+        assert [r["data"]["slug"] for r in rows if r.get("type") == "Source"] == ["s1"]
+        assert "node Source" in _read_schema_source(store)
+
+    def test_integer_keyed_endpoint(self, store: str) -> None:
+        """An edge whose endpoint node is keyed on an int.
+
+        The endpoint reference is the node's `id`, which is a String
+        rendering of the key value — never the key's own type. Inferring
+        `I64` from the Python value instead made EVERY edge insert into an
+        int-keyed endpoint fail with "cannot assign/compare I64 with String
+        for property `to`", which is exactly what the shipped example does.
+        """
+        db = _e2e_db(store, "int_endpoint")
+
+        async def main() -> None:
+            people = await omnigraph.mount_node_target(
+                db, "Person", await NodeSchema.from_class(_ScClaim, key="slug")
+            )
+            meetings = await omnigraph.mount_node_target(
+                db, "Meeting", await NodeSchema.from_class(_ScMeeting, key="meeting_id")
+            )
+            attended = await omnigraph.mount_edge_target(
+                db, "Attended", people, meetings
+            )
+            people.declare_node(node=_ScClaim(slug="Ada"))
+            meetings.declare_node(node=_ScMeeting(meeting_id=7, note="Kickoff"))
+            attended.declare_edge(from_id="Ada", to_id=7)
+
+        app = coco.App(
+            coco.AppConfig(name="e2e_int_endpoint", environment=coco_env), main
+        )
+        app.update_blocking()
+
+        rows = _export_rows(store)
+        (edge,) = [r for r in rows if r.get("edge") == "Attended"]
+        assert (edge["from"], edge["to"]) == ("Ada", "7")
+        # Re-running must not duplicate it, and must not re-stub the endpoint
+        # over the real node (a keyed insert is a full-record replace).
+        app.update_blocking()
+        rows = _export_rows(store)
+        assert len([r for r in rows if r.get("edge") == "Attended"]) == 1
+        assert [r["data"]["note"] for r in rows if r.get("type") == "Meeting"] == [
+            "Kickoff"
+        ]

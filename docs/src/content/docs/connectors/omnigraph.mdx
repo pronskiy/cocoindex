@@ -1,0 +1,420 @@
+---
+title: "*Omnigraph* connector"
+toc_max_heading_level: 4
+description: >
+  Write to Omnigraph — a lakehouse-native property-graph database — with
+  support for node types, edge types, `.pg`-schema evolution, git-style
+  branching, and a synthetic `coco_key` property that gives every managed
+  node and edge a stable, filterable identity.
+---
+
+The `omnigraph` connector writes records to [Omnigraph](https://github.com/ModernRelay/omnigraph), a lakehouse-native property-graph database: typed nodes and edges declared in a `.pg` schema, Lance-backed storage, and git-style branching, all driven through a CLI. It supports node types, edge types, additive `.pg` schema evolution, and per-`ConnectionFactory` branch targeting.
+
+```python
+from cocoindex.connectors import omnigraph
+```
+
+:::note[Requirements]
+Unlike the other graph connectors, this one needs **no extra Python package** — it shells out to the `omnigraph` CLI binary rather than linking a driver. Install the binary and make sure it's on `PATH` (or point `ConnectionFactory(cli=...)` at it directly). Everything else — `pip install cocoindex` — is unchanged.
+
+Verified against Omnigraph 0.9.0. The connector only invokes CLI subcommands present in that release; HTTP transport is a future increment (the `omnigraph-server` HTTP surface exists but is not yet used here).
+:::
+
+## Connection setup
+
+Create a `ConnectionFactory` and provide it via a `ContextKey`. `store` is a graph URI — typically a local, git-ignored `file://` path — and `branch` names the branch every write in this connection targets.
+
+:::note
+The key name is load-bearing across runs — it's the stable identity CocoIndex uses to track managed nodes and edges. See [ContextKey as stable identity](../programming_guide/context#contextkey-as-stable-identity) before renaming.
+:::
+
+```python
+from collections.abc import AsyncIterator
+from cocoindex.connectors import omnigraph
+import cocoindex as coco
+
+OG: coco.ContextKey[omnigraph.ConnectionFactory] = coco.ContextKey("og")
+
+@coco.lifespan
+async def coco_lifespan(builder: coco.EnvironmentBuilder) -> AsyncIterator[None]:
+    builder.provide(
+        OG,
+        omnigraph.ConnectionFactory(
+            store="file:///var/lib/cocoindex/graph.omni",
+            branch="main",
+        ),
+    )
+    yield
+```
+
+```python
+class ConnectionFactory:
+    store: str            # a graph URI, e.g. "file:///abs/path/g.omni"
+    branch: str = "main"  # the branch every write through this connection targets
+    cli: str = "omnigraph"  # override if the binary isn't on PATH
+```
+
+If the graph at `store` hasn't been initialized yet, the connector runs `omnigraph init` for you on the first schema write — there's no separate provisioning step.
+
+### Multiple graphs or branches
+
+Pair each graph (or branch) with its own `ContextKey` and `ConnectionFactory`:
+
+```python
+OG: coco.ContextKey[omnigraph.ConnectionFactory] = coco.ContextKey("og")
+STAGING_OG: coco.ContextKey[omnigraph.ConnectionFactory] = coco.ContextKey("staging_og")
+
+@coco.lifespan
+async def coco_lifespan(builder: coco.EnvironmentBuilder) -> AsyncIterator[None]:
+    builder.provide(OG, omnigraph.ConnectionFactory(store="file:///data/g.omni", branch="main"))
+    builder.provide(STAGING_OG, omnigraph.ConnectionFactory(store="file:///data/g.omni", branch="staging"))
+    yield
+```
+
+:::caution[A non-`main` branch blocks every schema change]
+Omnigraph applies schema to the whole graph, not per branch, and refuses to do it at all while any other branch exists: `schema apply requires a graph with only main; found non-main branches: staging`. So pointing a `ConnectionFactory` at a branch other than `main` works **only** if the connector never needs to write schema — that is, if every type it touches is `managed_by="user"`. With any `managed_by="system"` type, the first type creation or schema change on that store fails.
+
+(This does not affect the scratch branches the connector opens for oversized syncs: those are transient and deleted before the next schema write.)
+:::
+
+A type's tracking identity is `(ContextKey, type name)` — the store URI and branch live on the `ConnectionFactory` and are resolved at write time, not baked into the tracking records. Two apps that should not share tracking must therefore use two different `ContextKey`s, as above; repointing one `ContextKey`'s `ConnectionFactory` at a different branch reuses the same records, which now describe another branch's contents.
+
+## As target
+
+The `omnigraph` connector provides target state APIs for writing nodes to node types and edges to edge types. CocoIndex tracks what nodes and edges should exist and automatically handles upserts and deletions.
+
+### Declaring target states
+
+#### Node types (parent state)
+
+Declares a node type as a target state. Returns a `NodeTarget` for declaring nodes.
+
+```python
+def mount_node_target(
+    db: coco.ContextKey[ConnectionFactory],
+    type_name: str,
+    schema: NodeSchema,
+    *,
+    key: str | Sequence[str] | None = None,
+    managed_by: Literal["system", "user"] = "system",
+) -> NodeTarget[Any]
+```
+
+**Parameters:**
+
+- `db` — A `ContextKey[omnigraph.ConnectionFactory]` for the Omnigraph connection.
+- `type_name` — The `.pg` node type name (e.g. `"Source"`).
+- `schema` — A `NodeSchema` describing the type's properties and key. Unlike the sibling connectors, this is required, not optional — a node type is always self-describing.
+- `key` — Optional redundant check: if given, must match `schema.key`, or mounting raises `ValueError`. Exists so a ported neo4j/falkordb/surrealdb app's `primary_key=` (renamed `key=`) keeps working at both the schema-construction and the mount call site, without deleting the second one.
+- `managed_by` — Whether CocoIndex manages the type's `.pg` schema (`"system"`) or assumes it exists (`"user"`, validate-only — see [Schema evolution](#schema-declaration-and-evolution) below).
+
+**Returns:** A resolved `NodeTarget`. `declare_node_target` (sync, for endpoint-only types) and `node_target` (the raw `TargetState`, for composing with `coco.mount`) are also available.
+
+#### Nodes (child states)
+
+Once a `NodeTarget` is resolved, declare nodes to be upserted (translated to a keyed `insert`, which Omnigraph treats as an upsert by key):
+
+```python
+def NodeTarget.declare_node(
+    self,
+    *,
+    node: RowT | None = None,
+    row: RowT | None = None,
+) -> None
+```
+
+**Parameters:**
+
+- `node` — A row object (dict, dataclass, NamedTuple, or Pydantic model) carrying every property named in `schema`, including the key field(s).
+- `row` — Compatibility alias for `node`, matching the sibling connectors' `declare_record(row=...)` call shape. Pass exactly one of `node`/`row` — passing both, or neither, raises `TypeError`.
+
+`declare_record` is an alias for `declare_node`, for compatibility with the sibling graph connectors (Neo4j, FalkorDB, SurrealDB).
+
+#### Edge types (parent state)
+
+Declares an edge type as a target state. `from_target`/`to_target` are passed **positionally**, so a mistyped endpoint is a mount-time Python error rather than a write-time one; the connector uses them to render `edge {Name}: {From} -> {To} { ... }` and to build endpoint stubs (see [Cross-component ordering](#cross-component-ordering) below).
+
+```python
+def mount_edge_target(
+    db: coco.ContextKey[ConnectionFactory],
+    type_name: str,
+    from_target: NodeTarget[Any],
+    to_target: NodeTarget[Any],
+    schema: NodeSchema | None = None,
+    *,
+    managed_by: Literal["system", "user"] = "system",
+) -> EdgeTarget[Any]
+```
+
+**Parameters:**
+
+- `db`, `type_name`, `managed_by` — as above. `type_name` must not already name a **node** type in the same graph: Omnigraph accepts both in a schema, but a mutation resolves the bare name to the node type, leaving the edge unwritable. Declaring one raises `ValueError` on the sync that would have created it.
+- `from_target` / `to_target` — the `NodeTarget`s this edge type connects.
+- `schema` — The edge's own properties. Required if you intend to pass `record=` to `declare_edge`: Omnigraph is schema-first, so an edge type's properties live in its `.pg` block and an insert naming an undeclared one is refused — passing a record to a schema-less edge type raises `TypeError` at declare time. (Neo4j's `MERGE` creates relationship properties on the fly, so a ported app that mounted a relation bare and still passed a record needs a schema added here.) If you build it with `NodeSchema.from_class`, that call still requires a `key=` naming one non-nullable field of the edge's own dataclass — but the value has no effect on the edge's identity, which is always `(from_id, to_id)` (see below).
+
+**Returns:** A resolved `EdgeTarget`. `declare_edge_target` and `edge_target` are also available, matching the node-type trio.
+
+Mounting validates both endpoints — see [Endpoint requirements](#endpoint-requirements).
+
+#### Edges (child states)
+
+Once an `EdgeTarget` is resolved, declare edges:
+
+```python
+def EdgeTarget.declare_edge(
+    self,
+    *,
+    from_id: Any,
+    to_id: Any,
+    record: RowT | None = None,
+) -> None
+```
+
+**Parameters:**
+
+- `from_id` / `to_id` — the source and target nodes' key values. Each must be a single scalar the endpoint type's key can be rendered from — see [Endpoint requirements](#endpoint-requirements).
+- `record` — Optional row object whose fields populate the edge's own properties.
+
+`declare_relation` is an alias for `declare_edge`.
+
+Omnigraph assigns every edge its own internal id (a ULID) that isn't addressable — there is no way to `insert`-then-upsert an edge by a caller-supplied id the way a keyed node works. The connector's identity for an edge is always the `(from_id, to_id)` pair: a second `declare_edge` call for the same pair updates that one edge (delete-then-insert under the hood) rather than creating a second, parallel edge.
+
+### The synthetic `coco_key` property
+
+Every type this connector manages — node or edge — gets one extra, non-nullable property: `coco_key: String`. You never set it yourself; it isn't a field on your dataclass, and declaring a property literally named `coco_key` raises `ValueError`.
+
+It exists because Omnigraph gives the connector no other way to address one specific entity for an update or delete:
+
+- Edges have no caller-suppliable id (see above), and their auto-assigned ULID isn't a filterable GQ property.
+- `where` accepts exactly **one** equality predicate — `where from = $a and to = $b` is a parse error, so a node's or edge's own key fields can't be combined into a compound filter either.
+
+So the connector derives a stable value (a fingerprint of the node's key tuple, or of `(from_id, to_id)` for an edge) and writes it into `coco_key` on every insert, then deletes and updates by `where coco_key = $value`. This is purely internal bookkeeping — it shows up in `omnigraph export`/`schema show` output, but nothing in the public API asks you to touch it.
+
+### Node schema: from Python class
+
+Build a `NodeSchema` by introspecting a record type:
+
+```python
+@classmethod
+async def NodeSchema.from_class(
+    cls,
+    target: type,
+    *,
+    key: str | Sequence[str],
+) -> NodeSchema
+```
+
+**Parameters:**
+
+- `target` — A dataclass. Unlike the sibling connectors' `TableSchema.from_class`, this does not also accept a NamedTuple or Pydantic model — `NodeSchema.from_class` introspects via `dataclasses.fields()` directly. It must not have a field named **`id`** — that's Omnigraph's own node identity column, materialized from the `@key` property, and declaring one alongside it makes the schema invalid. On an edge type, `src`, `dst`, `from` and `to` are reserved too. All of these raise `ValueError` naming the field.
+- `key` — The field name forming the type's key. Required — an unkeyed `insert` is a strict insert in Omnigraph, so every re-run would duplicate every node. Exactly **one** field: Omnigraph node types support a single `@key`, and a two-`@key` block is rejected outright (`node type X has multiple @key constraints; only one is supported`). A `Sequence[str]` is accepted for signature parity with the sibling connectors' `primary_key=`, but it must hold exactly one name. If your entity is identified by a combination of fields, derive a single id from them and key on that.
+
+**Returns:** A `NodeSchema` populated from the class's fields.
+
+#### Default Python → `.pg` type mapping
+
+| Python type | `.pg` type | Notes |
+|---|---|---|
+| `bool` | `Bool` | Checked before `int` — `bool` is a subclass of `int`. |
+| `int` | `I64` | |
+| `float` | `F64` | |
+| `str` | `String` | |
+| `datetime.date` | `Date` | Encoded via `.isoformat()`. |
+| `datetime.datetime` | `DateTime` | Encoded via `.isoformat()`; the engine accepts ISO with or without a trailing `Z`. |
+| `X \| None` | `X?` | Any of the above, made nullable. |
+| `list[X]` for scalar `X` | `[X]` | See the list-element constraint below. |
+| `bytes` | *(no mapping)* | See below — raises `TypeError`. |
+
+`.pg` also has `I32`, `U32`, `U64`, `F32`, `Vector(N)`, and `enum(a, b, ...)` keywords, plus `Blob`, but none of these has a default Python mapping — reach them with `OmnigraphType` (below) and your own encoder. Vector-index attachments (the equivalent of the neo4j connector's `declare_vector_index`) aren't implemented yet.
+
+**`bytes` has no mapping, on purpose.** Omnigraph's `Blob` type is an external URI reference the engine *fetches* — a `file://` value — not inline bytes. A Python `bytes` value can never legally become a `Blob`, so `bytes` fields raise `TypeError` at schema-build time rather than being silently coerced into something the engine would reject (or worse, quietly accept as the wrong thing). If you need blob-like content, store the URI as a `str` property and manage the referenced file yourself.
+
+**List elements must be non-nullable scalars.** `list[str]` maps to `[String]`, but `list[str | None]` (`[String?]`) and `list[list[str]]` (`[[String]]`) both raise `TypeError` at schema-build time — the engine rejects both forms outright (`"expected core_type"` / `"expected base_type"`).
+
+#### `OmnigraphType`
+
+Override the default mapping for a single property with `OmnigraphType`, via `typing.Annotated`:
+
+```python
+from typing import Annotated
+from dataclasses import dataclass
+from cocoindex.connectors.omnigraph import OmnigraphType
+
+@dataclass
+class Reading:
+    sensor: str
+    value: Annotated[int, OmnigraphType("I32")]  # narrower than the default I64
+```
+
+```python
+class OmnigraphType(NamedTuple):
+    pg_type: str
+```
+
+The `pg_type` string is validated against Omnigraph's type grammar (`validate_pg_type`) at schema-build time — an invalid expression fails fast in Python, before it would otherwise reach the engine as generated `.pg` text.
+
+### Node schema: explicit property definitions
+
+Build a `NodeSchema` directly when the row shape is dynamic:
+
+```python
+from cocoindex.connectors.omnigraph import NodeSchema, PropertyDef
+
+schema = NodeSchema(
+    properties={
+        "slug": PropertyDef("slug", "String"),
+        "title": PropertyDef("title", "String"),
+        "note": PropertyDef("note", "String?"),
+    },
+    key=("slug",),
+)
+```
+
+`PropertyDef` fields:
+
+- `name` — The property name (must match its key in `properties`).
+- `pg_type` — The `.pg` type string (see the table above; `?` suffix for nullable).
+- `encoder` — Optional `Callable[[Any], Any]` applied to non-`None` values before they're sent to Omnigraph.
+
+Note that `NodeSchema`'s fields (`properties`, `key`) are named differently from the sibling connectors' explicit-construction form (neo4j's `TableSchema(columns=..., primary_key=...)`) — `TableSchema = NodeSchema` is a straight alias, not a wrapper, so it keeps `NodeSchema`'s own field names.
+
+## Schema declaration and evolution
+
+For each managed type, the connector maintains a `.pg` fragment and reconciles it against the graph's actual schema on change. Because Omnigraph's `schema apply`/`init` each take the graph's **complete** desired schema — not a per-type diff — the connector reads the current whole-graph `.pg` source back, replaces (or appends) just this type's block, and writes the merged whole back. This read-merge-write is **not atomic**: two components applying schema changes concurrently can race it, and a lost update would silently drop whichever type the loser was adding or changing. Schema actions are rare (only on type creation or a property/key change), so the window is small, but it exists.
+
+| Schema change | What happens | Effect on existing nodes/edges |
+|---|---|---|
+| Type not yet in the graph | `.pg` fragment applied (`init` on the very first type, `schema apply` after) | — |
+| Property added | Additive `schema apply` | None re-upserted — existing rows just gain the column |
+| Property dropped or retyped | `schema apply` | Every existing node/edge of that type is forced to re-upsert |
+| `@key` changed, or a node/edge switched shape | Type dropped and recreated (two `schema apply` calls — see below) | Every child record is re-declared from scratch |
+| Type no longer declared | Its block is removed from the schema (`schema apply`) — **unless** it is `managed_by="user"`, which is left alone | Every node/edge of that type is removed with it; nothing is removed for a `managed_by="user"` type |
+| `managed_by="user"` | Validate only — never mutates `.pg` | Raises if the app's schema disagrees with what it previously tracked |
+
+**A non-nullable property can only be declared at type creation, never added by migration.** Omnigraph's `schema apply` rejects adding a non-nullable property to an existing type outright (`"requires a backfill and is not supported in schema migration v1"`). The connector checks for this in Python and raises a clear `ValueError` naming the property — make it optional (`X | None`), or accept that adding it means dropping and recreating the type.
+
+**A `@key` change can't be applied in place.** The engine flatly rejects an in-place key change as an unsupported migration step. The connector works around this with two separate `schema apply` calls: drop the type's block from the schema and apply that, then apply again with the type re-added under its new definition. This is exactly the `"destructive"` row above — every child node or edge of that type is re-declared from scratch, since their prior tracking is invalidated along with the old key.
+
+When `managed_by="user"` is set, the connector never mutates `.pg` for that type. Node/edge-level upserts and deletes still work normally — **provided your own `.pg` declares `coco_key: String` on that type.**
+
+:::caution[`managed_by="user"` types must declare `coco_key` yourself]
+The connector addresses every entity through the synthetic `coco_key` property, and under `managed_by="user"` it never writes the schema — so it cannot add that column for you. Every insert names `coco_key`, and every delete filters on it. Against a type whose `.pg` lacks it, *all* row writes fail with `type 'X' has no property 'coco_key'`.
+
+Add it to the type's definition when you create the graph:
+
+```
+node Source {
+  slug: String @key
+  title: String?
+  coco_key: String
+}
+```
+:::
+
+The check is against what CocoIndex has previously *tracked*, not against the live schema. On the first run there is nothing tracked, so the type is adopted as-is — that's the normal way to start using this mode against a graph you created yourself. It raises only once the app changes a type it had already tracked, which is the case worth reporting: your dataclass and your `.pg` have drifted apart.
+
+Removing a `managed_by="user"` type from your app is also never destructive: the connector didn't create the type and won't drop it.
+
+### Cross-component ordering
+
+An edge's endpoint node is routinely owned by a *different* component than the edge itself — in a per-file pipeline, a corpus-wide "attended" edge might reference a `Meeting` node a per-file component declares independently, and the two commit on their own schedules. The connector handles an edge arriving before its endpoint reactively: it applies the edge insert optimistically first, and only on an engine "not found" failure does it insert a key-only stub for the reported-missing endpoint and retry — up to two stub-and-retry rounds, since an edge has exactly two endpoints. The endpoint's own owning component later upserts its real row over the stub (a keyed `insert` is an upsert), so nothing is duplicated. Stubbing reactively rather than unconditionally matters: a keyed `insert` is a full-record *replace* in Omnigraph, not a partial merge, so stubbing an endpoint that already has real data would silently null out its other nullable properties.
+
+### Endpoint requirements
+
+`mount_edge_target` validates both endpoint types at **mount time**, not mid-sync — so a mistake raises `ValueError` naming the type immediately, rather than failing later from whatever unrelated component happens to declare the edge first. Two requirements, both consequences of how Omnigraph stores an edge:
+
+**Every non-key property must be optional.** The stub above can only ever carry the endpoint's key property, so a non-nullable property outside the key would make the stub insert impossible (`insert for 'Meeting' must provide non-nullable property 'note_file'`). Declare them as `X | None`.
+
+**The key must be a `String` or an integer.** An edge's `from`/`to` doesn't hold the key property — it holds the endpoint node's `id`, which the engine renders as a String from the key value whatever that key's declared type is. CocoIndex reproduces that rendering with `str(value)`, which is exact for strings and integers and for nothing else: a `Date` key of `2026-01-05` has the id `"20458"` (days since the epoch) and a `DateTime` id is epoch milliseconds. Key such a type on a generated string or integer id instead.
+
+## Branching and the sink
+
+Within one component's sync, the connector partitions its writes by target graph, and orders node upserts before edge inserts (so endpoints exist before edges reference them) and edge deletes before node deletes (so no edge dangles). If everything fits in one Omnigraph commit — a single kind of change (all upserts, or all deletes) for one type, no more than 8,192 entities of any one type and 32,768 in total — it's sent as one direct write to the branch configured on `ConnectionFactory`.
+
+When a component's writes don't fit — more than 8,192 entities of one type, or a mix of upserts *and* deletes in the same sync (Omnigraph 0.9.0 cannot combine `insert`/`update` with `delete` in a single mutation) — the connector opens a scratch branch off the target branch, applies every chunk there, and merges once the whole component is written. A single-commit sync that turns out to need an endpoint stub escalates to the same path: the recovery is two commits, and running it against the live branch could leave an orphan stub node behind if the retry then failed. Nothing is lost by the attempt — a failed Omnigraph mutation applies nothing at all. This keeps the component's target-state sync atomic from a reader's perspective, even though it lands as several underlying Omnigraph commits. The scratch branch is cleaned up (deleted) whether the merge succeeds or fails; a failed merge doesn't leave orphan branches behind.
+
+Every mutation reaches the CLI as two files — `--query` for the GQ source and `--params-file` for the bound values — never as inline arguments. A full-size commit is over 2 MB across the two, which exceeds the operating system's argument-list limit; the file forms have no size limit, so the 8,192-entity cap is a real, reachable number rather than one the transport would fail long before.
+
+## Example: Node and edge types
+
+```python
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from typing import Any
+import cocoindex as coco
+from cocoindex.connectors import omnigraph
+
+OG: coco.ContextKey[omnigraph.ConnectionFactory] = coco.ContextKey("og")
+
+
+# Both types are used as edge endpoints below, so their non-key properties
+# are optional -- see "Endpoint requirements".
+@dataclass
+class Source:
+    slug: str
+    title: str | None
+
+
+@dataclass
+class Claim:
+    slug: str
+    statement: str | None
+
+
+@coco.lifespan
+async def coco_lifespan(builder: coco.EnvironmentBuilder) -> AsyncIterator[None]:
+    builder.provide(OG, omnigraph.ConnectionFactory(store="file:///tmp/demo.omni"))
+    yield
+
+
+@coco.fn
+async def app_main() -> None:
+    sources = await omnigraph.mount_node_target(
+        OG, "Source", await omnigraph.NodeSchema.from_class(Source, key="slug"),
+    )
+    claims = await omnigraph.mount_node_target(
+        OG, "Claim", await omnigraph.NodeSchema.from_class(Claim, key="slug"),
+    )
+    supports = await omnigraph.mount_edge_target(OG, "Supports", sources, claims)
+
+    sources.declare_node(node=Source(slug="overview", title="Overview"))
+    claims.declare_node(node=Claim(slug="claim-1", statement="CocoIndex is declarative."))
+    supports.declare_edge(from_id="overview", to_id="claim-1")
+
+
+app = coco.App(coco.AppConfig(name="demo_to_omnigraph"), app_main)
+```
+
+Generated schema:
+
+```
+node Source {
+  slug: String @key
+  title: String?
+  coco_key: String
+}
+
+node Claim {
+  slug: String @key
+  statement: String?
+  coco_key: String
+}
+
+edge Supports: Source -> Claim {
+  coco_key: String
+}
+```
+
+## Naming: node/edge primary, table/relation/record aliases
+
+Omnigraph's own schema language says `node Source` and `edge Supports`, so `NodeTarget`/`EdgeTarget` and `declare_node`/`declare_edge` are this connector's primary names. But the three sibling graph connectors (Neo4j, FalkorDB, SurrealDB) share one table/relation-shaped public surface — so every entry point below has a table/relation alias that is *literally the same object*, not a wrapper, letting a sibling-connector app port to Omnigraph by changing its import, its `ConnectionFactory` arguments, and `primary_key=` to `key=`:
+
+| Primary | Alias |
+|---|---|
+| `NodeTarget`, `EdgeTarget` | `TableTarget`, `RelationTarget` |
+| `NodeSchema`, `PropertyDef` | `TableSchema`, `ColumnDef` |
+| `node_target`, `declare_node_target`, `mount_node_target` | `table_target`, `declare_table_target`, `mount_table_target` |
+| `edge_target`, `declare_edge_target`, `mount_edge_target` | `relation_target`, `declare_relation_target`, `mount_relation_target` |
+| `declare_node`, `declare_edge` | `declare_record`, `declare_relation` |
+
+See [`examples/meeting_notes_graph_omnigraph`](https://github.com/cocoindex-io/cocoindex/tree/main/examples/meeting_notes_graph_omnigraph) for the port, side-by-side with [`examples/meeting_notes_graph_neo4j`](https://github.com/cocoindex-io/cocoindex/tree/main/examples/meeting_notes_graph_neo4j).

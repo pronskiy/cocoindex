@@ -77,6 +77,7 @@ def validate_pg_type(pg_type: str) -> None:
 
 def render_property(name: str, pg_type: str, *, is_key: bool) -> str:
     validate_identifier(name, "property name")
+    validate_pg_type(pg_type)
     return f"{name}: {pg_type} @key" if is_key else f"{name}: {pg_type}"
 
 

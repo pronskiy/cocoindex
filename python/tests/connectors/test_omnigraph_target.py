@@ -122,6 +122,14 @@ class TestRenderProperty:
     def test_nullable_is_passed_through(self) -> None:
         assert render_property("age", "I32?", is_key=False) == "age: I32?"
 
+    def test_pg_type_cannot_inject_another_schema_block(self) -> None:
+        with pytest.raises(ValueError, match="Invalid Omnigraph property type"):
+            render_property(
+                "title",
+                "String\n}\nnode Surprise {\n  slug: String @key",
+                is_key=False,
+            )
+
 
 class TestRenderNodeType:
     def test_injects_coco_key(self) -> None:

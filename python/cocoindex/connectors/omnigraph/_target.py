@@ -267,13 +267,13 @@ class _TypeSpec:
     from_type: str | None
     to_type: str | None
     managed_by: ManagedBy
-    # Populated only for edge specs: the *endpoint* node types' own key field
-    # names. Needed by the sink to build endpoint stubs and the edge's
+    # Populated only for edge specs: the *endpoint* node types' own key
+    # definitions. Needed by the sink to build endpoint stubs and the edge's
     # `from`/`to` refs — `from_type`/`to_type` name the endpoint types, but
-    # nothing else here carries their key fields, since `schema` above is the
-    # edge's own (possibly absent) property schema, not the endpoints'.
-    from_key_fields: tuple[str, ...] = ()
-    to_key_fields: tuple[str, ...] = ()
+    # nothing else here carries their key definitions, since `schema` above is
+    # the edge's own (possibly absent) property schema, not the endpoints'.
+    from_key_property: PropertyDef | None = None
+    to_key_property: PropertyDef | None = None
 
 
 class _TypeMainRecord(msgspec.Struct, frozen=True, array_like=True):
@@ -627,8 +627,8 @@ class _EdgeAction(NamedTuple):
     properties: Sequence[PropertyValue]
     from_type: str
     to_type: str
-    from_key_fields: tuple[str, ...]
-    to_key_fields: tuple[str, ...]
+    from_key_property: PropertyDef
+    to_key_property: PropertyDef
 
 
 def _entity_record(properties: dict[str, Any]) -> _EntityTrackingRecord:
@@ -659,10 +659,14 @@ def _encode_properties(
     out = []
     for name, value in properties.items():
         prop_def = property_defs[name]
-        if value is not None and prop_def.encoder is not None:
-            value = prop_def.encoder(value)
-        out.append(PropertyValue(name, prop_def.pg_type, value))
+        out.append(_encode_property(prop_def, value))
     return tuple(out)
+
+
+def _encode_property(prop_def: PropertyDef, value: Any) -> PropertyValue:
+    if value is not None and prop_def.encoder is not None:
+        value = prop_def.encoder(value)
+    return PropertyValue(prop_def.name, prop_def.pg_type, value)
 
 
 class _NodeHandler(coco.TargetHandler[_NodeValue, _EntityTrackingRecord, Any]):
@@ -747,16 +751,16 @@ class _EdgeHandler(coco.TargetHandler[_EdgeValue, _EntityTrackingRecord, Any]):
         key: _TypeKey,
         from_type: str,
         to_type: str,
-        from_key_fields: tuple[str, ...],
-        to_key_fields: tuple[str, ...],
+        from_key_property: PropertyDef,
+        to_key_property: PropertyDef,
         property_defs: dict[str, PropertyDef],
     ) -> None:
         self._type_name = type_name
         self._key = key
         self._from_type = from_type
         self._to_type = to_type
-        self._from_key_fields = from_key_fields
-        self._to_key_fields = to_key_fields
+        self._from_key_property = from_key_property
+        self._to_key_property = to_key_property
         self._property_defs = property_defs
 
     def reconcile(
@@ -796,8 +800,8 @@ class _EdgeHandler(coco.TargetHandler[_EdgeValue, _EntityTrackingRecord, Any]):
                     (),
                     self._from_type,
                     self._to_type,
-                    self._from_key_fields,
-                    self._to_key_fields,
+                    self._from_key_property,
+                    self._to_key_property,
                 ),
                 sink=_entity_sink,
                 tracking_record=coco.NON_EXISTENCE,
@@ -847,8 +851,8 @@ class _EdgeHandler(coco.TargetHandler[_EdgeValue, _EntityTrackingRecord, Any]):
                 ),
                 self._from_type,
                 self._to_type,
-                self._from_key_fields,
-                self._to_key_fields,
+                self._from_key_property,
+                self._to_key_property,
             ),
             sink=_entity_sink,
             tracking_record=desired,
@@ -901,26 +905,6 @@ def _endpoint_ref(value: Any) -> PropertyValue:
     `.value` address the endpoint.
     """
     return PropertyValue("ref", "String", str(value))
-
-
-def _stub_key_ref(value: Any) -> PropertyValue:
-    """Build the PropertyValue for an endpoint stub's own key PROPERTY —
-    which, unlike the `from`/`to` reference above, is typed as the schema
-    declares it.
-
-    `plan_commits` is pure and has no schema to consult, so the pg_type is
-    inferred from the value's own runtime type via the same `_pg_type_for`
-    mapping `NodeSchema.from_class` uses for a plain (non-`OmnigraphType`
-    -overridden) field, and a date/datetime value gets the same ISO encoding
-    `PropertyDef.encoder` applies to an ordinary property.
-    """
-    pg_type = _pg_type_for(type(value))
-    encoded = (
-        value.isoformat()
-        if isinstance(value, (datetime.date, datetime.datetime))
-        else value
-    )
-    return PropertyValue("ref", pg_type, encoded)
 
 
 def _chunk_by_type(
@@ -1107,29 +1091,26 @@ def _build_endpoint_stub(
             # A delete carries no endpoints (`from_id`/`to_id` are `None`) and
             # needs none — deleting by `coco_key` never touches them. Without
             # this, `str(None)` matches any node whose key value is literally
-            # "None", and `_stub_key_ref(None)` then raises a bare TypeError
-            # from inside the sink, aborting the component mid-scratch-branch.
+            # "None" and can build a meaningless stub from the delete action.
             continue
         if (
             role == "src"
             and action.from_type == type_name
             and str(action.from_id) == key_str
         ):
-            value, key_fields = action.from_id, action.from_key_fields
+            value, key_property = action.from_id, action.from_key_property
         elif (
             role == "dst"
             and action.to_type == type_name
             and str(action.to_id) == key_str
         ):
-            value, key_fields = action.to_id, action.to_key_fields
+            value, key_property = action.to_id, action.to_key_property
         else:
             continue
-        if not key_fields:
-            continue
-        ref = _stub_key_ref(value)
+        ref = _encode_property(key_property, value)
         return build_endpoint_stub(
             type_name,
-            [PropertyValue(key_fields[0], ref.pg_type, ref.value)],
+            [ref],
             derive_coco_key((value,)),
         )
     return None
@@ -1507,17 +1488,19 @@ async def _apply_type_actions(
                 )
             else:
                 # Edge type: `from_type`/`to_type` name the endpoints, and
-                # `from_key_fields`/`to_key_fields` are the endpoints' own
-                # key field names — needed to build endpoint stubs.
+                # `from_key_property`/`to_key_property` are the endpoints' own
+                # key definitions — needed to build correctly typed stubs.
                 assert spec.to_type is not None
+                assert spec.from_key_property is not None
+                assert spec.to_key_property is not None
                 outputs[i] = coco.ChildTargetDef(
                     handler=_EdgeHandler(
                         action.key.type_name,
                         action.key,
                         spec.from_type,
                         spec.to_type,
-                        spec.from_key_fields,
-                        spec.to_key_fields,
+                        spec.from_key_property,
+                        spec.to_key_property,
                         spec.schema.properties if spec.schema is not None else {},
                     )
                 )
@@ -1822,14 +1805,16 @@ def _build_edge_spec(
     testable without reaching into `coco.TargetState`'s private value."""
     _validate_edge_endpoint(from_target, "from")
     _validate_edge_endpoint(to_target, "to")
+    (from_key_field,) = from_target.schema.key
+    (to_key_field,) = to_target.schema.key
     return _TypeSpec(
         schema=schema,
         key=(),
         from_type=from_target.type_name,
         to_type=to_target.type_name,
         managed_by=managed_by,
-        from_key_fields=from_target.schema.key,
-        to_key_fields=to_target.schema.key,
+        from_key_property=from_target.schema.properties[from_key_field],
+        to_key_property=to_target.schema.properties[to_key_field],
     )
 
 

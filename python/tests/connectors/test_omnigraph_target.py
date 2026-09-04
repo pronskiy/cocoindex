@@ -1509,7 +1509,13 @@ def _node_handler() -> _NodeHandler:
 
 def _edge_handler() -> _EdgeHandler:
     return _EdgeHandler(
-        "Supports", _EK, "Source", "Claim", ("slug",), ("slug",), _SUPPORTS_PROPS
+        "Supports",
+        _EK,
+        "Source",
+        "Claim",
+        _SOURCE_PROPS["slug"],
+        _SOURCE_PROPS["slug"],
+        _SUPPORTS_PROPS,
     )
 
 
@@ -1655,11 +1661,11 @@ class TestEdgeReconcile:
         assert a.action.coco_key != b.action.coco_key
 
     def test_endpoint_metadata_is_carried_for_stubs(self) -> None:
-        """The sink emits key-only endpoint stubs, so it needs the types and key fields."""
+        """The sink needs each endpoint's full key definition for stubs."""
         out = _edge_handler().reconcile(("a", "b"), _EdgeValue("a", "b", {}), [], False)
         assert out is not None
         assert out.action.from_type == "Source" and out.action.to_type == "Claim"
-        assert out.action.from_key_fields == ("slug",)
+        assert out.action.from_key_property == PropertyDef("slug", "String")
 
     def test_empty_and_prev_may_be_missing_is_replace_not_insert(self) -> None:
         """Empty `prev_possible_records` does not mean the edge is absent: the
@@ -1796,8 +1802,8 @@ def _edge(op: str, a: str, b: str) -> ogt._EdgeAction:
         (),
         "Source",
         "Claim",
-        ("slug",),
-        ("slug",),
+        PropertyDef("slug", "String"),
+        PropertyDef("slug", "String"),
     )
 
 
@@ -1917,8 +1923,8 @@ class TestPlanCommits:
             (),
             "Person",
             "Meeting",
-            ("name",),
-            ("meeting_id",),
+            PropertyDef("name", "String"),
+            PropertyDef("meeting_id", "I64"),
         )
         (commit,) = plan_commits([action])
         assert "$s0_e_to: String" in commit.expr
@@ -2055,16 +2061,35 @@ class TestPlanCommitsEncoding:
 
 
 class TestBuildEndpointStub:
+    def test_uses_the_endpoint_schemas_declared_key_type(self) -> None:
+        action = ogt._EdgeAction(
+            "insert",
+            _TypeKey("og", "edge", "Supports"),
+            "Supports",
+            derive_coco_key((7, "c1")),
+            7,
+            "c1",
+            (),
+            "Source",
+            "Claim",
+            PropertyDef("source_id", "I32"),
+            PropertyDef("slug", "String"),
+        )
+
+        stub = ogt._build_endpoint_stub("src", "7", "Source", [action])
+
+        assert stub is not None
+        assert "$p_source_id: I32" in stub.expr
+        assert "$p_source_id: I64" not in stub.expr
+        assert stub.params["p_source_id"] == 7
+
     def test_delete_actions_are_not_stub_candidates(self) -> None:
         """A delete `_EdgeAction` carries `from_id=None`/`to_id=None`, so
         `str(action.from_id)` is the literal `"None"`.
 
         A node whose key value is the string `"None"` therefore matched a
-        delete action, and `_stub_key_ref(None)` raised `TypeError: no
-        Omnigraph type mapping for <class 'NoneType'>` from inside the sink —
-        an uncaught TypeError rather than an `OmnigraphCliError`, aborting the
-        whole component's sync mid-scratch-branch. A delete needs no endpoints
-        anyway: deleting by `coco_key` never touches them.
+        delete action and built a meaningless endpoint stub. A delete needs no
+        endpoints anyway: deleting by `coco_key` never touches them.
         """
         h = _edge_handler()
         first = h.reconcile(("a", "b"), _EdgeValue("a", "b", {}), [], False)
@@ -2242,8 +2267,8 @@ class TestApplyEntityActions:
                 (),
                 "Source",
                 "Claim",
-                ("slug",),
-                ("slug",),
+                PropertyDef("slug", "String"),
+                PropertyDef("slug", "String"),
             ),
         ]
         await ogt._apply_entity_actions(cp, actions)
@@ -2822,11 +2847,11 @@ class TestPublicSurface:
 
 
 # ---------------------------------------------------------------------------
-# Endpoint key-field wiring: Task 9's stub-and-retry recovery reads
-# `_EdgeAction.from_key_fields`/`to_key_fields`, sourced from
-# `_TypeSpec.from_key_fields`/`to_key_fields`. Nothing populated those until
-# `edge_target()` (this task) does — without this wiring the fields silently
-# default to `()` and the recovery mechanism never fires. See
+# Endpoint key-definition wiring: the stub-and-retry recovery reads
+# `_EdgeAction.from_key_property`/`to_key_property`, sourced from
+# `_TypeSpec.from_key_property`/`to_key_property`. Without this wiring the
+# recovery mechanism cannot preserve the endpoint schema's declared type and
+# encoder. See
 # `test_endpoint_metadata_is_carried_for_stubs` above for the handler-level
 # half of this same contract.
 # ---------------------------------------------------------------------------
@@ -2896,9 +2921,9 @@ class TestRecordToDict:
         }
 
 
-class TestEdgeTargetKeyFieldWiring:
-    def test_edge_target_populates_endpoint_key_fields(self) -> None:
-        # Key-only schemas — this test is about key-field wiring, not the
+class TestEdgeTargetKeyPropertyWiring:
+    def test_edge_target_populates_endpoint_key_properties(self) -> None:
+        # Key-only schemas — this test is about key-definition wiring, not the
         # stub-compatibility guard (see test_mount_edge_rejects_unstubbable_
         # endpoint below for that), so neither endpoint may carry a
         # non-nullable non-key property or `_build_edge_spec` would raise
@@ -2925,8 +2950,8 @@ class TestEdgeTargetKeyFieldWiring:
             claim,
             ManagedBy.SYSTEM,
         )
-        assert spec.from_key_fields == ("slug",)
-        assert spec.to_key_fields == ("slug",)
+        assert spec.from_key_property == PropertyDef("slug", "String")
+        assert spec.to_key_property == PropertyDef("slug", "String")
 
         # Reconcile the spec through the real handler chain, exactly as the
         # engine would, to prove the field actually reaches `_EdgeAction` —
@@ -2934,24 +2959,24 @@ class TestEdgeTargetKeyFieldWiring:
         out = _EdgeTypeHandler().reconcile(_EK, spec, [], False)
         assert out is not None
         assert not coco.is_non_existence(out.action.spec)
-        assert out.action.spec.from_key_fields == ("slug",)
-        assert out.action.spec.to_key_fields == ("slug",)
+        assert out.action.spec.from_key_property == PropertyDef("slug", "String")
+        assert out.action.spec.to_key_property == PropertyDef("slug", "String")
 
         handler = _EdgeHandler(
             "Supports",
             _EK,
             "Source",
             "Claim",
-            out.action.spec.from_key_fields,
-            out.action.spec.to_key_fields,
+            out.action.spec.from_key_property,
+            out.action.spec.to_key_property,
             _SUPPORTS_PROPS,
         )
         edge_out = handler.reconcile(
             ("s1", "c1"), _EdgeValue("s1", "c1", {}), [], False
         )
         assert edge_out is not None
-        assert edge_out.action.from_key_fields == ("slug",)
-        assert edge_out.action.to_key_fields == ("slug",)
+        assert edge_out.action.from_key_property == PropertyDef("slug", "String")
+        assert edge_out.action.to_key_property == PropertyDef("slug", "String")
 
 
 # ---------------------------------------------------------------------------
@@ -4076,8 +4101,8 @@ class TestReplaceOrderingLive:
             (PropertyValue("weight", "I64", 1),),
             "Source",
             "Claim",
-            ("slug",),
-            ("slug",),
+            PropertyDef("slug", "String"),
+            PropertyDef("slug", "String"),
         )
         await ogt._apply_entity_actions(cp, [insert_action])
 
@@ -4096,8 +4121,8 @@ class TestReplaceOrderingLive:
             (PropertyValue("weight", "I64", 2),),
             "Source",
             "Claim",
-            ("slug",),
-            ("slug",),
+            PropertyDef("slug", "String"),
+            PropertyDef("slug", "String"),
         )
         commits = plan_commits([replace_action])
         assert len(commits) == 2  # phase A (delete) + phase B (insert)
@@ -4142,8 +4167,8 @@ class TestEndpointRetryLive:
             (PropertyValue("weight", "I64", 1),),
             "Source",
             "Claim",
-            ("slug",),
-            ("slug",),
+            PropertyDef("slug", "String"),
+            PropertyDef("slug", "String"),
         )
         await ogt._apply_entity_actions(cp, [insert_action])
 
@@ -4194,8 +4219,8 @@ class TestEndpointRetryLive:
             (PropertyValue("weight", "I64", 1),),
             "Source",
             "Claim",
-            ("slug",),
-            ("slug",),
+            PropertyDef("slug", "String"),
+            PropertyDef("slug", "String"),
         )
         await ogt._apply_entity_actions(cp, [insert_action])
 
@@ -4236,8 +4261,8 @@ class TestEndpointRetryLive:
             (PropertyValue("weight", "I64", 1),),
             "Source",
             "Claim",
-            ("slug",),
-            ("slug",),
+            PropertyDef("slug", "String"),
+            PropertyDef("slug", "String"),
         )
         await ogt._apply_entity_actions(cp, [insert_action])
 

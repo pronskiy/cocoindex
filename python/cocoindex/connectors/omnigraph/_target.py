@@ -1227,8 +1227,10 @@ async def _apply_entity_actions(
         # non-zero exit from `branch_merge` and propagates like any other
         # failure below.
         scratch = f"coco_scratch_{uuid.uuid4().hex}"
+        scratch_created = False
         try:
             await client.branch_create(scratch, frm=conn.branch)
+            scratch_created = True
             for commit in commits:
                 await _mutate_with_endpoint_retry(
                     client, commit, branch=scratch, edge_actions=edge_actions
@@ -1243,15 +1245,11 @@ async def _apply_entity_actions(
             # every subsequent `schema apply` on that store outright
             # (verified live). `branch_delete` itself raises when the
             # branch doesn't exist (verified against the binary) — if
-            # `branch_create` never landed, there's nothing to delete, and
-            # `finally` running after an exception from `try` must not
-            # mask it with a second one. `contextlib.suppress` here
-            # swallows only branch_delete's own failure, which is enough:
-            # a `finally` block that raises nothing lets whatever
-            # exception `try` raised (if any) continue propagating on its
-            # own, so a genuine merge failure still surfaces exactly as
-            # before.
-            with contextlib.suppress(OmnigraphCliError):
+            # `branch_create` never landed, there is nothing to delete. Once
+            # it did land, however, cleanup failure must be reported: a stale
+            # non-main branch prevents later schema changes, so treating this
+            # update as successful would persist a hidden operational failure.
+            if scratch_created:
                 await client.branch_delete(scratch)
 
 

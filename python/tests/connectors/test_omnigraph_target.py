@@ -2112,6 +2112,41 @@ class TestApplyEntityActions:
             await ogt._apply_entity_actions(cp, actions)
 
     @pytest.mark.asyncio
+    async def test_branch_cleanup_failure_is_reported(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def noop(self: object, *args: object, **kwargs: object) -> None:
+            return None
+
+        async def fail_delete(self: object, name: str) -> None:
+            raise OmnigraphCliError(f"failed to delete {name}")
+
+        monkeypatch.setattr(_CliClient, "mutate", noop)
+        monkeypatch.setattr(_CliClient, "branch_create", noop)
+        monkeypatch.setattr(_CliClient, "branch_merge", noop)
+        monkeypatch.setattr(_CliClient, "branch_delete", fail_delete)
+
+        db = ContextKey[ConnectionFactory](f"test_db_{uuid.uuid4().hex}")
+        cp = ContextProvider()
+        cp.provide(db, ConnectionFactory(store="file:///tmp/whatever.omni"))
+        key = _TypeKey(db.key, "node", "Source")
+        actions: list[ogt._NodeAction | ogt._EdgeAction] = [
+            ogt._NodeAction(
+                "upsert",
+                key,
+                "Source",
+                (PropertyValue("slug", "String", "a"),),
+                derive_coco_key(("a",)),
+            ),
+            ogt._NodeAction(
+                "delete", key, "Source", (), derive_coco_key(("gone",))
+            ),
+        ]
+
+        with pytest.raises(OmnigraphCliError, match="failed to delete"):
+            await ogt._apply_entity_actions(cp, actions)
+
+    @pytest.mark.asyncio
     async def test_single_commit_skips_the_scratch_branch(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

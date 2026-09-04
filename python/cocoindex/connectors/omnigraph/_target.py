@@ -426,13 +426,22 @@ class _TypeHandlerBase(coco.TargetHandler[_TypeSpec, _TypeTrackingRecord, Any]):
         desired = _type_tracking_record_from_spec(spec)
 
         # --- The write path: what actually has to be applied. ---
-        main_action, property_transitions = statediff.diff_composite(
-            statediff.resolve_system_transition(
-                statediff.TrackingRecordTransition(
-                    desired, prev_possible_records, prev_may_be_missing
-                )
+        # A SYSTEM declaration owns the desired schema, including when the
+        # previous declaration was USER-managed. Keep those previous schemas
+        # in the diff: filtering them out makes a simultaneous ownership and
+        # schema change look like an already-converged empty transition, then
+        # persists the new tracking record without ever applying its DDL.
+        # USER declarations still emit no schema action at all.
+        write_transition = (
+            statediff.TrackingRecordTransition(
+                desired.tracking_record,
+                [p.tracking_record for p in prev_possible_records],
+                prev_may_be_missing,
             )
+            if spec.managed_by == ManagedBy.SYSTEM
+            else None
         )
+        main_action, property_transitions = statediff.diff_composite(write_transition)
         property_actions: dict[str, statediff.DiffAction] = {}
         if main_action is None:
             # `_apply_type_schema` re-renders and re-issues this type's whole

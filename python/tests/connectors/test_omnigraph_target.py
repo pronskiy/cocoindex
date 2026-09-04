@@ -1309,6 +1309,32 @@ class TestTypeOwnershipMatrix:
         assert bool(out.action.main_action or out.action.property_actions) is writes
 
     @pytest.mark.asyncio
+    async def test_user_to_system_handoff_applies_a_schema_change(self) -> None:
+        @dataclass
+        class _V1:
+            slug: str
+
+        @dataclass
+        class _V2:
+            slug: str
+            title: str | None
+
+        old_schema = await NodeSchema.from_class(_V1, key="slug")
+        new_schema = await NodeSchema.from_class(_V2, key="slug")
+        prev = _type_tracking_record_from_spec(_spec(old_schema, ManagedBy.USER))
+
+        out = _NodeTypeHandler().reconcile(
+            _TypeKey("og", "node", "Doc"),
+            _spec(new_schema, ManagedBy.SYSTEM),
+            [prev],
+            False,
+        )
+
+        assert out is not None
+        assert out.action.main_action is None
+        assert out.action.property_actions == {"prop:title": "insert"}
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "prev_ownerships",
         [[], [ManagedBy.SYSTEM], [ManagedBy.USER], [ManagedBy.SYSTEM, ManagedBy.USER]],

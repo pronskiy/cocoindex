@@ -2279,6 +2279,86 @@ class TestApplyEntityActions:
         assert "mutate:main" not in calls[1:]  # no stub written to the live branch
         assert "branch_merge" in calls and calls[-1] == "branch_delete"
 
+    @pytest.mark.asyncio
+    async def test_scratch_branch_blocks_schema_changes_until_deleted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        branch_created = asyncio.Event()
+        allow_mutations = asyncio.Event()
+        schema_started = asyncio.Event()
+        schema_read = asyncio.Event()
+        calls: list[str] = []
+
+        async def fake_mutate(self: object, mutation: Mutation, *, branch: str) -> None:
+            calls.append(f"mutate:{branch}")
+            await allow_mutations.wait()
+
+        async def fake_branch_create(self: object, name: str, *, frm: str) -> None:
+            calls.append("branch_create")
+            branch_created.set()
+
+        async def fake_branch_merge(self: object, name: str, *, into: str) -> None:
+            calls.append("branch_merge")
+
+        async def fake_branch_delete(self: object, name: str) -> None:
+            calls.append("branch_delete")
+
+        async def fake_read_schema(self: object) -> str | None:
+            calls.append("schema_read")
+            schema_read.set()
+            return "node Existing {\n  slug: String @key\n  coco_key: String\n}\n"
+
+        async def fake_apply_schema(self: object, schema_pg: str) -> None:
+            calls.append("schema_apply")
+
+        monkeypatch.setattr(_CliClient, "mutate", fake_mutate)
+        monkeypatch.setattr(_CliClient, "branch_create", fake_branch_create)
+        monkeypatch.setattr(_CliClient, "branch_merge", fake_branch_merge)
+        monkeypatch.setattr(_CliClient, "branch_delete", fake_branch_delete)
+        monkeypatch.setattr(_CliClient, "read_schema", fake_read_schema)
+        monkeypatch.setattr(_CliClient, "apply_schema", fake_apply_schema)
+
+        store = f"file:///tmp/{uuid.uuid4().hex}.omni"
+        conn = ConnectionFactory(store=store)
+        db = ContextKey[ConnectionFactory](f"test_db_{uuid.uuid4().hex}")
+        cp = ContextProvider()
+        cp.provide(db, conn)
+        edge_action = ogt._EdgeAction(
+            "replace",
+            _TypeKey(db.key, "edge", "Supports"),
+            "Supports",
+            derive_coco_key(("s1", "c1")),
+            "s1",
+            "c1",
+            (),
+            "Source",
+            "Claim",
+            PropertyDef("slug", "String"),
+            PropertyDef("slug", "String"),
+        )
+        schema_action = _type_action(
+            "insert",
+            "Added",
+            "node Added {\n  slug: String @key\n  coco_key: String\n}",
+        )
+
+        async def reconcile_schema() -> None:
+            schema_started.set()
+            await ogt._apply_type_schema(_CliClient(conn), [schema_action])
+
+        entity_task = asyncio.create_task(ogt._apply_entity_actions(cp, [edge_action]))
+        await branch_created.wait()
+        schema_task = asyncio.create_task(reconcile_schema())
+        await schema_started.wait()
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(schema_read.wait(), timeout=0.05)
+        finally:
+            allow_mutations.set()
+        await asyncio.gather(entity_task, schema_task)
+
+        assert calls.index("branch_delete") < calls.index("schema_read")
+
 
 class TestReadSchema:
     """Unit coverage for read_schema's not-found detection, mocked so it

@@ -92,8 +92,8 @@ class _CliClient:
         self._conn = conn
 
     @contextlib.asynccontextmanager
-    async def schema_lock(self) -> AsyncIterator[None]:
-        """Serialize whole-schema read/modify/write sequences for this store."""
+    async def store_lock(self) -> AsyncIterator[None]:
+        """Serialize operations that require exclusive access to this store."""
         digest = hashlib.sha256(self._conn.store.encode()).hexdigest()
         path = (
             pathlib.Path(tempfile.gettempdir()) / f"cocoindex-omnigraph-{digest}.lock"

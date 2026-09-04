@@ -1206,32 +1206,37 @@ async def _apply_entity_actions(
         # takes `--if-commit`); a conflicted merge simply surfaces as a
         # non-zero exit from `branch_merge` and propagates like any other
         # failure below.
-        scratch = f"coco_scratch_{uuid.uuid4().hex}"
-        scratch_created = False
-        try:
-            await client.branch_create(scratch, frm=conn.branch)
-            scratch_created = True
-            for commit in commits:
-                await _mutate_with_endpoint_retry(
-                    client, commit, branch=scratch, edge_actions=edge_actions
-                )
-            await client.branch_merge(scratch, into=conn.branch)
-        finally:
-            # Delete the scratch branch whether the merge succeeded or
-            # failed — `branch_merge` does not delete its source branch
-            # (we don't pass `--delete-branch`, which would only cover the
-            # success path anyway), so a bare
-            # try/except-only cleanup left one behind on every SUCCESSFUL
-            # multi-commit sync, and a leftover non-main branch blocks
-            # every subsequent `schema apply` on that store outright
-            # (verified live). `branch_delete` itself raises when the
-            # branch doesn't exist (verified against the binary) — if
-            # `branch_create` never landed, there is nothing to delete. Once
-            # it did land, however, cleanup failure must be reported: a stale
-            # non-main branch prevents later schema changes, so treating this
-            # update as successful would persist a hidden operational failure.
-            if scratch_created:
-                await client.branch_delete(scratch)
+        # A non-main branch makes Omnigraph reject every schema apply on the
+        # store. Hold the same store lock as schema reconciliation from before
+        # branch creation until after deletion, so a concurrent type update
+        # never observes this transient branch and fails spuriously.
+        async with client.store_lock():
+            scratch = f"coco_scratch_{uuid.uuid4().hex}"
+            scratch_created = False
+            try:
+                await client.branch_create(scratch, frm=conn.branch)
+                scratch_created = True
+                for commit in commits:
+                    await _mutate_with_endpoint_retry(
+                        client, commit, branch=scratch, edge_actions=edge_actions
+                    )
+                await client.branch_merge(scratch, into=conn.branch)
+            finally:
+                # Delete the scratch branch whether the merge succeeded or
+                # failed — `branch_merge` does not delete its source branch
+                # (we don't pass `--delete-branch`, which would only cover the
+                # success path anyway), so a bare
+                # try/except-only cleanup left one behind on every SUCCESSFUL
+                # multi-commit sync, and a leftover non-main branch blocks
+                # every subsequent `schema apply` on that store outright
+                # (verified live). `branch_delete` itself raises when the
+                # branch doesn't exist (verified against the binary) — if
+                # `branch_create` never landed, there is nothing to delete. Once
+                # it did land, however, cleanup failure must be reported: a stale
+                # non-main branch prevents later schema changes, so treating this
+                # update as successful would persist a hidden operational failure.
+                if scratch_created:
+                    await client.branch_delete(scratch)
 
 
 _entity_sink = coco.TargetActionSink.from_async_fn(_apply_entity_actions)
@@ -1392,7 +1397,7 @@ async def _apply_type_schema(
     # merge, and every resulting apply under one store-scoped lock so two app
     # updates cannot both read the same schema and overwrite each other's
     # changes with competing complete-schema writes.
-    async with client.schema_lock():
+    async with client.store_lock():
         await _apply_type_schema_locked(client, pending)
 
 

@@ -21,12 +21,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, cast
 
-import pytest
-
-from cocoindex._internal.context_keys import ContextKey, ContextProvider
-
 import cocoindex as coco
+import pytest
+from cocoindex._internal.context_keys import ContextKey, ContextProvider
+from cocoindex.connectorkits import statediff
+from cocoindex.connectorkits.target import ManagedBy
 from cocoindex.connectors import omnigraph
+from cocoindex.connectors.omnigraph import _target as ogt
 from cocoindex.connectors.omnigraph._client import (
     ConnectionFactory,
     OmnigraphCliError,
@@ -50,9 +51,6 @@ from cocoindex.connectors.omnigraph._gq import (
     validate_identifier,
     validate_pg_type,
 )
-from cocoindex.connectorkits import statediff
-from cocoindex.connectorkits.target import ManagedBy
-from cocoindex.connectors.omnigraph import _target as ogt
 from cocoindex.connectors.omnigraph._target import (
     NodeSchema,
     OmnigraphType,
@@ -60,13 +58,12 @@ from cocoindex.connectors.omnigraph._target import (
     _EdgeHandler,
     _EdgeTypeHandler,
     _EdgeValue,
-    _EntityTrackingRecord,
     _NodeHandler,
     _NodeTypeHandler,
     _NodeValue,
+    _type_tracking_record_from_spec,
     _TypeKey,
     _TypeSpec,
-    _type_tracking_record_from_spec,
     derive_coco_key,
     plan_commits,
 )
@@ -654,7 +651,7 @@ class TestTypeMapping:
         ISO with or without a trailing `Z`, so `.isoformat()` suffices."""
         schema = await NodeSchema.from_class(_Doc, key="slug")
         on = datetime.date(2026, 1, 1)
-        at = datetime.datetime(2026, 1, 1, 12, 30)
+        at = datetime.datetime(2026, 1, 1, 12, 30)  # noqa: DTZ001
         assert schema.properties["on"].encoder is not None
         assert schema.properties["on"].encoder(on) == on.isoformat()
         assert schema.properties["at"].encoder is not None
@@ -2025,7 +2022,7 @@ class TestPlanCommitsEncoding:
                 {
                     "slug": "e1",
                     "on": datetime.date(2026, 1, 1),
-                    "at": datetime.datetime(2026, 1, 1, 12, 0),
+                    "at": datetime.datetime(2026, 1, 1, 12, 0),  # noqa: DTZ001
                     "note": None,
                 }
             ),
@@ -2138,9 +2135,7 @@ class TestApplyEntityActions:
                 (PropertyValue("slug", "String", "a"),),
                 derive_coco_key(("a",)),
             ),
-            ogt._NodeAction(
-                "delete", key, "Source", (), derive_coco_key(("gone",))
-            ),
+            ogt._NodeAction("delete", key, "Source", (), derive_coco_key(("gone",))),
         ]
 
         with pytest.raises(OmnigraphCliError, match="failed to delete"):
@@ -3544,6 +3539,7 @@ def _init_live(store_dir: Path, schema_pg: str) -> subprocess.CompletedProcess[s
             ],
             capture_output=True,
             text=True,
+            check=False,
         )
 
 
@@ -3567,6 +3563,7 @@ def _mutate_live(
         ],
         capture_output=True,
         text=True,
+        check=False,
     )
     if check:
         assert r.returncode == 0, r.stderr
@@ -3688,13 +3685,16 @@ class TestEngineSchemaLimitsLive:
                 "--json",
                 "--quiet",
                 "-e",
-                "query m($p_slug: String, $p_coco_key: String) "
-                "{ insert Meeting { slug: $p_slug, coco_key: $p_coco_key } }",
+                (
+                    "query m($p_slug: String, $p_coco_key: String) "
+                    "{ insert Meeting { slug: $p_slug, coco_key: $p_coco_key } }"
+                ),
                 "--params",
                 '{"p_slug": "m1", "p_coco_key": "ck1"}',
             ],
             capture_output=True,
             text=True,
+            check=False,
         )
         assert r.returncode != 0
         assert "must provide non-nullable property `note_file`" in r.stderr

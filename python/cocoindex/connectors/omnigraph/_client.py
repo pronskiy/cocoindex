@@ -11,7 +11,6 @@ import json
 import pathlib
 import tempfile
 from collections.abc import AsyncIterator
-from typing import Protocol
 
 from cocoindex.connectors.omnigraph._gq import Mutation
 
@@ -32,16 +31,6 @@ class ConnectionFactory:
     cli: str = "omnigraph"
 
 
-class _Client(Protocol):
-    async def init_graph(self, schema_pg: str) -> None: ...
-    async def apply_schema(self, schema_pg: str) -> None: ...
-    async def read_schema(self) -> str | None: ...
-    async def mutate(self, mutation: Mutation, *, branch: str) -> None: ...
-    async def branch_create(self, name: str, *, frm: str) -> None: ...
-    async def branch_merge(self, name: str, *, into: str) -> None: ...
-    async def branch_delete(self, name: str) -> None: ...
-
-
 class OmnigraphCliError(RuntimeError):
     """Non-zero exit from the omnigraph CLI, carrying its stderr."""
 
@@ -54,7 +43,9 @@ class _CliClient:
     async def schema_lock(self) -> AsyncIterator[None]:
         """Serialize whole-schema read/modify/write sequences for this store."""
         digest = hashlib.sha256(self._conn.store.encode()).hexdigest()
-        path = pathlib.Path(tempfile.gettempdir()) / f"cocoindex-omnigraph-{digest}.lock"
+        path = (
+            pathlib.Path(tempfile.gettempdir()) / f"cocoindex-omnigraph-{digest}.lock"
+        )
         lock_file = await asyncio.to_thread(path.open, "a+b")
         try:
             await asyncio.to_thread(fcntl.flock, lock_file, fcntl.LOCK_EX)

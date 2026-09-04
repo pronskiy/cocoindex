@@ -11,10 +11,8 @@ import uuid
 from collections.abc import Callable, Sequence
 from typing import Any, Generic, Literal, NamedTuple
 
-import msgspec
-from typing_extensions import TypeVar
-
 import cocoindex as coco
+import msgspec
 from cocoindex._internal.context_keys import ContextProvider
 from cocoindex._internal.datatype import TypeChecker
 from cocoindex.connectorkits import statediff
@@ -28,13 +26,13 @@ from cocoindex.connectors.omnigraph._client import (
 from cocoindex.connectors.omnigraph._gq import (
     Mutation,
     PropertyValue,
+    _find_type_block,
     build_edge_delete,
     build_edge_insert,
     build_endpoint_stub,
     build_node_delete,
     build_node_upsert,
     combine_mutations,
-    _find_type_block,
     edge_types_referencing,
     merge_type_into_schema,
     remove_type_from_schema,
@@ -43,6 +41,7 @@ from cocoindex.connectors.omnigraph._gq import (
     validate_identifier,
     validate_pg_type,
 )
+from typing_extensions import TypeVar
 
 
 def derive_coco_key(parts: object) -> str:
@@ -1554,7 +1553,7 @@ RowT = TypeVar("RowT", default=dict[str, Any])
 
 
 class NodeTarget(
-    Generic[RowT, coco.MaybePendingS], coco.ResolvesTo["NodeTarget[RowT]"]
+    coco.ResolvesTo["NodeTarget[RowT]"], Generic[RowT, coco.MaybePendingS]
 ):
     """A target for writing nodes to an Omnigraph node type."""
 
@@ -1613,7 +1612,7 @@ class NodeTarget(
 
 
 class EdgeTarget(
-    Generic[RowT, coco.MaybePendingS], coco.ResolvesTo["EdgeTarget[RowT]"]
+    coco.ResolvesTo["EdgeTarget[RowT]"], Generic[RowT, coco.MaybePendingS]
 ):
     """A target for writing edges to an Omnigraph edge type."""
 

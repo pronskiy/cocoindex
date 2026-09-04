@@ -52,11 +52,10 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, cast
 
+import cocoindex as coco
 import instructor
 import litellm
 import pydantic
-
-import cocoindex as coco
 from cocoindex.connectors import google_drive, omnigraph
 from cocoindex.ops.entity_resolution import ResolvedEntities, resolve_entities
 from cocoindex.ops.entity_resolution.llm_resolver import LlmPairResolver

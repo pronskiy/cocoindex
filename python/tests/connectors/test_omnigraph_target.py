@@ -2086,6 +2086,23 @@ class TestPlanCommitsEncoding:
         assert commit.params["s0_p_note"] is None
 
 
+class TestParseMissingEndpoint:
+    @pytest.mark.parametrize(
+        ("role", "key", "type_name"),
+        [
+            ("src", "O'Brien", "Person"),
+            ("dst", "a'b'c", "Claim"),
+            ("src", "", "EmptyKey"),
+        ],
+    )
+    def test_preserves_apostrophes_in_key(
+        self, role: str, key: str, type_name: str
+    ) -> None:
+        error = OmnigraphCliError(f"{role} '{key}' not found in {type_name}")
+
+        assert ogt._parse_missing_endpoint(error) == (role, key, type_name)
+
+
 class TestBuildEndpointStub:
     def test_uses_the_endpoint_schemas_declared_key_type(self) -> None:
         action = ogt._EdgeAction(

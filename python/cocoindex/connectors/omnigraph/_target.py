@@ -1068,7 +1068,10 @@ def plan_commits(actions: Sequence[Any]) -> list[Mutation]:
 #: `(src|dst) '...' not found in` is a tight enough anchor on its own; an
 #: unrelated error would need this exact multi-token phrase to trigger a
 #: spurious stub.
-_ENDPOINT_NOT_FOUND_RE = re.compile(r"(src|dst) '([^']*)' not found in (\w+)")
+# Match the closing quote by its full error-message suffix rather than treating
+# every apostrophe as the end of the key. String keys are allowed to contain
+# apostrophes (for example, ``O'Brien``).
+_ENDPOINT_NOT_FOUND_RE = re.compile(r"(src|dst) '([\s\S]*?)' not found in (\w+)")
 
 
 def _parse_missing_endpoint(error: OmnigraphCliError) -> tuple[str, str, str] | None:

@@ -5,14 +5,66 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
-import fcntl
 import hashlib
 import json
 import pathlib
+import sys
 import tempfile
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
+from typing import BinaryIO
+
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
 
 from cocoindex.connectors.omnigraph._gq import Mutation
+
+if sys.platform == "win32":
+
+    def _lock_file(lock_file: BinaryIO) -> None:
+        # ``msvcrt.locking`` locks a byte range, so make sure byte zero exists
+        # before asking for an exclusive lock on it.
+        lock_file.seek(0, 2)
+        if lock_file.tell() == 0:
+            lock_file.write(b"\0")
+            lock_file.flush()
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+
+    def _unlock_file(lock_file: BinaryIO) -> None:
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+
+else:
+
+    def _lock_file(lock_file: BinaryIO) -> None:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+
+    def _unlock_file(lock_file: BinaryIO) -> None:
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def _temporary_text_file(content: str, *, suffix: str) -> Iterator[str]:
+    """Write a closed, short-lived file that another process can reopen.
+
+    Windows denies reopening a ``NamedTemporaryFile`` while its original
+    handle is still open. Creating it with ``delete=False`` lets us close the
+    handle before invoking the CLI and still remove the file deterministically
+    afterward on every platform.
+    """
+    path: pathlib.Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=suffix, encoding="utf-8", delete=False
+        ) as f:
+            f.write(content)
+            path = pathlib.Path(f.name)
+        yield str(path)
+    finally:
+        if path is not None:
+            path.unlink(missing_ok=True)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -48,10 +100,10 @@ class _CliClient:
         )
         lock_file = await asyncio.to_thread(path.open, "a+b")
         try:
-            await asyncio.to_thread(fcntl.flock, lock_file, fcntl.LOCK_EX)
+            await asyncio.to_thread(_lock_file, lock_file)
             yield
         finally:
-            await asyncio.to_thread(fcntl.flock, lock_file, fcntl.LOCK_UN)
+            await asyncio.to_thread(_unlock_file, lock_file)
             await asyncio.to_thread(lock_file.close)
 
     # --- argv builders (pure, unit-tested) ---
@@ -189,16 +241,12 @@ class _CliClient:
         return json.loads(text) if text else {}
 
     async def init_graph(self, schema_pg: str) -> None:
-        with tempfile.NamedTemporaryFile("w", suffix=".pg", encoding="utf-8") as f:
-            f.write(schema_pg)
-            f.flush()
-            await self._run(self._init_argv(f.name))
+        with _temporary_text_file(schema_pg, suffix=".pg") as path:
+            await self._run(self._init_argv(path))
 
     async def apply_schema(self, schema_pg: str) -> None:
-        with tempfile.NamedTemporaryFile("w", suffix=".pg", encoding="utf-8") as f:
-            f.write(schema_pg)
-            f.flush()
-            await self._run(self._apply_schema_argv(f.name))
+        with _temporary_text_file(schema_pg, suffix=".pg") as path:
+            await self._run(self._apply_schema_argv(path))
 
     async def read_schema(self) -> str | None:
         """Return the graph's current, complete `.pg` schema source, or
@@ -231,14 +279,12 @@ class _CliClient:
 
     async def mutate(self, mutation: Mutation, *, branch: str) -> None:
         with (
-            tempfile.NamedTemporaryFile("w", suffix=".gq", encoding="utf-8") as q,
-            tempfile.NamedTemporaryFile("w", suffix=".json", encoding="utf-8") as p,
+            _temporary_text_file(mutation.expr, suffix=".gq") as query_path,
+            _temporary_text_file(
+                json.dumps(mutation.params), suffix=".json"
+            ) as params_path,
         ):
-            q.write(mutation.expr)
-            q.flush()
-            json.dump(mutation.params, p)
-            p.flush()
-            await self._run(self._mutate_argv(q.name, p.name, branch=branch))
+            await self._run(self._mutate_argv(query_path, params_path, branch=branch))
 
     async def branch_create(self, name: str, *, frm: str) -> None:
         await self._run(self._branch_create_argv(name, frm=frm))

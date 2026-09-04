@@ -1734,12 +1734,17 @@ class TestCliArgv:
     ) -> None:
         """The argv test above pins the shape; this pins that the files
         those paths point at actually hold the mutation, read back from
-        disk while the call is in flight."""
+        disk while the call is in flight. Reopening them here also verifies
+        that the original handles are closed, which Windows requires."""
         seen: dict[str, str] = {}
 
         async def fake_run(self: object, argv: list[str]) -> dict[str, object]:
-            seen["query"] = Path(argv[argv.index("--query") + 1]).read_text()
-            seen["params"] = Path(argv[argv.index("--params-file") + 1]).read_text()
+            query_path = Path(argv[argv.index("--query") + 1])
+            params_path = Path(argv[argv.index("--params-file") + 1])
+            seen["query_path"] = str(query_path)
+            seen["params_path"] = str(params_path)
+            seen["query"] = query_path.read_text()
+            seen["params"] = params_path.read_text()
             return {}
 
         monkeypatch.setattr(_CliClient, "_run", fake_run)
@@ -1747,6 +1752,8 @@ class TestCliArgv:
         await _client().mutate(m, branch="main")
         assert seen["query"] == m.expr
         assert json.loads(seen["params"]) == {"p_a": "1"}
+        assert not Path(seen["query_path"]).exists()
+        assert not Path(seen["params_path"]).exists()
 
     def test_merge_argv_has_no_cas_flag(self) -> None:
         argv = _client()._merge_argv("scratch", into="main")

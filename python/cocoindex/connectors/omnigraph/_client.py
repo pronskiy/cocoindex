@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
+import fcntl
+import hashlib
 import json
+import pathlib
 import tempfile
+from collections.abc import AsyncIterator
 from typing import Protocol
 
 from cocoindex.connectors.omnigraph._gq import Mutation
@@ -45,6 +50,19 @@ class _CliClient:
     def __init__(self, conn: ConnectionFactory) -> None:
         self._conn = conn
 
+    @contextlib.asynccontextmanager
+    async def schema_lock(self) -> AsyncIterator[None]:
+        """Serialize whole-schema read/modify/write sequences for this store."""
+        digest = hashlib.sha256(self._conn.store.encode()).hexdigest()
+        path = pathlib.Path(tempfile.gettempdir()) / f"cocoindex-omnigraph-{digest}.lock"
+        lock_file = await asyncio.to_thread(path.open, "a+b")
+        try:
+            await asyncio.to_thread(fcntl.flock, lock_file, fcntl.LOCK_EX)
+            yield
+        finally:
+            await asyncio.to_thread(fcntl.flock, lock_file, fcntl.LOCK_UN)
+            await asyncio.to_thread(lock_file.close)
+
     # --- argv builders (pure, unit-tested) ---
 
     def _mutate_argv(
@@ -82,7 +100,8 @@ class _CliClient:
         ]
 
     def _merge_argv(self, name: str, *, into: str) -> list[str]:
-        # No --if-commit: 0.9.0 has no CAS. A conflict is a non-zero exit.
+        # `branch merge` has no compare-and-swap precondition (as of 0.10.0
+        # only `mutate` takes `--if-commit`). A conflict is a non-zero exit.
         return [
             self._conn.cli,
             "branch",

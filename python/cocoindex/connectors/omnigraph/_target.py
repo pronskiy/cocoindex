@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 import datetime
 import re
@@ -1222,8 +1221,9 @@ async def _apply_entity_actions(
                     raise
         # More than one commit needs atomicity across all of them together,
         # and one CLI invocation is one commit — so apply the whole sequence
-        # on a scratch branch and merge it in as a single step. There is no
-        # `--if-commit` in 0.9.0; a conflicted merge simply surfaces as a
+        # on a scratch branch and merge it in as a single step. `branch merge`
+        # has no compare-and-swap precondition (as of 0.10.0 only `mutate`
+        # takes `--if-commit`); a conflicted merge simply surfaces as a
         # non-zero exit from `branch_merge` and propagates like any other
         # failure below.
         scratch = f"coco_scratch_{uuid.uuid4().hex}"
@@ -1239,7 +1239,8 @@ async def _apply_entity_actions(
         finally:
             # Delete the scratch branch whether the merge succeeded or
             # failed — `branch_merge` does not delete its source branch
-            # (0.9.0 has no --delete-branch on our call), so a bare
+            # (we don't pass `--delete-branch`, which would only cover the
+            # success path anyway), so a bare
             # try/except-only cleanup left one behind on every SUCCESSFUL
             # multi-commit sync, and a leftover non-main branch blocks
             # every subsequent `schema apply` on that store outright
@@ -1406,6 +1407,18 @@ async def _apply_type_schema(
     pending = [a for a in actions if a.main_action is not None or a.property_actions]
     if not pending:
         return
+
+    # Omnigraph applies schema source as a whole. Keep the read, in-memory
+    # merge, and every resulting apply under one store-scoped lock so two app
+    # updates cannot both read the same schema and overwrite each other's
+    # changes with competing complete-schema writes.
+    async with client.schema_lock():
+        await _apply_type_schema_locked(client, pending)
+
+
+async def _apply_type_schema_locked(
+    client: _CliClient, pending: Sequence[_TypeAction]
+) -> None:
 
     # Before the `init` path below, not after it: on a fresh graph that path
     # returns first, so a clash inside the very first batch was never checked.

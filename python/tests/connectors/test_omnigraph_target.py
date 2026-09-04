@@ -2373,6 +2373,39 @@ class TestApplyTypeSchema:
         assert "node B {" in applied
 
     @pytest.mark.asyncio
+    async def test_concurrent_updates_preserve_both_schema_changes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        schema = "node A {\n  slug: String @key\n  coco_key: String\n}\n"
+
+        async def fake_read_schema(self: object) -> str | None:
+            await asyncio.sleep(0)
+            return schema
+
+        async def fake_apply_schema(self: object, pg_fragment: str) -> None:
+            nonlocal schema
+            await asyncio.sleep(0)
+            schema = pg_fragment
+
+        monkeypatch.setattr(_CliClient, "read_schema", fake_read_schema)
+        monkeypatch.setattr(_CliClient, "apply_schema", fake_apply_schema)
+
+        b_fragment = "node B {\n  slug: String @key\n  coco_key: String\n}"
+        c_fragment = "node C {\n  slug: String @key\n  coco_key: String\n}"
+        await asyncio.gather(
+            ogt._apply_type_schema(
+                _client(), [_type_action("insert", "B", b_fragment)]
+            ),
+            ogt._apply_type_schema(
+                _client(), [_type_action("insert", "C", c_fragment)]
+            ),
+        )
+
+        assert "node A {" in schema
+        assert "node B {" in schema
+        assert "node C {" in schema
+
+    @pytest.mark.asyncio
     async def test_replace_drops_then_re_adds_instead_of_merging_in_place(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

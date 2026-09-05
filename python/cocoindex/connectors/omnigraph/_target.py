@@ -2043,6 +2043,22 @@ def node_target(
             f"with `NodeSchema.from_class(..., key=...)`, or pass a non-empty "
             f"`key` to `NodeSchema`."
         )
+    for key_field in schema.key:
+        encoder = schema.properties[key_field].encoder
+        if encoder is not None and encoder not in _ENCODERS.values():
+            # CocoIndex tracks a node by the raw key value; the graph keys on
+            # the encoded one. Changing such an encoder upserted a second
+            # node under the new encoding and left the old one behind, both
+            # sharing one `coco_key`. Only the fixed Date/DateTime encoders
+            # are allowed on a key: pure functions of the value, never
+            # changing, so the two identities cannot drift apart.
+            raise ValueError(
+                f"Node type {type_name!r}: key property {key_field!r} has a custom "
+                f"encoder. The key is the node's identity — CocoIndex tracks it by "
+                f"the raw value while the graph keys on the encoded one, so changing "
+                f"the encoder would leave the old node behind next to the new one. "
+                f"Normalize the key value before declaring the node instead."
+            )
     type_key = _TypeKey(db_key=db.key, type_kind="node", type_name=type_name)
     spec = _TypeSpec(
         schema=schema,

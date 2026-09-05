@@ -276,7 +276,7 @@ schema = NodeSchema(
 
 - `name` — The property name (must match its key in `properties`).
 - `pg_type` — The `.pg` type string (see the table above; `?` suffix for nullable).
-- `encoder` — Optional `Callable[[Any], Any]` applied to non-`None` values before they're sent to Omnigraph. Change detection fingerprints the encoded value, so changing an encoder rewrites every node or edge it applies to on the next update. `Date`/`DateTime` properties get an ISO-format encoder by default, and a list of either gets it mapped over the elements.
+- `encoder` — Optional `Callable[[Any], Any]` applied to non-`None` values before they're sent to Omnigraph. Change detection fingerprints the encoded value, so changing an encoder rewrites every node or edge it applies to on the next update. `Date`/`DateTime` properties get an ISO-format encoder by default, and a list of either gets it mapped over the elements. A key property may not carry a custom encoder — mounting raises `ValueError` — because the key is the node's identity: CocoIndex tracks it by the raw value while the graph keys on the encoded one, so an encoder change there would leave the old node beside the new one. Normalize key values before declaring the node. (The built-in `Date`/`DateTime` encoders are allowed on a key; they never change.)
 
 
 ## Schema declaration and evolution

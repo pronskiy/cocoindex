@@ -995,7 +995,7 @@ class TestEdgeSchema:
         node_schema = await NodeSchema.from_class(_ScClaim, key="slug")
         with pytest.raises(TypeError, match="EdgeSchema"):
             omnigraph.edge_target(
-                ContextKey[ConnectionFactory]("db"),
+                ContextKey[ConnectionFactory](f"db_{uuid.uuid4().hex}"),
                 "E",
                 _bare_node_target(node_schema, "A"),
                 _bare_node_target(node_schema, "B"),
@@ -3630,6 +3630,37 @@ def _bare_node_target(schema: NodeSchema, type_name: str) -> omnigraph.NodeTarge
 
 
 class TestNodeTargetKeyValidation:
+    def test_a_custom_encoder_on_a_key_property_is_refused(self) -> None:
+        """CocoIndex tracks a node by the raw key value while the graph keys
+        on the encoded one. With `str.lower`, a declared "Mixed" was stored
+        as "mixed"; switching the encoder to `str.upper` then upserted a
+        second node "MIXED" under the same `coco_key` and left "mixed"
+        behind. The key is the identity: normalize it before declaring the
+        node, never in an encoder."""
+        schema = NodeSchema(
+            properties={"slug": PropertyDef("slug", "String", str.lower)},
+            key=("slug",),
+        )
+        with pytest.raises(
+            ValueError, match=r"key property 'slug' has a custom encoder"
+        ):
+            omnigraph.node_target(
+                ContextKey[ConnectionFactory](f"db_{uuid.uuid4().hex}"),
+                "Person",
+                schema,
+            )
+
+    @pytest.mark.asyncio
+    async def test_the_built_in_date_encoder_on_a_key_is_allowed(self) -> None:
+        """Only the fixed `Date`/`DateTime` encoders may sit on a key: they
+        are a pure function of the value and never change, so raw and
+        encoded identity cannot drift apart."""
+        schema = await NodeSchema.from_class(_Doc, key="on")
+        assert schema.properties["on"].encoder is not None
+        omnigraph.node_target(
+            ContextKey[ConnectionFactory](f"db_{uuid.uuid4().hex}"), "Doc", schema
+        )
+
     def test_keyless_schema_is_refused(self) -> None:
         """A hand-built `NodeSchema` with an empty key must be refused at
         mount, not silently collapse every row onto one target state.

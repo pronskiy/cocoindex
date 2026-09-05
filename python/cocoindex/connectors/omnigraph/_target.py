@@ -5,6 +5,8 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import datetime
+import functools
+import hashlib
 import re
 import types
 import typing
@@ -16,6 +18,7 @@ import cocoindex as coco
 import msgspec
 from cocoindex._internal.context_keys import ContextProvider
 from cocoindex._internal.datatype import TypeChecker
+from cocoindex._internal.memo_fingerprint import canonical_module_name
 from cocoindex.connectorkits import statediff
 from cocoindex.connectorkits.fingerprint import fingerprint_object
 from cocoindex.connectorkits.target import ManagedBy
@@ -129,7 +132,11 @@ _KEY_ENCODERS: dict[str, tuple[ValueEncoder, ...]] = {
 }
 
 
+@functools.cache
 def _list_encoder(element: ValueEncoder) -> ValueEncoder:
+    # Cached so `_encoder_for` hands back one object per element encoder:
+    # `_encoder_identity` tells the built-in encoding of a type from a custom
+    # one by identity.
     return lambda values: [element(v) for v in values]
 
 
@@ -347,6 +354,61 @@ class _TypeMainRecord(msgspec.Struct, frozen=True, array_like=True):
     to_type: str | None
 
 
+class _PropertyRecord(msgspec.Struct, frozen=True, array_like=True):
+    """One property as the type's tracking record remembers it.
+
+    `pg_type` is the bare `.pg` type string: nullability is already spelled
+    in it as a trailing `?`, so neo4j's `(type, nullable)` split would only
+    restate the same bit.
+
+    `encoder` is `_encoder_identity` of the property's encoder. The rendered
+    `.pg` never changes with an encoder, so without this a changed encoder
+    was invisible at the type level: reconciling each node re-encodes its
+    values and would notice, but a memoized declaring component is skipped
+    whole and never reconciles anything. A change here is a "lossy"
+    invalidation, which also invalidates every memo that declared into this
+    type, so its component runs again and its rows are re-upserted.
+    """
+
+    pg_type: str
+    encoder: str
+
+
+def _code_digest(code: types.CodeType) -> str:
+    consts = tuple(
+        _code_digest(c) if isinstance(c, types.CodeType) else repr(c)
+        for c in code.co_consts
+    )
+    payload = repr((code.co_code, consts, code.co_names)).encode()
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def _encoder_identity(prop_def: PropertyDef) -> str:
+    """A stable name for what `prop_def.encoder` does, across runs.
+
+    Empty for the built-in encoding of the property's type, whether the
+    definition left `encoder` unset or names the same function `from_class`
+    fills in — the two are one encoding. Otherwise the callable's qualified
+    name, with a digest of its code for a Python function, so editing a
+    lambda's body counts as a change the way swapping `str.lower` for
+    `str.upper` does. Closed-over values are not part of it, as with a
+    `@coco.fn` body's own helpers.
+    """
+    encoder = prop_def.encoder
+    if encoder is None or encoder is _encoder_for(prop_def.pg_type):
+        return ""
+    module = (
+        canonical_module_name(encoder)
+        if hasattr(encoder, "__module__")
+        else type(encoder).__module__
+    )
+    qualname = getattr(encoder, "__qualname__", None) or type(encoder).__qualname__
+    code = getattr(encoder, "__code__", None)
+    if not isinstance(code, types.CodeType):
+        return f"{module}.{qualname}"
+    return f"{module}.{qualname}#{_code_digest(code)}"
+
+
 _PROPERTY_SUBKEY_PREFIX = "prop:"
 
 
@@ -358,11 +420,9 @@ def _property_name(subkey: str) -> str:
     return subkey[len(_PROPERTY_SUBKEY_PREFIX) :]
 
 
-#: Identity in `main`, one entry per property in `sub`. The sub-value is the
-#: bare `.pg` type string: nullability is already spelled in it as a trailing
-#: `?`, so neo4j's `(type, nullable)` split would only restate the same bit.
+#: Identity in `main`, one entry per property in `sub`.
 _TypeTrackingRecord = statediff.MutualTrackingRecord[
-    statediff.CompositeTrackingRecord[_TypeMainRecord, str, str]
+    statediff.CompositeTrackingRecord[_TypeMainRecord, str, _PropertyRecord]
 ]
 
 
@@ -376,7 +436,10 @@ def _type_tracking_record_from_spec(spec: _TypeSpec) -> _TypeTrackingRecord:
     point: it is what the removal path consults to decide it must not drop.
     """
     sub = (
-        {_property_subkey(p.name): p.pg_type for p in spec.schema.properties.values()}
+        {
+            _property_subkey(p.name): _PropertyRecord(p.pg_type, _encoder_identity(p))
+            for p in spec.schema.properties.values()
+        }
         if spec.schema is not None
         else {}
     )
@@ -589,7 +652,7 @@ class _TypeHandlerBase(coco.TargetHandler[_TypeSpec, _TypeTrackingRecord, Any]):
                 _property_name(sub_key)
                 for sub_key, action in tracked_actions.items()
                 if action in ("insert", "upsert")
-                and not desired_sub[sub_key].endswith("?")
+                and not desired_sub[sub_key].pg_type.endswith("?")
             )
             if non_nullable_adds:
                 raise ValueError(

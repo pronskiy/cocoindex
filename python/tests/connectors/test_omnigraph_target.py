@@ -1203,6 +1203,46 @@ class TestNodeTypeReconcile:
         assert out is not None
         assert out.child_invalidation == "lossy"
 
+    def test_encoder_change_is_lossy(self) -> None:
+        """A changed encoder rewrites what the graph holds for every row, but
+        the rendered `.pg` is byte-identical, so the only way a memoized
+        declaring component ever learns of it is through the type's own
+        tracking record: the change has to invalidate the children like a
+        retyped property does. A hand-built definition without an encoder
+        and one carrying the built-in encoder for its type are the same
+        encoding and must not count as a change."""
+
+        def schema(encoder: ogt.ValueEncoder | None) -> NodeSchema:
+            return NodeSchema(
+                properties={
+                    "slug": PropertyDef("slug", "String"),
+                    "name": PropertyDef("name", "String", encoder),
+                    "at": PropertyDef("at", "DateTime", ogt._ENCODERS["DateTime"]),
+                },
+                key=("slug",),
+            )
+
+        prev = _type_tracking_record_from_spec(_spec(schema(str.lower)))
+        out = _NodeTypeHandler().reconcile(
+            _TypeKey("og", "node", "Doc"), _spec(schema(str.upper)), [prev], False
+        )
+        assert out is not None
+        assert out.action.main_action is None
+        assert out.child_invalidation == "lossy"
+
+        by_hand = NodeSchema(
+            properties={
+                "slug": PropertyDef("slug", "String"),
+                "name": PropertyDef("name", "String", str.lower),
+                "at": PropertyDef("at", "DateTime"),
+            },
+            key=("slug",),
+        )
+        assert (
+            _type_tracking_record_from_spec(_spec(by_hand)).tracking_record.sub
+            == prev.tracking_record.sub
+        )
+
     @pytest.mark.asyncio
     async def test_key_change_is_destructive(self) -> None:
         @dataclass
@@ -6083,6 +6123,44 @@ class TestEndToEnd:
 
         app = coco.App(
             coco.AppConfig(name="e2e_encoder_change", environment=coco_env), main
+        )
+        app.update_blocking()
+        assert [r["data"]["name"] for r in _export_rows(store) if r.get("type")] == [
+            "ada lovelace"
+        ]
+
+        encoder["fn"] = str.upper
+        app.update_blocking()
+        assert [r["data"]["name"] for r in _export_rows(store) if r.get("type")] == [
+            "ADA LOVELACE"
+        ]
+
+    def test_encoder_change_reaches_a_memoized_component(self, store: str) -> None:
+        """The test above declares its node from an unmemoized main. With the
+        declaration inside a `@coco.fn(memo=True)` component, the second
+        update skipped that component outright: neither its memo key nor
+        the type's tracking record knew about the encoder, so no reconcile
+        ever saw the new encoding and the lowercase value stayed."""
+        db = _e2e_db(store, "encoder_change_memo")
+        encoder = {"fn": str.lower}
+
+        @coco.fn(memo=True)
+        async def declare_ada(people: omnigraph.NodeTarget[Any]) -> None:
+            people.declare_node(node={"slug": "ada", "name": "Ada Lovelace"})
+
+        async def main() -> None:
+            schema = NodeSchema(
+                properties={
+                    "slug": PropertyDef("slug", "String"),
+                    "name": PropertyDef("name", "String", encoder["fn"]),
+                },
+                key=("slug",),
+            )
+            people = await omnigraph.mount_node_target(db, "Person", schema)
+            await coco.mount(declare_ada, people)
+
+        app = coco.App(
+            coco.AppConfig(name="e2e_encoder_change_memo", environment=coco_env), main
         )
         app.update_blocking()
         assert [r["data"]["name"] for r in _export_rows(store) if r.get("type")] == [

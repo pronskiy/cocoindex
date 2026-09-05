@@ -472,17 +472,15 @@ class _TypeHandlerBase(coco.TargetHandler[_TypeSpec, _TypeTrackingRecord, Any]):
         # --- The tracked path: what CocoIndex has actually seen before. ---
         #
         # The same records, diffed as if `prev` were known complete and
-        # without `resolve_system_transition`, because both guards below need
-        # to see *through* ownership rather than past it.
+        # without `resolve_system_transition`: the non-nullable guard below
+        # and the child invalidation both need to see *through* ownership
+        # rather than past it.
         #
-        # Reading the guards off the write path instead would silently disable
-        # them. Under `--reprocess` (or any other `prev_may_be_missing`) the
+        # Reading the guard off the write path instead would silently disable
+        # it. Under `--reprocess` (or any other `prev_may_be_missing`) the
         # main action becomes "upsert", which empties `property_actions` and
-        # leaves both guards nothing to fire on — reintroducing the raw
-        # `OG-MF-103` engine error this guard exists to replace. And
-        # `resolve_system_transition` returns `None` outright for a
-        # user-managed desired state, which would leave the managed_by guard
-        # permanently silent.
+        # leaves the guard nothing to fire on — reintroducing the raw
+        # `OG-MF-103` engine error it exists to replace.
         tracked_main, tracked_transitions = statediff.diff_composite(
             statediff.TrackingRecordTransition(
                 desired.tracking_record,
@@ -497,34 +495,21 @@ class _TypeHandlerBase(coco.TargetHandler[_TypeSpec, _TypeTrackingRecord, Any]):
                 if action is not None:
                     tracked_actions[sub_key] = action
 
-        # Check managed_by first: a USER-managed type is never altered by this
-        # connector, so the non-nullable-addition guard below — whose advice
-        # ("make it optional, or drop and recreate") only makes sense for a
-        # type this connector itself would alter or rebuild — must not fire
-        # ahead of the managed_by mismatch it would otherwise mask.
+        # A USER-managed type is never validated, let alone altered, by this
+        # connector: the schema is the user's, migrated with `omnigraph schema
+        # apply` on their own schedule, and the declaration is simply tracked
+        # from then on. An earlier guard compared the declaration against the
+        # *tracked* one and refused on any difference — and since reconcile
+        # never reads the live schema, the migration that guard advised could
+        # not unblock it: every later run failed the same way. The guard below
+        # is about a schema write this connector would itself issue, so it
+        # applies to SYSTEM-managed types only.
         # `==`, not `is`: ManagedBy is a StrEnum, so a plain `"user"` string
         # compares equal but is not identical — and an identity check would
         # silently fall through to full SYSTEM management, letting the
         # connector rewrite a schema the user said they own. The sibling
         # connectors compare by value (see `connectorkits.statediff`).
-        if spec.managed_by == ManagedBy.USER:
-            # Nothing tracked means only that: on a first run there never is,
-            # whatever the graph already holds. A user-managed type is adopted
-            # in that state, not rejected — the connector isn't claiming the
-            # schema matches, it's declining to have an opinion, exactly as the
-            # siblings do (their `resolve_system_transition` yields "no DDL"
-            # for a user-managed desired state rather than raising). Only a
-            # type this connector has tracked before AND now sees declared
-            # differently is a real signal that the app and the graph have
-            # diverged.
-            if tracked_main is not None or tracked_actions:
-                raise ValueError(
-                    f"Omnigraph type {key.type_name!r} is declared managed_by=user "
-                    f"but the app's schema differs from the tracked one. "
-                    f"Apply the schema change with `omnigraph schema apply`, or "
-                    f"switch to managed_by=system."
-                )
-        elif tracked_main is None:
+        if spec.managed_by != ManagedBy.USER and tracked_main is None:
             # Verified in Task 1: `schema apply` rejects adding a NON-nullable
             # property to an existing type (OG-MF-103, "requires a backfill and
             # is not supported in schema migration v1"). Only initial creation

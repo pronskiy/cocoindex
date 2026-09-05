@@ -989,12 +989,16 @@ class TestNodeTypeReconcile:
         assert out.child_invalidation == "destructive"
 
     @pytest.mark.asyncio
-    async def test_user_managed_mismatch_raises(self) -> None:
-        """A non-nullable addition on a managed_by=user type must raise the
-        managed_by message, not the non-nullable-guard message: the connector
-        never alters or rebuilds a user-managed type itself, so the guard's
-        advice ("make it optional, or drop and recreate") doesn't apply, and
-        must not fire ahead of (or instead of) the managed_by mismatch."""
+    async def test_user_managed_schema_drift_is_tracked_not_rejected(self) -> None:
+        """User-managed means the schema is the user's: they migrate it with
+        `omnigraph schema apply`, then declare the wider dataclass. The
+        connector used to compare that declaration against what it had
+        tracked and refuse — advising exactly that migration, which it then
+        rejected again on every run, because the check read tracking
+        history and never the live schema. No validation, no schema write:
+        the new declaration is simply tracked from here on. That holds even
+        for a non-nullable addition — whether the user's migration was legal
+        is the engine's call, made when they applied it."""
 
         @dataclass
         class _V1:
@@ -1008,13 +1012,13 @@ class TestNodeTypeReconcile:
         prev = _type_tracking_record_from_spec(
             _spec(await NodeSchema.from_class(_V1, key="slug"), ManagedBy.USER)
         )
-        with pytest.raises(ValueError, match="managed_by=user"):
-            _NodeTypeHandler().reconcile(
-                _TypeKey("og", "node", "Doc"),
-                _spec(await NodeSchema.from_class(_V2, key="slug"), ManagedBy.USER),
-                [prev],
-                False,
-            )
+        spec_v2 = _spec(await NodeSchema.from_class(_V2, key="slug"), ManagedBy.USER)
+        out = _NodeTypeHandler().reconcile(
+            _TypeKey("og", "node", "Doc"), spec_v2, [prev], False
+        )
+        assert out is not None
+        assert out.action.main_action is None and not out.action.property_actions
+        assert out.tracking_record == _type_tracking_record_from_spec(spec_v2)
 
     @pytest.mark.asyncio
     async def test_user_managed_first_run_adopts(self) -> None:
@@ -1414,20 +1418,25 @@ class TestTypeOwnershipMatrix:
 
 
 class TestGuardsUnderPrevMayBeMissing:
-    """Both guards read a diff computed with `prev_may_be_missing=False`, and
-    these two tests are what pin that.
+    """The non-nullable-addition guard reads a diff computed with
+    `prev_may_be_missing=False`, and these tests are what pin that.
 
     Collapsing the two diffs into one looks like a simplification and
-    silently disables both guards: with `prev_may_be_missing` set (a
+    silently disables the guard: with `prev_may_be_missing` set (a
     `--reprocess`, or internal state lost while the graph persists) the main
-    action becomes "upsert", which empties `property_actions` and leaves them
+    action becomes "upsert", which empties `property_actions` and leaves it
     nothing to fire on. The failure mode is not a wrong error message -- it is
-    the raw `OG-MF-103` engine error coming back, and a user-managed schema
-    silently diverging.
+    the raw `OG-MF-103` engine error coming back.
     """
 
     @pytest.mark.asyncio
-    async def test_user_managed_mismatch_still_raises(self) -> None:
+    async def test_user_managed_drift_writes_nothing_even_when_prev_may_be_missing(
+        self,
+    ) -> None:
+        """`prev_may_be_missing` turns the write path's main action into an
+        "upsert" for a system-managed type. A user-managed one must still
+        emit no schema action at all, and must not be rejected either."""
+
         @dataclass
         class _V1:
             slug: str
@@ -1440,13 +1449,14 @@ class TestGuardsUnderPrevMayBeMissing:
         prev = _type_tracking_record_from_spec(
             _spec(await NodeSchema.from_class(_V1, key="slug"), ManagedBy.USER)
         )
-        with pytest.raises(ValueError, match="managed_by=user"):
-            _NodeTypeHandler().reconcile(
-                _TypeKey("og", "node", "Doc"),
-                _spec(await NodeSchema.from_class(_V2, key="slug"), ManagedBy.USER),
-                [prev],
-                True,
-            )
+        out = _NodeTypeHandler().reconcile(
+            _TypeKey("og", "node", "Doc"),
+            _spec(await NodeSchema.from_class(_V2, key="slug"), ManagedBy.USER),
+            [prev],
+            True,
+        )
+        assert out is not None
+        assert out.action.main_action is None and not out.action.property_actions
 
     @pytest.mark.asyncio
     async def test_non_nullable_addition_still_raises(self) -> None:
@@ -5547,3 +5557,78 @@ class TestEndToEnd:
 
         assert _branch_names(store) == ["main"]
         assert "note: String?" in _read_schema_source(store)
+
+    def test_user_managed_type_follows_an_external_migration(self, store: str) -> None:
+        """`managed_by="user"` means the schema is the user's: they migrate
+        it with `omnigraph schema apply`, then declare the wider dataclass.
+        The connector used to compare the new declaration against what it
+        had tracked and refuse — advising exactly that migration, which it
+        then rejected again on every run because it never looked at the
+        live schema. A user-managed type must never be validated against
+        tracking history; it must simply write rows."""
+        store_dir = Path(store[len("file://") :])
+        v1 = "node Doc {\n  slug: String @key\n  coco_key: String\n}\n"
+        v2 = (
+            "node Doc {\n  slug: String @key\n  title: String?\n  coco_key: String\n}\n"
+        )
+        assert _init_live(store_dir, v1).returncode == 0
+
+        @dataclass
+        class _DocV1:
+            slug: str
+
+        @dataclass
+        class _DocV2:
+            slug: str
+            title: str | None
+
+        db = _e2e_db(store, "user_managed_migration")
+        wide = {"on": False}
+
+        async def main() -> None:
+            docs = await omnigraph.mount_node_target(
+                db,
+                "Doc",
+                await NodeSchema.from_class(
+                    _DocV2 if wide["on"] else _DocV1, key="slug"
+                ),
+                managed_by=ManagedBy.USER,
+            )
+            node: Any = (
+                _DocV2(slug="d1", title="T") if wide["on"] else _DocV1(slug="d1")
+            )
+            docs.declare_node(node=node)
+
+        app = coco.App(
+            coco.AppConfig(name="e2e_user_managed_migration", environment=coco_env),
+            main,
+        )
+        app.update_blocking()
+
+        # The user's own migration, applied outside CocoIndex.
+        with tempfile.NamedTemporaryFile("w", suffix=".pg", encoding="utf-8") as f:
+            f.write(v2)
+            f.flush()
+            subprocess.run(
+                [
+                    _OMNIGRAPH_BIN,
+                    "schema",
+                    "apply",
+                    "--schema",
+                    f.name,
+                    "--store",
+                    store,
+                    "--json",
+                    "--quiet",
+                ],
+                check=True,
+                capture_output=True,
+            )
+
+        wide["on"] = True
+        app.update_blocking()
+
+        (row,) = [r for r in _export_rows(store) if r.get("type") == "Doc"]
+        assert row["data"]["title"] == "T"
+        # The connector still never wrote the schema: the user's block is verbatim.
+        assert _read_schema_source(store) == v2

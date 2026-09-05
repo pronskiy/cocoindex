@@ -106,7 +106,7 @@ def mount_node_target(
 - `type_name` — The `.pg` node type name (e.g. `"Source"`).
 - `schema` — A `NodeSchema` describing the type's properties and key. Unlike the sibling connectors, this is required, not optional — a node type is always self-describing.
 - `key` — Optional redundant check: if given, must match `schema.key`, or mounting raises `ValueError`. Exists so a ported neo4j/falkordb/surrealdb app's `primary_key=` (renamed `key=`) keeps working at both the schema-construction and the mount call site, without deleting the second one.
-- `managed_by` — Whether CocoIndex manages the type's `.pg` schema (`"system"`) or assumes it exists (`"user"`, validate-only — see [Schema evolution](#schema-declaration-and-evolution) below).
+- `managed_by` — Whether CocoIndex manages the type's `.pg` schema (`"system"`) or assumes it exists (`"user"` — never written, never validated; see [Schema evolution](#schema-declaration-and-evolution) below).
 
 **Returns:** A resolved `NodeTarget`. `declare_node_target` (sync, for endpoint-only types) and `node_target` (the raw `TargetState`, for composing with `coco.mount`) are also available.
 
@@ -289,7 +289,7 @@ For each managed type, the connector maintains a `.pg` fragment and reconciles i
 | Property dropped or retyped | `schema apply` | Every existing node/edge of that type is forced to re-upsert |
 | `@key` changed, or a node/edge switched shape | Type dropped and recreated (two `schema apply` calls — see below) | Every child record is re-declared from scratch |
 | Type no longer declared | Its block is removed from the schema (`schema apply`) — **unless** it is `managed_by="user"`, which is left alone | Every node/edge of that type is removed with it; nothing is removed for a `managed_by="user"` type |
-| `managed_by="user"` | Validate only — never mutates `.pg` | Raises if the app's schema disagrees with what it previously tracked |
+| `managed_by="user"` | Nothing — never mutates `.pg`; migrate the type yourself with `omnigraph schema apply`, then declare the new shape | The declaration is tracked as-is; a write that names a property the graph lacks fails with the engine's own error |
 
 **A non-nullable property can only be declared at type creation, never added by migration.** Omnigraph's `schema apply` rejects adding a non-nullable property to an existing type outright (`"requires a backfill and is not supported in schema migration v1"`). The connector checks for this in Python and raises a clear `ValueError` naming the property — make it optional (`X | None`), or accept that adding it means dropping and recreating the type.
 

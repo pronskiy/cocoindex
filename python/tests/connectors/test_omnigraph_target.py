@@ -1891,6 +1891,41 @@ def _edge(op: str, a: str, b: str) -> ogt._EdgeAction:
     )
 
 
+class TestCliCancellation:
+    @pytest.mark.asyncio
+    async def test_cancelling_a_call_kills_and_reaps_the_child(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Cancelling the task awaiting a CLI call must not leave the CLI
+        running: asyncio's `communicate()` does nothing to the child on
+        cancellation, so a cancelled `mutate` kept writing to the store
+        after the connector had given up on it."""
+        started: list[asyncio.subprocess.Process] = []
+        real_exec = asyncio.create_subprocess_exec
+
+        async def spying_exec(*argv: str, **kw: Any) -> asyncio.subprocess.Process:
+            proc = await real_exec(*argv, **kw)
+            started.append(proc)
+            return proc
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spying_exec)
+        client = _CliClient(ConnectionFactory(store="file:///tmp/g.omni", cli="sleep"))
+        task = asyncio.create_task(client._run(["sleep", "30"]))
+        while not started:
+            await asyncio.sleep(0.01)
+        (proc,) = started
+        try:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            # Killed AND reaped: a returncode means `wait()` collected it.
+            assert proc.returncode is not None
+        finally:
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()
+
+
 class TestCombineMutations:
     def test_single_is_unchanged_in_effect(self) -> None:
         m = combine_mutations(

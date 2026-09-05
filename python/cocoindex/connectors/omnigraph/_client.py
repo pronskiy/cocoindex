@@ -227,7 +227,19 @@ class _CliClient:
         proc = await asyncio.create_subprocess_exec(
             *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
-        out, err = await proc.communicate()
+        try:
+            out, err = await proc.communicate()
+        except BaseException:
+            # Cancellation must not leave the CLI running: `communicate()`
+            # does nothing to the child when the awaiting task is cancelled,
+            # so a cancelled `mutate` kept writing to the store after the
+            # connector had given up on it. Kill it and reap it, then let
+            # the cancellation propagate.
+            if proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                await proc.wait()
+            raise
         if proc.returncode != 0:
             raise OmnigraphCliError(
                 f"{' '.join(argv[:3])} exited {proc.returncode}: "

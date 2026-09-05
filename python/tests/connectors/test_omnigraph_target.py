@@ -822,6 +822,48 @@ class TestTypeMapping:
         assert schema.properties["slug"].encoder is None
         assert schema.properties["note"].encoder is None
 
+    def test_explicit_date_and_datetime_definitions_encode_by_type(self) -> None:
+        """A hand-built `PropertyDef("at", "DateTime")` has no encoder set,
+        and encoding was keyed on that field: a `datetime` then reached
+        `json.dumps` raw, and a `date` key reached the engine's StableKey
+        raw. The built-in ISO encoding follows the `.pg` type, whether the
+        definition came from a dataclass or was written out by hand."""
+        at = datetime.datetime(2026, 1, 1, 12, 30, tzinfo=datetime.UTC)
+        assert ogt._encode_property(PropertyDef("at", "DateTime"), at).value == (
+            at.isoformat()
+        )
+        assert (
+            ogt._encode_property(
+                PropertyDef("on", "Date?"), datetime.date(2026, 1, 5)
+            ).value
+            == "2026-01-05"
+        )
+        assert ogt._encode_property(
+            PropertyDef("days", "[Date]"), [datetime.date(2026, 1, 5)]
+        ).value == ["2026-01-05"]
+        assert (
+            ogt._tracking_key_value(
+                PropertyDef("on", "Date"), datetime.date(2026, 1, 5)
+            )
+            == "2026-01-05"
+        )
+
+    def test_isoformat_given_explicitly_counts_as_the_built_in_key_encoder(
+        self,
+    ) -> None:
+        """The obvious thing to write by hand is the same thing the connector
+        applies by default; it must not be refused as a custom key encoder."""
+        for pg_type, encoder in (
+            ("DateTime", datetime.datetime.isoformat),
+            ("Date", datetime.date.isoformat),
+        ):
+            schema = NodeSchema(
+                properties={"k": PropertyDef("k", pg_type, encoder)}, key=("k",)
+            )
+            omnigraph.node_target(
+                ContextKey[ConnectionFactory](f"db_{uuid.uuid4().hex}"), "T", schema
+            )
+
     @pytest.mark.asyncio
     async def test_list_of_dates_encodes_every_element(self) -> None:
         """`list[datetime.date]` maps to `[Date]`, which the schema accepts —
@@ -6437,3 +6479,51 @@ class TestEndToEnd:
         declare["ats"] = []
         app.update_blocking()
         assert [r for r in _export_rows(store) if r.get("type") == "Event"] == []
+
+    def test_an_explicit_datetime_keyed_schema_round_trips(self, store: str) -> None:
+        """Positive case for a hand-built schema: no dataclass, no encoder
+        given, `datetime` values in dict rows. Declared twice, one node."""
+        db = _e2e_db(store, "explicit_datetime")
+        schema = NodeSchema(
+            properties={
+                "at": PropertyDef("at", "DateTime"),
+                "note": PropertyDef("note", "String?"),
+            },
+            key=("at",),
+        )
+        at = datetime.datetime(2026, 1, 1, 12, 0, tzinfo=datetime.UTC)
+
+        async def main() -> None:
+            events = await omnigraph.mount_node_target(db, "Event", schema)
+            events.declare_node(node={"at": at, "note": "n"})
+
+        app = coco.App(
+            coco.AppConfig(name="e2e_explicit_datetime", environment=coco_env), main
+        )
+        app.update_blocking()
+        app.update_blocking()
+        (row,) = [r for r in _export_rows(store) if r.get("type") == "Event"]
+        assert row["data"]["at"] == 1767268800000
+        assert row["data"]["note"] == "n"
+
+    def test_an_explicit_date_keyed_schema_round_trips(self, store: str) -> None:
+        db = _e2e_db(store, "explicit_date")
+        schema = NodeSchema(
+            properties={
+                "on": PropertyDef("on", "Date"),
+                "note": PropertyDef("note", "String?"),
+            },
+            key=("on",),
+        )
+
+        async def main() -> None:
+            days = await omnigraph.mount_node_target(db, "Day", schema)
+            days.declare_node(node={"on": datetime.date(2026, 1, 5), "note": "n"})
+
+        app = coco.App(
+            coco.AppConfig(name="e2e_explicit_date", environment=coco_env), main
+        )
+        app.update_blocking()
+        app.update_blocking()
+        (row,) = [r for r in _export_rows(store) if r.get("type") == "Day"]
+        assert row["data"]["note"] == "n"

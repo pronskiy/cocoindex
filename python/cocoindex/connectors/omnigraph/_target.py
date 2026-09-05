@@ -80,6 +80,10 @@ class OmnigraphType(NamedTuple):
 class PropertyDef(NamedTuple):
     name: str
     pg_type: str
+    #: Applied to non-`None` values before they are sent. `None` means the
+    #: built-in encoding for `pg_type` (ISO format for `Date`/`DateTime`,
+    #: mapped over a list of either), so a hand-built definition behaves
+    #: like one `NodeSchema.from_class` produced.
     encoder: ValueEncoder | None = None
 
 
@@ -110,6 +114,16 @@ _ENCODERS: dict[str, ValueEncoder] = {
     "Date": _isoformat,
     "DateTime": _isoformat,
 }
+
+#: Encoders a key property may carry: the built-in ones, and the `isoformat`
+#: methods a person writing a schema by hand would reach for, which are the
+#: same encoding. Anything else changes what the graph keys on and is
+#: refused at `node_target`.
+_BUILTIN_KEY_ENCODERS: tuple[ValueEncoder, ...] = (
+    *_ENCODERS.values(),
+    datetime.date.isoformat,
+    datetime.datetime.isoformat,
+)
 
 
 def _list_encoder(element: ValueEncoder) -> ValueEncoder:
@@ -773,8 +787,20 @@ def _tracking_key_value(prop_def: PropertyDef, value: Any) -> Any:
 
 
 def _encode_property(prop_def: PropertyDef, value: Any) -> PropertyValue:
-    if value is not None and prop_def.encoder is not None:
-        value = prop_def.encoder(value)
+    """Encode `value` for the transport: the definition's own encoder, or —
+    when it sets none — the built-in encoding for its `.pg` type.
+
+    The built-in encoding follows the type, not the definition: a hand-built
+    `PropertyDef("at", "DateTime")` has no encoder set, and keying on that
+    field alone sent a raw `datetime` to `json.dumps` and a raw `date` into
+    the engine's StableKey, while the same schema inferred from a dataclass
+    worked because `from_class` filled the encoder in.
+    """
+    encoder = prop_def.encoder
+    if encoder is None:
+        encoder = _encoder_for(prop_def.pg_type)
+    if value is not None and encoder is not None:
+        value = encoder(value)
     return PropertyValue(prop_def.name, prop_def.pg_type, value)
 
 
@@ -2113,7 +2139,7 @@ def node_target(
         )
     for key_field in schema.key:
         encoder = schema.properties[key_field].encoder
-        if encoder is not None and encoder not in _ENCODERS.values():
+        if encoder is not None and encoder not in _BUILTIN_KEY_ENCODERS:
             # The key is the node's identity, and an edge addresses that
             # identity by the raw key value its author passed to
             # `declare_edge`. A custom encoder would make the graph key on

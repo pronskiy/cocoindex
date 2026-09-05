@@ -29,16 +29,18 @@ from cocoindex.connectors.omnigraph._client import (
 )
 from cocoindex.connectors.omnigraph._gq import (
     COCO_MANAGED,
-    Mutation,
     PropertyValue,
+    Query,
     Statement,
     _find_type_block,
     build_edge_delete,
     build_edge_insert,
     build_endpoint_stub,
+    build_incident_edges_query,
     build_node_delete,
     build_node_upsert,
     edge_types_referencing,
+    incident_edge_patterns,
     is_connector_managed,
     merge_type_into_schema,
     release_ownership,
@@ -758,6 +760,10 @@ class _NodeAction(NamedTuple):
     type_name: str
     properties: Sequence[PropertyValue]
     coco_key: str
+    #: On a delete: the key property in its transport encoding, so the sink
+    #: can turn the delete into a key-only upsert when an edge outside the
+    #: batch still references the node (see `_keep_referenced_nodes`).
+    key_properties: tuple[PropertyValue, ...] = ()
 
 
 class _EdgeAction(NamedTuple):
@@ -852,6 +858,16 @@ def _tracking_key_value(prop_def: PropertyDef, value: Any) -> Any:
     return _encode_property(prop_def, value).value
 
 
+def _transport_key_value(prop_def: PropertyDef, tracked: Any) -> Any:
+    """The transport form of a key value the engine handed back as a
+    StableKey. Every tracking key is already the value the graph is sent —
+    except a `DateTime` key, tracked by its instant in epoch milliseconds,
+    which goes back out as ISO."""
+    if prop_def.pg_type.rstrip("?") == "DateTime":
+        return (_EPOCH + datetime.timedelta(milliseconds=tracked)).isoformat()
+    return tracked
+
+
 def _encode_property(prop_def: PropertyDef, value: Any) -> PropertyValue:
     """Encode `value` for the transport: the definition's own encoder, or —
     when it sets none — the built-in encoding for its `.pg` type.
@@ -918,8 +934,23 @@ class _NodeHandler(coco.TargetHandler[_NodeValue, _EntityTrackingRecord, Any]):
             # insert path below already applies to this exact signal.
             if not prev_possible_records and not prev_may_be_missing:
                 return None
+            key_properties = tuple(
+                PropertyValue(
+                    field,
+                    self._property_defs[field].pg_type,
+                    _transport_key_value(self._property_defs[field], value),
+                )
+                for field, value in zip(self._key_fields, key_tuple, strict=True)
+            )
             return coco.TargetReconcileOutput(
-                action=_NodeAction("delete", self._key, self._type_name, (), coco_key),
+                action=_NodeAction(
+                    "delete",
+                    self._key,
+                    self._type_name,
+                    (),
+                    coco_key,
+                    key_properties=key_properties,
+                ),
                 sink=_entity_sink,
                 tracking_record=coco.NON_EXISTENCE,
             )
@@ -1133,7 +1164,7 @@ def _chunk_by_type(
     return chunks
 
 
-def plan_commits(actions: Sequence[Any]) -> list[Mutation]:
+def plan_commits(actions: Sequence[Any]) -> list[Query]:
     """Bucket reconcile actions into three phases and combine each phase's
     mutations into one commit per phase (chunked past `_MAX_ENTITIES_PER_TYPE`).
 
@@ -1231,7 +1262,7 @@ def plan_commits(actions: Sequence[Any]) -> list[Mutation]:
 
     phase_b = phase_b_nodes + phase_b_edges
     phase_c = phase_c_edges + phase_c_nodes
-    commits: list[Mutation] = []
+    commits: list[Query] = []
     for phase in (phase_a, phase_b, phase_c):
         if not phase:
             continue
@@ -1319,7 +1350,7 @@ def _build_endpoint_stub(
 
 async def _mutate_with_endpoint_retry(
     client: _CliClient,
-    commit: Mutation,
+    commit: Query,
     *,
     branch: str,
     edge_actions: Sequence[_EdgeAction],
@@ -1454,6 +1485,84 @@ async def _apply_schema_recovering_abandoned_branches(
         await client.apply_schema(schema_pg)
 
 
+async def _keep_referenced_nodes(
+    client: _CliClient, actions: Sequence[_NodeAction | _EdgeAction], *, branch: str
+) -> list[_NodeAction | _EdgeAction]:
+    """Turn the delete of a node that an edge outside `actions` still
+    references into a key-only upsert of that node.
+
+    Deleting a node cascades to its edges in the graph (`affected_edges` in
+    the mutation's result, verified against the engine) — silently, from
+    the point of view of whichever component declared those edges: their
+    tracking still says they exist, so once the node came back the edges'
+    reconcile found nothing to do and they were gone for good. The edge is
+    the declared state that still holds, and the connector already has a
+    shape for "an edge whose endpoint nobody declares": the key-only stub
+    it writes when an edge arrives before its node. A referenced node is
+    reduced to that same stub, so the edge survives, and the node's next
+    declaration fills it back in. Edges this batch deletes itself do not
+    count, so a node undeclared together with all of its edges is deleted
+    outright, as before.
+
+    The edge types to look at come from the live schema, one read per
+    batch; nodes of a type no edge type references cost nothing more. Each
+    remaining delete costs one read per (edge type, end) at which its type
+    sits. An edge inserted by another component between that read and this
+    batch's commit is still cascaded; the window is the same one every
+    unlocked entity write has.
+    """
+    deletes = [a for a in actions if isinstance(a, _NodeAction) and a.op == "delete"]
+    if not deletes:
+        return list(actions)
+    existing = await client.read_schema()
+    if existing is None:
+        return list(actions)
+    patterns = {
+        type_name: incident_edge_patterns(existing, type_name)
+        for type_name in {a.type_name for a in deletes}
+    }
+    if not any(patterns.values()):
+        return list(actions)
+    deleted_edges = {
+        (a.type_name, a.coco_key)
+        for a in actions
+        if isinstance(a, _EdgeAction) and a.op == "delete"
+    }
+    out: list[_NodeAction | _EdgeAction] = []
+    for action in actions:
+        if not (isinstance(action, _NodeAction) and action.op == "delete"):
+            out.append(action)
+            continue
+        referenced = False
+        for pattern in patterns[action.type_name]:
+            rows = await client.query(
+                render_query(
+                    [
+                        build_incident_edges_query(
+                            action.type_name, action.coco_key, pattern
+                        )
+                    ]
+                ),
+                branch=branch,
+            )
+            if any(
+                (pattern.edge_type, row["edge_key"]) not in deleted_edges
+                for row in rows
+            ):
+                referenced = True
+                break
+        if referenced:
+            action = _NodeAction(
+                "upsert",
+                action.key,
+                action.type_name,
+                action.key_properties,
+                action.coco_key,
+            )
+        out.append(action)
+    return out
+
+
 async def _apply_entity_actions(
     context_provider: ContextProvider, actions: Sequence[_NodeAction | _EdgeAction]
 ) -> None:
@@ -1466,6 +1575,9 @@ async def _apply_entity_actions(
     for db_key, db_actions in by_db.items():
         conn: ConnectionFactory = context_provider.get(db_key)
         client = _CliClient(conn)
+        db_actions = await _keep_referenced_nodes(
+            client, db_actions, branch=conn.branch
+        )
         commits = plan_commits(db_actions)
         if not commits:
             continue

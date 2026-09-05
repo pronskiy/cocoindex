@@ -288,14 +288,36 @@ def _scan_type_blocks(existing_pg: str) -> list[_TypeBlock]:
     return blocks
 
 
+class IncidentEdge(NamedTuple):
+    """An edge type that has a given node type at one of its ends."""
+
+    edge_type: str
+    role: str  # "from" | "to"
+
+
+def incident_edge_patterns(existing_pg: str, node_type_name: str) -> list[IncidentEdge]:
+    """Every (edge type, end) in `existing_pg` at which `node_type_name`
+    sits, in source order. A self-referencing edge type contributes both
+    ends."""
+    patterns: list[IncidentEdge] = []
+    for block in _scan_type_blocks(existing_pg):
+        if block.kind != "edge":
+            continue
+        if block.from_type == node_type_name:
+            patterns.append(IncidentEdge(block.name, "from"))
+        if block.to_type == node_type_name:
+            patterns.append(IncidentEdge(block.name, "to"))
+    return patterns
+
+
 def edge_types_referencing(existing_pg: str, node_type_name: str) -> list[str]:
     """Names of edge types in `existing_pg` that use `node_type_name` as an
     endpoint. Used to refuse removing a node type out from under one."""
-    return [
-        block.name
-        for block in _scan_type_blocks(existing_pg)
-        if block.kind == "edge" and node_type_name in (block.from_type, block.to_type)
-    ]
+    return list(
+        dict.fromkeys(
+            p.edge_type for p in incident_edge_patterns(existing_pg, node_type_name)
+        )
+    )
 
 
 def _find_type_block(
@@ -488,10 +510,11 @@ class Statement(NamedTuple):
     binds: tuple[Bind, ...]
 
 
-class Mutation(NamedTuple):
+class Query(NamedTuple):
     """A rendered `query m(...) { ... }` source plus its bound params — the
-    form the transport sends. Values are never interpolated into `expr`, so
-    a property value containing quotes or braces cannot alter the query.
+    form the transport sends, whether the block mutates or reads. Values
+    are never interpolated into `expr`, so a property value containing
+    quotes or braces cannot alter the query.
     """
 
     expr: str
@@ -504,7 +527,7 @@ class Mutation(NamedTuple):
 _SLOT = "$?"
 
 
-def render_query(statements: Sequence[Statement]) -> Mutation:
+def render_query(statements: Sequence[Statement]) -> Query:
     """Render statements into ONE `query m(...) { ... }` — one CLI
     invocation, one commit. N separate `mutate` calls would be N commits
     and no atomicity.
@@ -537,7 +560,7 @@ def render_query(statements: Sequence[Statement]) -> Mutation:
             params[name] = bind.value
             rendered.append(f"${name}{rest}")
         bodies.append("".join(rendered))
-    return Mutation(f"query m({', '.join(signature)}) {{ {' '.join(bodies)} }}", params)
+    return Query(f"query m({', '.join(signature)}) {{ {' '.join(bodies)} }}", params)
 
 
 def _bind(props: Sequence[PropertyValue], prefix: str) -> tuple[list[Bind], list[str]]:
@@ -597,6 +620,33 @@ def build_node_delete(type_name: str, coco_key: str) -> Statement:
 def build_edge_delete(type_name: str, coco_key: str) -> Statement:
     validate_identifier(type_name, "edge type")
     return _delete_by_coco_key(type_name, coco_key)
+
+
+def build_incident_edges_query(
+    node_type: str, coco_key: str, edge: IncidentEdge
+) -> Statement:
+    """Read the `coco_key` of every `edge.edge_type` edge at the node of
+    `node_type` whose `coco_key` is `coco_key`, on the end `edge.role`.
+
+    A read matches an edge type by its traversal spelling, which starts
+    with a lowercase letter (`worksAt` for `edge WorksAt`; the engine looks
+    it up case-insensitively, verified against the binary), and binds the
+    hop as `$e:worksAt` so the edge's own properties can be read back. The
+    node is found by `coco_key`, which every type this connector writes to
+    declares, rather than by its `@key`, so the query is the same for every
+    key type.
+    """
+    validate_identifier(node_type, "node type")
+    validate_identifier(edge.edge_type, "edge type")
+    if edge.role not in ("from", "to"):
+        raise ValueError(f"edge role must be 'from' or 'to', got {edge.role!r}")
+    spelling = edge.edge_type[0].lower() + edge.edge_type[1:]
+    hop = f"$n $e:{spelling} $o" if edge.role == "from" else f"$o $e:{spelling} $n"
+    body = (
+        f"match {{ $n: {node_type} {{ {COCO_KEY}: {_SLOT} }} {hop} }} "
+        f"return {{ $e.{COCO_KEY} as edge_key }}"
+    )
+    return Statement(body, (_coco_key_bind(coco_key),))
 
 
 def build_edge_insert(

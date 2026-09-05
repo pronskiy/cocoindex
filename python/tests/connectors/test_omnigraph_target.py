@@ -28,6 +28,7 @@ from cocoindex._internal.context_keys import ContextKey, ContextProvider
 from cocoindex.connectorkits import statediff
 from cocoindex.connectorkits.target import ManagedBy
 from cocoindex.connectors import omnigraph
+from cocoindex.connectors.omnigraph import _gq as ogq
 from cocoindex.connectors.omnigraph import _target as ogt
 from cocoindex.connectors.omnigraph._client import (
     ConnectionFactory,
@@ -37,8 +38,8 @@ from cocoindex.connectors.omnigraph._client import (
 from cocoindex.connectors.omnigraph._gq import (
     COCO_KEY,
     Bind,
-    Mutation,
     PropertyValue,
+    Query,
     Statement,
     build_edge_delete,
     build_edge_insert,
@@ -439,6 +440,53 @@ class TestRemoveTypeFromSchema:
         assert a2 in rebuilt
         assert b in rebuilt
         assert a1 not in rebuilt  # A's old (slug-keyed) definition is gone
+
+
+class TestIncidentEdges:
+    SCHEMA = (
+        "node Person {\n  slug: String @key\n  coco_key: String\n}\n"
+        "node Company {\n  cid: I64 @key\n  coco_key: String\n}\n"
+        "edge WorksAt: Person -> Company {\n  coco_key: String\n}\n"
+        "edge Knows: Person -> Person {\n  coco_key: String\n}\n"
+    )
+
+    def test_patterns_cover_both_ends_and_self_loops(self) -> None:
+        assert ogq.incident_edge_patterns(self.SCHEMA, "Person") == [
+            ogq.IncidentEdge("WorksAt", "from"),
+            ogq.IncidentEdge("Knows", "from"),
+            ogq.IncidentEdge("Knows", "to"),
+        ]
+        assert ogq.incident_edge_patterns(self.SCHEMA, "Company") == [
+            ogq.IncidentEdge("WorksAt", "to")
+        ]
+        assert ogq.incident_edge_patterns(self.SCHEMA, "Nope") == []
+
+    def test_query_matches_by_coco_key_in_traversal_spelling(self) -> None:
+        """The read side names an edge type by its traversal spelling, which
+        starts lowercase (`worksAt` for `edge WorksAt`, verified against
+        the engine, which looks it up case-insensitively). The node is
+        found by `coco_key`, bound as a parameter like every value."""
+        out = render_query(
+            [
+                ogq.build_incident_edges_query(
+                    "Person", "k1", ogq.IncidentEdge("WorksAt", "from")
+                )
+            ]
+        )
+        assert out.expr == (
+            "query m($s0_p_coco_key: String) { match { "
+            "$n: Person { coco_key: $s0_p_coco_key } $n $e:worksAt $o } "
+            "return { $e.coco_key as edge_key } }"
+        )
+        assert out.params == {"s0_p_coco_key": "k1"}
+        incoming = render_query(
+            [
+                ogq.build_incident_edges_query(
+                    "Company", "k7", ogq.IncidentEdge("WorksAt", "to")
+                )
+            ]
+        )
+        assert "$o $e:worksAt $n }" in incoming.expr
 
 
 class TestOwnershipDetection:
@@ -1965,6 +2013,9 @@ class TestNodeReconcile:
         assert not isinstance(first.tracking_record, coco.NonExistenceType)
         out = h.reconcile("s1", coco.NON_EXISTENCE, [first.tracking_record], False)
         assert out is not None and out.action.op == "delete"
+        # The sink turns this delete into a key-only stub if an edge still
+        # references the node, so the key travels with it.
+        assert out.action.key_properties == (PropertyValue("slug", "String", "s1"),)
 
     def test_undeclared_and_never_written_is_noop(self) -> None:
         assert _node_handler().reconcile("s1", coco.NON_EXISTENCE, [], False) is None
@@ -2181,7 +2232,7 @@ class TestCliArgv:
             return {}
 
         monkeypatch.setattr(_CliClient, "_run", fake_run)
-        m = Mutation("query m($p_a: String) { insert P { a: $p_a } }", {"p_a": "1"})
+        m = Query("query m($p_a: String) { insert P { a: $p_a } }", {"p_a": "1"})
         await _client().mutate(m, branch="main")
         assert seen["query"] == m.expr
         assert json.loads(seen["params"]) == {"p_a": "1"}
@@ -2549,7 +2600,7 @@ class TestPlanCommitsEncoding:
     @pytest.mark.asyncio
     async def test_date_and_datetime_properties_survive_json_dumps(self) -> None:
         """A dataclass with date/datetime/optional fields must round-trip
-        through plan_commits into a Mutation whose params survive
+        through plan_commits into a Query whose params survive
         json.dumps — this is what _CliClient._mutate_argv does with them."""
 
         @dataclass
@@ -2667,6 +2718,9 @@ class TestApplyEntityActions:
 
         monkeypatch.setattr(_CliClient, "branch_create", fake_branch_create)
         monkeypatch.setattr(_CliClient, "branch_delete", fake_branch_delete)
+        # The delete below makes the sink read the schema first, to learn
+        # whether some edge type could still reference the node.
+        monkeypatch.setattr(_CliClient, "read_schema", _noop_read_schema)
 
         db = ContextKey[ConnectionFactory](f"test_db_{uuid.uuid4().hex}")
         cp = ContextProvider()
@@ -2706,6 +2760,7 @@ class TestApplyEntityActions:
         monkeypatch.setattr(_CliClient, "branch_create", noop)
         monkeypatch.setattr(_CliClient, "branch_merge", noop)
         monkeypatch.setattr(_CliClient, "branch_delete", fail_delete)
+        monkeypatch.setattr(_CliClient, "read_schema", _noop_read_schema)
 
         db = ContextKey[ConnectionFactory](f"test_db_{uuid.uuid4().hex}")
         cp = ContextProvider()
@@ -2733,7 +2788,7 @@ class TestApplyEntityActions:
         `mutate` on the real branch — no branch_create/branch_merge at all."""
         calls: list[str] = []
 
-        async def fake_mutate(self: object, mutation: Mutation, *, branch: str) -> None:
+        async def fake_mutate(self: object, mutation: Query, *, branch: str) -> None:
             calls.append(f"mutate:{branch}")
 
         async def fake_branch_create(self: object, name: str, *, frm: str) -> None:
@@ -2762,6 +2817,106 @@ class TestApplyEntityActions:
         assert calls == ["mutate:main"]
 
     @pytest.mark.asyncio
+    async def test_a_node_an_edge_still_references_becomes_a_stub(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Deleting a node cascades to its edges in the graph, while the
+        edges' own tracking, in whatever component declared them, still
+        says they exist — so they were never re-inserted. A node that an
+        edge outside this batch still references is reduced to a key-only
+        stub instead; one whose only edges this batch deletes too is
+        deleted for real."""
+        schema = TestOrphanedEdgeEndpoints.SCHEMA
+        queried: list[tuple[str, dict[str, object]]] = []
+        commits: list[Query] = []
+        edge_ab = derive_coco_key(("a", "co"))
+        edge_bb = derive_coco_key(("b", "co"))
+
+        async def fake_read_schema(self: object) -> str | None:
+            return schema
+
+        async def fake_query(
+            self: object, query: Query, *, branch: str
+        ) -> list[dict[str, object]]:
+            queried.append((query.expr, query.params))
+            (coco_key,) = query.params.values()
+            return [
+                {
+                    "edge_key": edge_ab
+                    if coco_key == derive_coco_key(("a",))
+                    else edge_bb
+                }
+            ]
+
+        async def fake_mutate(self: object, mutation: Query, *, branch: str) -> None:
+            commits.append(mutation)
+
+        monkeypatch.setattr(_CliClient, "read_schema", fake_read_schema)
+        monkeypatch.setattr(_CliClient, "query", fake_query)
+        monkeypatch.setattr(_CliClient, "mutate", fake_mutate)
+        _patch_cli_branch_calls(monkeypatch)
+
+        db = ContextKey[ConnectionFactory](f"test_db_{uuid.uuid4().hex}")
+        cp = ContextProvider()
+        cp.provide(db, ConnectionFactory(store="file:///tmp/whatever.omni"))
+
+        def delete(slug: str) -> ogt._NodeAction:
+            return ogt._NodeAction(
+                "delete",
+                _TypeKey(db.key, "node", "Person"),
+                "Person",
+                (),
+                derive_coco_key((slug,)),
+                key_properties=(PropertyValue("slug", "String", slug),),
+            )
+
+        await ogt._apply_entity_actions(
+            cp,
+            [
+                delete("a"),
+                delete("b"),
+                ogt._EdgeAction(
+                    "delete",
+                    _TypeKey(db.key, "edge", "WorksAt"),
+                    "WorksAt",
+                    edge_bb,
+                    None,
+                    None,
+                    (),
+                    "Person",
+                    "Company",
+                    PropertyDef("slug", "String"),
+                    PropertyDef("cid", "I64"),
+                ),
+            ],
+        )
+
+        # One query per referencing edge type and side: Person is only ever
+        # a `from` of WorksAt here.
+        assert [params for _, params in queried] == [
+            {"s0_p_coco_key": derive_coco_key(("a",))},
+            {"s0_p_coco_key": derive_coco_key(("b",))},
+        ]
+        assert all("$n $e:worksAt $o" in expr for expr, _ in queried)
+        # `a` is still referenced: a key-only upsert, in the upsert phase.
+        # `b`'s only edge goes in this batch: a real delete, after the edge.
+        assert [c.expr for c in commits] == [
+            (
+                "query m($s0_p_slug: String, $s0_p_coco_key: String) "
+                "{ insert Person { slug: $s0_p_slug, coco_key: $s0_p_coco_key } }"
+            ),
+            (
+                "query m($s0_p_coco_key: String, $s1_p_coco_key: String) "
+                "{ delete WorksAt where coco_key = $s0_p_coco_key "
+                "delete Person where coco_key = $s1_p_coco_key }"
+            ),
+        ]
+        assert commits[0].params == {
+            "s0_p_slug": "a",
+            "s0_p_coco_key": derive_coco_key(("a",)),
+        }
+
+    @pytest.mark.asyncio
     async def test_missing_endpoint_escalates_a_single_commit_to_a_branch(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2774,7 +2929,7 @@ class TestApplyEntityActions:
         failed mutation applies nothing."""
         calls: list[str] = []
 
-        async def fake_mutate(self: object, mutation: Mutation, *, branch: str) -> None:
+        async def fake_mutate(self: object, mutation: Query, *, branch: str) -> None:
             calls.append(f"mutate:{branch}")
             if branch == "main":
                 raise OmnigraphCliError("dst 'c1' not found in Claim")
@@ -2853,7 +3008,7 @@ class TestApplyEntityActions:
         budget failed this batch on its third attempt."""
         present: set[tuple[str, str]] = set()
 
-        async def fake_mutate(self: object, mutation: Mutation, *, branch: str) -> None:
+        async def fake_mutate(self: object, mutation: Query, *, branch: str) -> None:
             if "insert Supports" in mutation.expr:
                 for i in range(2):
                     frm, to = (
@@ -2896,7 +3051,7 @@ class TestApplyEntityActions:
         batch means the stub did not take; that must propagate, not spin."""
         attempts = 0
 
-        async def fake_mutate(self: object, mutation: Mutation, *, branch: str) -> None:
+        async def fake_mutate(self: object, mutation: Query, *, branch: str) -> None:
             nonlocal attempts
             if "insert Supports" in mutation.expr:
                 attempts += 1
@@ -2929,7 +3084,7 @@ class TestApplyEntityActions:
         schema_read = asyncio.Event()
         calls: list[str] = []
 
-        async def fake_mutate(self: object, mutation: Mutation, *, branch: str) -> None:
+        async def fake_mutate(self: object, mutation: Query, *, branch: str) -> None:
             calls.append(f"mutate:{branch}")
             await allow_mutations.wait()
 
@@ -4027,7 +4182,7 @@ def test_mount_edge_rejects_an_endpoint_key_it_cannot_render() -> None:
 # key-tuple construction from `self._schema.key` had zero coverage. These
 # drive the real declarative pipeline (mount -> declare -> reconcile ->
 # sink) with the CLI client's I/O methods mocked out, and assert on the
-# actual `Mutation` that would be sent — the concrete, observable form of
+# actual `Query` that would be sent — the concrete, observable form of
 # "what reaches the target state" — rather than on any internal method.
 # ---------------------------------------------------------------------------
 
@@ -4050,10 +4205,10 @@ def _patch_cli_schema_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(_CliClient, "read_schema", _noop_read_schema)
 
 
-def _capture_mutations(monkeypatch: pytest.MonkeyPatch) -> list[Mutation]:
-    captured: list[Mutation] = []
+def _capture_mutations(monkeypatch: pytest.MonkeyPatch) -> list[Query]:
+    captured: list[Query] = []
 
-    async def fake_mutate(self: object, mutation: Mutation, *, branch: str) -> None:
+    async def fake_mutate(self: object, mutation: Query, *, branch: str) -> None:
         captured.append(mutation)
 
     monkeypatch.setattr(_CliClient, "mutate", fake_mutate)
@@ -4595,7 +4750,7 @@ def _init_live(store_dir: Path, schema_pg: str) -> subprocess.CompletedProcess[s
 
 
 def _mutate_live(
-    store: str, mutation: Mutation, *, check: bool = True
+    store: str, mutation: Query, *, check: bool = True
 ) -> subprocess.CompletedProcess[str]:
     r = subprocess.run(
         [
@@ -5741,7 +5896,9 @@ class TestEndToEnd:
         )  # both endpoints remain
 
     def test_node_deleted_cascades_to_its_edges(self, store: str) -> None:
-        """Undeclaring a node must also remove the edges that reference it.
+        """Undeclaring a node together with the edges that reference it
+        removes both (a node undeclared while an edge still references it
+        is another matter: test_undeclaring_a_referenced_node_keeps_its_edge).
         This isn't ordinary CocoIndex parent-child cleanup -- Source and
         Supports are independent target-state trees, so nothing
         automatically knows an edge references a node from a SEPARATE
@@ -5792,6 +5949,74 @@ class TestEndToEnd:
         edges_after = [r for r in rows if r.get("edge") == "Supports"]
         assert len(edges_after) == 1
         assert edges_after[0]["from"] == "a" and edges_after[0]["to"] == "c1"
+
+    def test_undeclaring_a_referenced_node_keeps_its_edge(self, store: str) -> None:
+        """The edge lives in one component and its source node in another.
+        The node's component stops declaring the node, then declares it
+        again, while the edge's component declares the edge unchanged
+        throughout. Deleting the node cascaded to the edge in the graph
+        while the edge's tracking still said it was there, so when the
+        node came back the edge's reconcile had nothing to do, and the
+        graph ended with both endpoints and no edge. A node an edge still
+        references is reduced to a key-only stub instead — the shape an
+        edge arriving before its node leaves behind — and the owner's next
+        declaration fills it back in."""
+        db = _e2e_db(store, "referenced_node")
+        declare_a = {"on": True}
+
+        @coco.fn
+        async def declare_source(sources: omnigraph.NodeTarget[Any]) -> None:
+            if declare_a["on"]:
+                sources.declare_node(node=_ScSourceNarrow(slug="a", title="A"))
+
+        @coco.fn
+        async def declare_support(
+            supports: omnigraph.EdgeTarget[Any], claims: omnigraph.NodeTarget[Any]
+        ) -> None:
+            claims.declare_node(node=_ScClaim(slug="c1"))
+            supports.declare_edge(
+                from_id="a", to_id="c1", record=_ScEdgeProps(weight=1)
+            )
+
+        async def main() -> None:
+            sources = await omnigraph.mount_node_target(
+                db, "Source", await NodeSchema.from_class(_ScSourceNarrow, key="slug")
+            )
+            claims = await omnigraph.mount_node_target(
+                db, "Claim", await NodeSchema.from_class(_ScClaim, key="slug")
+            )
+            supports = await omnigraph.mount_edge_target(
+                db,
+                "Supports",
+                sources,
+                claims,
+                await EdgeSchema.from_class(_ScEdgeProps),
+            )
+            await coco.mount(declare_source, sources)
+            await coco.mount(declare_support, supports, claims)
+
+        def graph() -> tuple[list[tuple[str, str | None]], int]:
+            rows = _export_rows(store)
+            sources = [
+                (r["data"]["slug"], r["data"]["title"])
+                for r in rows
+                if r.get("type") == "Source"
+            ]
+            return sources, len([r for r in rows if r.get("edge") == "Supports"])
+
+        app = coco.App(
+            coco.AppConfig(name="e2e_referenced_node", environment=coco_env), main
+        )
+        app.update_blocking()
+        assert graph() == ([("a", "A")], 1)
+
+        declare_a["on"] = False
+        app.update_blocking()
+        assert graph() == ([("a", None)], 1)
+
+        declare_a["on"] = True
+        app.update_blocking()
+        assert graph() == ([("a", "A")], 1)
 
     def test_unchanged_issues_no_writes(self, store: str) -> None:
         """The single most important case: CocoIndex's whole incrementality

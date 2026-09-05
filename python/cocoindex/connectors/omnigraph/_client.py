@@ -21,7 +21,7 @@ if sys.platform == "win32":
 else:
     import fcntl
 
-from cocoindex.connectors.omnigraph._gq import Mutation
+from cocoindex.connectors.omnigraph._gq import Query
 
 if sys.platform == "win32":
 
@@ -228,6 +228,25 @@ class _CliClient:
             "--quiet",
         ]
 
+    def _query_argv(
+        self, query_path: str, params_path: str, *, branch: str
+    ) -> list[str]:
+        """The read side of `_mutate_argv`: same file-borne payloads."""
+        return [
+            self._conn.cli,
+            "query",
+            "--store",
+            self._conn.store,
+            "--branch",
+            branch,
+            "--query",
+            query_path,
+            "--params-file",
+            params_path,
+            "--json",
+            "--quiet",
+        ]
+
     def _merge_argv(self, name: str, *, into: str) -> list[str]:
         # `branch merge` has no compare-and-swap precondition (as of 0.10.0
         # only `mutate` takes `--if-commit`). A conflict is a non-zero exit.
@@ -386,7 +405,7 @@ class _CliClient:
         assert isinstance(source, str)
         return source
 
-    async def mutate(self, mutation: Mutation, *, branch: str) -> None:
+    async def mutate(self, mutation: Query, *, branch: str) -> None:
         with (
             _temporary_text_file(mutation.expr, suffix=".gq") as query_path,
             _temporary_text_file(
@@ -394,6 +413,22 @@ class _CliClient:
             ) as params_path,
         ):
             await self._run(self._mutate_argv(query_path, params_path, branch=branch))
+
+    async def query(self, query: Query, *, branch: str) -> list[dict[str, object]]:
+        """Run a read query and return its rows, one dict per row keyed by
+        the `return` clause's column aliases."""
+        with (
+            _temporary_text_file(query.expr, suffix=".gq") as query_path,
+            _temporary_text_file(
+                json.dumps(query.params), suffix=".json"
+            ) as params_path,
+        ):
+            result = await self._run(
+                self._query_argv(query_path, params_path, branch=branch)
+            )
+        rows = result["rows"]
+        assert isinstance(rows, list)
+        return rows
 
     async def branch_create(self, name: str, *, frm: str) -> None:
         await self._run(self._branch_create_argv(name, frm=frm))

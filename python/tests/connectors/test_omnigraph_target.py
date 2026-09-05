@@ -2322,6 +2322,102 @@ class TestApplyEntityActions:
         assert "mutate:main" not in calls[1:]  # no stub written to the live branch
         assert "branch_merge" in calls and calls[-1] == "branch_delete"
 
+    @staticmethod
+    def _two_edge_actions(db_key: str) -> list[ogt._NodeAction | ogt._EdgeAction]:
+        key = _TypeKey(db_key, "edge", "Supports")
+        return [
+            ogt._EdgeAction(
+                "insert",
+                key,
+                "Supports",
+                derive_coco_key((s, c)),
+                s,
+                c,
+                (),
+                "Source",
+                "Claim",
+                PropertyDef("slug", "String"),
+                PropertyDef("slug", "String"),
+            )
+            for s, c in (("s1", "c1"), ("s2", "c2"))
+        ]
+
+    @pytest.mark.asyncio
+    async def test_stubs_every_distinct_missing_endpoint_in_the_batch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two edges whose four endpoints are all absent need four stub
+        rounds — the engine names only the first missing endpoint per
+        attempt — and every one of them must be taken. A fixed two-round
+        budget failed this batch on its third attempt."""
+        present: set[tuple[str, str]] = set()
+
+        async def fake_mutate(self: object, mutation: Mutation, *, branch: str) -> None:
+            if "insert Supports" in mutation.expr:
+                for i in range(2):
+                    frm, to = (
+                        mutation.params[f"s{i}_e_from"],
+                        mutation.params[f"s{i}_e_to"],
+                    )
+                    if ("Source", frm) not in present:
+                        raise OmnigraphCliError(f"src '{frm}' not found in Source")
+                    if ("Claim", to) not in present:
+                        raise OmnigraphCliError(f"dst '{to}' not found in Claim")
+                return
+            # Anything else is a key-only endpoint stub.
+            type_name = mutation.expr.split("insert ")[1].split(" ")[0]
+            present.add((type_name, str(mutation.params["p_slug"])))
+
+        async def noop(self: object, *args: object, **kwargs: object) -> None:
+            return None
+
+        monkeypatch.setattr(_CliClient, "mutate", fake_mutate)
+        monkeypatch.setattr(_CliClient, "branch_create", noop)
+        monkeypatch.setattr(_CliClient, "branch_merge", noop)
+        monkeypatch.setattr(_CliClient, "branch_delete", noop)
+
+        db = ContextKey[ConnectionFactory](f"test_db_{uuid.uuid4().hex}")
+        cp = ContextProvider()
+        cp.provide(db, ConnectionFactory(store="file:///tmp/whatever.omni"))
+        await ogt._apply_entity_actions(cp, self._two_edge_actions(db.key))
+        assert present == {
+            ("Source", "s1"),
+            ("Claim", "c1"),
+            ("Source", "s2"),
+            ("Claim", "c2"),
+        }
+
+    @pytest.mark.asyncio
+    async def test_endpoint_still_missing_after_its_stub_fails_loudly(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A "not found" that names an endpoint already stubbed in this
+        batch means the stub did not take; that must propagate, not spin."""
+        attempts = 0
+
+        async def fake_mutate(self: object, mutation: Mutation, *, branch: str) -> None:
+            nonlocal attempts
+            if "insert Supports" in mutation.expr:
+                attempts += 1
+                raise OmnigraphCliError("src 's1' not found in Source")
+
+        async def noop(self: object, *args: object, **kwargs: object) -> None:
+            return None
+
+        monkeypatch.setattr(_CliClient, "mutate", fake_mutate)
+        monkeypatch.setattr(_CliClient, "branch_create", noop)
+        monkeypatch.setattr(_CliClient, "branch_merge", noop)
+        monkeypatch.setattr(_CliClient, "branch_delete", noop)
+
+        db = ContextKey[ConnectionFactory](f"test_db_{uuid.uuid4().hex}")
+        cp = ContextProvider()
+        cp.provide(db, ConnectionFactory(store="file:///tmp/whatever.omni"))
+        with pytest.raises(OmnigraphCliError, match="not found"):
+            await ogt._apply_entity_actions(cp, self._two_edge_actions(db.key))
+        # The live attempt, the first scratch attempt, and exactly one retry
+        # after the stub — never a second retry for the same endpoint.
+        assert attempts == 3
+
     @pytest.mark.asyncio
     async def test_scratch_branch_blocks_schema_changes_until_deleted(
         self, monkeypatch: pytest.MonkeyPatch
@@ -4393,6 +4489,49 @@ class TestEndpointRetryLive:
         assert len([r for r in rows if r.get("edge") == "Supports"]) == 1
         assert len([r for r in rows if r.get("type") == "Source"]) == 1
         assert len([r for r in rows if r.get("type") == "Claim"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_two_edges_with_four_missing_endpoints(self, tmp_path: Path) -> None:
+        """One commit carrying two edges whose four endpoints are all absent:
+        the engine reports one missing endpoint per attempt, so this takes
+        four stub rounds. A fixed two-round budget failed on the third."""
+        store_dir = tmp_path / "g.omni"
+        conn = _live_conn(store_dir)
+        store_uri = f"file://{store_dir}"
+        client = _CliClient(conn)
+        cp, db_key = _live_context(conn)
+        await client.init_graph(_basic_pg())
+
+        edge_key = _TypeKey(db_key, "edge", "Supports")
+        actions = [
+            ogt._EdgeAction(
+                "insert",
+                edge_key,
+                "Supports",
+                derive_coco_key((s, c)),
+                s,
+                c,
+                (PropertyValue("weight", "I64", 1),),
+                "Source",
+                "Claim",
+                PropertyDef("slug", "String"),
+                PropertyDef("slug", "String"),
+            )
+            for s, c in (("s1", "c1"), ("s2", "c2"))
+        ]
+        await ogt._apply_entity_actions(cp, actions)
+
+        rows = _export_rows(store_uri)
+        assert len([r for r in rows if r.get("edge") == "Supports"]) == 2
+        assert sorted(r["data"]["slug"] for r in rows if r.get("type") == "Source") == [
+            "s1",
+            "s2",
+        ]
+        assert sorted(r["data"]["slug"] for r in rows if r.get("type") == "Claim") == [
+            "c1",
+            "c2",
+        ]
+        assert _branch_names(store_uri) == ["main"]
 
 
 # ---------------------------------------------------------------------------

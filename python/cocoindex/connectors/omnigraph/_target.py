@@ -1145,19 +1145,23 @@ async def _mutate_with_endpoint_retry(
     "not found" failure, is provably safe: the engine has just confirmed
     the node doesn't exist, so there's nothing to wipe.
 
-    Retries up to twice — not in an unbounded loop. The engine reports only
-    the *first* missing endpoint per attempt (verified: with both `from`
-    and `to` absent, only `src` is reported), and with up to 1024 components
-    running concurrently, an edge component preceding *both* of its
-    endpoint components is ordinary, not exotic — so one retry isn't
-    enough. Two is the principled bound: an edge has exactly two endpoints,
-    so a third "not found" means something else is wrong. Each `(type,
-    key)` that gets stubbed is tracked and never stubbed a second time, so
-    a not-found that persists after being stubbed fails loudly instead of
-    spinning.
+    The engine reports only the *first* missing endpoint per attempt
+    (verified: with both `from` and `to` absent, only `src` is reported),
+    and with up to 1024 components running concurrently, an edge component
+    preceding the components that own its endpoints is ordinary, not
+    exotic. A commit carries every edge of a component, so the number of
+    stub rounds it may need is the number of distinct endpoints those
+    edges reference — not two, which is the budget for a single edge and
+    failed any commit with three or more absent endpoints.
+
+    The loop is bounded by exactly that set: a stub is only ever built for
+    an endpoint some edge in `edge_actions` references, and each `(type,
+    key)` is stubbed at most once. A "not found" that names an endpoint
+    already stubbed, or one no edge here references, propagates instead
+    of spinning.
     """
     stubbed: set[tuple[str, str]] = set()
-    for _ in range(2):
+    while True:
         try:
             await client.mutate(commit, branch=branch)
             return
@@ -1173,8 +1177,6 @@ async def _mutate_with_endpoint_retry(
                 raise
             stubbed.add((type_name, key_str))
             await client.mutate(stub, branch=branch)
-    # Final attempt after up to two stubs; a third not-found propagates.
-    await client.mutate(commit, branch=branch)
 
 
 async def _apply_entity_actions(

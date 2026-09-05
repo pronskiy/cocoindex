@@ -741,13 +741,34 @@ def _tracking_key_value(prop_def: PropertyDef, value: Any) -> Any:
     graph node two tracking keys; removing one declaration then deleted the
     node the other still declared. Every other key is tracked by the
     encoded value the graph is sent, which is what it keys on.
+
+    The instant can only be derived from a `datetime`, so a `DateTime` key
+    accepts nothing else: a hand-built `PropertyDef("at", "DateTime")` lets
+    a dict row carry an ISO string, and a string tracked by its spelling
+    reopens the two-keys-one-node hole. A `Date` key likewise takes a
+    `datetime.date` — and not a `datetime`, whose ISO form carries a time.
     """
-    if prop_def.pg_type.rstrip("?") == "DateTime" and isinstance(
-        value, datetime.datetime
-    ):
+    base = prop_def.pg_type.rstrip("?")
+    if base == "DateTime":
+        if not isinstance(value, datetime.datetime):
+            raise TypeError(
+                f"Omnigraph key property {prop_def.name!r} is a DateTime: pass a "
+                f"`datetime.datetime`, not {type(value).__name__}. The graph "
+                f"identifies the node by the instant, which is derived from the "
+                f"datetime; a string would be tracked by its spelling, and two "
+                f"spellings of one instant would be two tracking keys for one node."
+            )
         if value.tzinfo is None:
             value = value.replace(tzinfo=datetime.UTC)
         return (value - _EPOCH) // datetime.timedelta(milliseconds=1)
+    if base == "Date" and (
+        not isinstance(value, datetime.date) or isinstance(value, datetime.datetime)
+    ):
+        raise TypeError(
+            f"Omnigraph key property {prop_def.name!r} is a Date: pass a "
+            f"`datetime.date`, not {type(value).__name__}. The key is tracked by "
+            f"the date's ISO form, which only a `date` yields exactly."
+        )
     return _encode_property(prop_def, value).value
 
 

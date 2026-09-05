@@ -4214,6 +4214,34 @@ class TestDateTimeKeyIdentity:
             self.AT, c
         )
 
+    def test_a_string_is_refused_for_a_datetime_key(self) -> None:
+        """A hand-built `PropertyDef("at", "DateTime")` lets a dict row carry
+        an ISO string, and a string is not normalised: `12:00+00:00` and
+        `14:00+02:00` got separate tracking keys for one graph node again.
+        The instant can only be derived from a `datetime`, so anything else
+        is refused before any state is declared."""
+        bare = PropertyDef("at", "DateTime")
+        with pytest.raises(TypeError, match=r"key property 'at'.*datetime\.datetime"):
+            ogt._tracking_key_value(bare, "2026-01-01T12:00:00+00:00")
+        with pytest.raises(TypeError, match=r"key property 'at'.*datetime\.datetime"):
+            ogt._tracking_key_value(bare, 1767268800000)
+
+    def test_only_a_date_is_accepted_for_a_date_key(self) -> None:
+        on = PropertyDef("on", "Date")
+        with pytest.raises(TypeError, match=r"key property 'on'.*datetime\.date"):
+            ogt._tracking_key_value(on, "2026-01-05")
+        # A datetime is a date subclass, but its ISO form carries a time.
+        with pytest.raises(TypeError, match=r"key property 'on'.*datetime\.date"):
+            ogt._tracking_key_value(on, datetime.datetime(2026, 1, 5, 12))  # noqa: DTZ001
+
+    def test_declare_node_refuses_a_string_for_a_datetime_key(self) -> None:
+        target = _bare_node_target(
+            NodeSchema(properties={"at": PropertyDef("at", "DateTime")}, key=("at",)),
+            "Event",
+        )
+        with pytest.raises(TypeError, match=r"key property 'at'.*datetime\.datetime"):
+            target.declare_node(node={"at": "2026-01-01T12:00:00+00:00"})
+
     def test_a_date_key_is_still_tracked_by_its_iso_form(self) -> None:
         on = PropertyDef("on", "Date", ogt._isoformat)
         assert ogt._tracking_key_value(on, datetime.date(2026, 1, 5)) == "2026-01-05"

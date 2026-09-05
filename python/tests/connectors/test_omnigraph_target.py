@@ -3685,12 +3685,12 @@ def _bare_node_target(schema: NodeSchema, type_name: str) -> omnigraph.NodeTarge
 
 class TestNodeTargetKeyValidation:
     def test_a_custom_encoder_on_a_key_property_is_refused(self) -> None:
-        """CocoIndex tracks a node by the raw key value while the graph keys
-        on the encoded one. With `str.lower`, a declared "Mixed" was stored
-        as "mixed"; switching the encoder to `str.upper` then upserted a
-        second node "MIXED" under the same `coco_key` and left "mixed"
-        behind. The key is the identity: normalize it before declaring the
-        node, never in an encoder."""
+        """With `str.lower`, a declared "Mixed" was stored as "mixed";
+        switching the encoder to `str.upper` then upserted a second node
+        "MIXED" under the same `coco_key` and left "mixed" behind — and an
+        edge declared with the raw "Mixed" would find neither. The key is
+        the identity: normalize it before declaring the node, never in an
+        encoder."""
         schema = NodeSchema(
             properties={"slug": PropertyDef("slug", "String", str.lower)},
             key=("slug",),
@@ -4164,6 +4164,43 @@ def test_declare_node_keys_on_the_schema_key_not_the_first_field(
     assert m.params["s0_p_v"] == 1.5
     assert m.params["s0_p_coco_key"] == derive_coco_key(("2026-01-01",))
     assert m.params["s0_p_coco_key"] != derive_coco_key(("s1",))
+
+
+@dataclass
+class _Day:
+    on: datetime.date
+    note: str | None
+
+
+async def _declare_a_day(db: coco.ContextKey[ConnectionFactory]) -> None:
+    days = await omnigraph.mount_node_target(
+        db, "Day", await NodeSchema.from_class(_Day, key="on")
+    )
+    days.declare_node(node=_Day(on=datetime.date(2026, 1, 5), note="n"))
+
+
+def test_declare_node_keyed_by_a_date_tracks_the_encoded_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A `Date` key is legal in `.pg`, and mounting one was allowed — but
+    declaring a node passed the raw `datetime.date` into the target-state
+    key, which the engine refused (`Unsupported StableKey Python type`).
+    The key is tracked in its encoded (ISO) form, the same value the
+    graph is sent, so identity and stored key can never disagree."""
+    _patch_cli_schema_calls(monkeypatch)
+    captured = _capture_mutations(monkeypatch)
+    db = _fresh_db("date_key")
+
+    app = coco.App(
+        coco.AppConfig(name="test_declare_node_date_key", environment=coco_env),
+        _declare_a_day,
+        db,
+    )
+    app.update_blocking()
+
+    (m,) = captured
+    assert m.params["s0_p_on"] == "2026-01-05"
+    assert m.params["s0_p_coco_key"] == derive_coco_key(("2026-01-05",))
 
 
 @dataclass
@@ -6274,3 +6311,18 @@ class TestEndToEnd:
         app.drop_blocking()
         assert _read_schema_source(store).strip() == ""
         assert _export_rows(store) == []
+
+    def test_a_date_keyed_node_round_trips(self, store: str) -> None:
+        """Declared twice, a `Date`-keyed node must be one node: its identity
+        is the ISO form of the key, both in tracking and in the graph."""
+        db = _e2e_db(store, "date_key")
+
+        async def main() -> None:
+            await _declare_a_day(db)
+
+        app = coco.App(coco.AppConfig(name="e2e_date_key", environment=coco_env), main)
+        app.update_blocking()
+        app.update_blocking()
+
+        (row,) = [r for r in _export_rows(store) if r.get("type") == "Day"]
+        assert row["data"]["note"] == "n"

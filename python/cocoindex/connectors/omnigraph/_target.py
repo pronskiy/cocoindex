@@ -1759,9 +1759,19 @@ class NodeTarget(
         return self._schema
 
     def declare_node(self: NodeTarget[RowT], *, node: RowT) -> None:
-        """Declare a node (record) to be upserted to this node type."""
+        """Declare a node (record) to be upserted to this node type.
+
+        The target-state key is the key property's *encoded* value — for a
+        `Date` key its ISO form, the same string the graph is sent and keys
+        on. The raw `datetime.date` is not a type the engine's StableKey
+        accepts, and tracking one form while storing the other would let
+        the two identities drift apart.
+        """
         properties = _record_to_dict(node, self._schema)
-        key = tuple(properties[k] for k in self._schema.key)
+        key: tuple[Any, ...] = tuple(
+            _encode_property(self._schema.properties[k], properties[k]).value
+            for k in self._schema.key
+        )
         coco.declare_target_state(
             self._provider.target_state(key, _NodeValue(properties))
         )
@@ -2059,18 +2069,21 @@ def node_target(
     for key_field in schema.key:
         encoder = schema.properties[key_field].encoder
         if encoder is not None and encoder not in _ENCODERS.values():
-            # CocoIndex tracks a node by the raw key value; the graph keys on
-            # the encoded one. Changing such an encoder upserted a second
-            # node under the new encoding and left the old one behind, both
-            # sharing one `coco_key`. Only the fixed Date/DateTime encoders
-            # are allowed on a key: pure functions of the value, never
-            # changing, so the two identities cannot drift apart.
+            # The key is the node's identity, and an edge addresses that
+            # identity by the raw key value its author passed to
+            # `declare_edge`. A custom encoder would make the graph key on
+            # something else: changing one from `str.lower` to `str.upper`
+            # upserted a second node under the new spelling and left the old
+            # one behind, and an edge declared with the raw value would never
+            # find either. Only the fixed Date/DateTime encoders are allowed
+            # on a key — pure functions of the value, never changing, and
+            # such types cannot be edge endpoints at all.
             raise ValueError(
                 f"Node type {type_name!r}: key property {key_field!r} has a custom "
-                f"encoder. The key is the node's identity — CocoIndex tracks it by "
-                f"the raw value while the graph keys on the encoded one, so changing "
-                f"the encoder would leave the old node behind next to the new one. "
-                f"Normalize the key value before declaring the node instead."
+                f"encoder. The key is the node's identity, and edges address it by "
+                f"the raw key value, so an encoder there would make the graph's key "
+                f"disagree with what edges reference. Normalize the key value before "
+                f"declaring the node instead."
             )
     type_key = _TypeKey(db_key=db.key, type_kind="node", type_name=type_name)
     spec = _TypeSpec(

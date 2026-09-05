@@ -54,6 +54,7 @@ from cocoindex.connectors.omnigraph._gq import (
     validate_pg_type,
 )
 from cocoindex.connectors.omnigraph._target import (
+    EdgeSchema,
     NodeSchema,
     OmnigraphType,
     PropertyDef,
@@ -960,6 +961,43 @@ def _spec(schema: NodeSchema, managed_by: ManagedBy = ManagedBy.SYSTEM) -> _Type
         to_type=None,
         managed_by=managed_by,
     )
+
+
+class TestEdgeSchema:
+    @pytest.mark.asyncio
+    async def test_from_class_needs_no_key(self) -> None:
+        """An edge's identity is always `(from_id, to_id)`; its own properties
+        never form a key. Building edge properties through
+        `NodeSchema.from_class` forced a meaningless `key=` onto every edge
+        dataclass, which the example then had to explain away."""
+        schema = await EdgeSchema.from_class(_AttendedRel)
+        assert schema.properties == {
+            "is_organizer": PropertyDef("is_organizer", "Bool")
+        }
+        assert not hasattr(schema, "key")
+
+    @pytest.mark.asyncio
+    async def test_from_class_rejects_id(self) -> None:
+        @dataclass
+        class _WithId:
+            id: str
+
+        with pytest.raises(ValueError, match="'id' is reserved"):
+            await EdgeSchema.from_class(_WithId)
+
+    @pytest.mark.asyncio
+    async def test_a_node_schema_is_not_an_edge_schema(self) -> None:
+        """Keyed schemas describe node types only; handing one to an edge
+        type is refused at mount, where the mistake is."""
+        node_schema = await NodeSchema.from_class(_ScClaim, key="slug")
+        with pytest.raises(TypeError, match="EdgeSchema"):
+            omnigraph.edge_target(
+                ContextKey[ConnectionFactory]("db"),
+                "E",
+                _bare_node_target(node_schema, "A"),
+                _bare_node_target(node_schema, "B"),
+                node_schema,  # type: ignore[arg-type]
+            )
 
 
 class TestNodeTypeReconcile:
@@ -3420,32 +3458,42 @@ class TestOrphanedEdgeEndpoints:
 
 
 class TestPublicSurface:
-    def test_aliases_are_the_same_objects(self) -> None:
-        assert omnigraph.TableTarget is omnigraph.NodeTarget
-        assert omnigraph.RelationTarget is omnigraph.EdgeTarget
-        assert omnigraph.TableSchema is omnigraph.NodeSchema
-        assert omnigraph.ColumnDef is omnigraph.PropertyDef
-        assert omnigraph.mount_table_target is omnigraph.mount_node_target
-        assert omnigraph.mount_relation_target is omnigraph.mount_edge_target
-        assert omnigraph.declare_table_target is omnigraph.declare_node_target
-        assert omnigraph.declare_relation_target is omnigraph.declare_edge_target
-        assert omnigraph.table_target is omnigraph.node_target
-        assert omnigraph.relation_target is omnigraph.edge_target
-
-    def test_method_aliases(self) -> None:
-        # mypy can't statically resolve a bound-method identity check through
-        # a generic class accessed via the class itself (rather than an
-        # instance) — the objects are the same regardless of instantiation.
-        assert omnigraph.NodeTarget.declare_record is omnigraph.NodeTarget.declare_node  # type: ignore[misc]
-        assert (
-            omnigraph.EdgeTarget.declare_relation  # type: ignore[misc]
-            is omnigraph.EdgeTarget.declare_edge
-        )
-
-    def test_all_is_sorted_and_complete(self) -> None:
-        assert omnigraph.__all__ == sorted(omnigraph.__all__)
-        for name in omnigraph.__all__:
-            assert hasattr(omnigraph, name), name
+    def test_exports_one_vocabulary(self) -> None:
+        """Omnigraph's own schema language says `node` and `edge`, and that is
+        the only vocabulary this connector exports. The table/relation/record
+        aliases doubled every name for no behaviour of their own, and the
+        mount-time `key=` could only agree with the schema or be an error."""
+        assert set(omnigraph.__all__) == {
+            "ConnectionFactory",
+            "EdgeSchema",
+            "EdgeTarget",
+            "NodeSchema",
+            "NodeTarget",
+            "OmnigraphType",
+            "PropertyDef",
+            "ValueEncoder",
+            "declare_edge_target",
+            "declare_node_target",
+            "edge_target",
+            "mount_edge_target",
+            "mount_node_target",
+            "node_target",
+        }
+        for alias in (
+            "TableTarget",
+            "RelationTarget",
+            "TableSchema",
+            "ColumnDef",
+            "table_target",
+            "mount_table_target",
+            "declare_table_target",
+            "relation_target",
+            "mount_relation_target",
+            "declare_relation_target",
+        ):
+            assert not hasattr(omnigraph, alias), alias
+        assert not hasattr(omnigraph.NodeTarget, "declare_record")
+        assert not hasattr(omnigraph.EdgeTarget, "declare_relation")
 
 
 # ---------------------------------------------------------------------------
@@ -3547,7 +3595,7 @@ class TestEdgeTargetKeyPropertyWiring:
         # into `coco.TargetState`'s private value) proves the wiring without
         # depending on coco internals.
         spec = ogt._build_edge_spec(
-            NodeSchema(properties=_SUPPORTS_PROPS, key=()),
+            EdgeSchema(properties=_SUPPORTS_PROPS),
             source,
             claim,
             ManagedBy.SYSTEM,
@@ -3838,7 +3886,7 @@ async def _declare_supports_edge(db: coco.ContextKey[ConnectionFactory]) -> None
     node_schema = await NodeSchema.from_class(_KeyOnlyNode, key="slug")
     source = await omnigraph.mount_node_target(db, "Source", node_schema)
     claim = await omnigraph.mount_node_target(db, "Claim", node_schema)
-    edge_schema = await NodeSchema.from_class(_EdgeProps, key="weight")
+    edge_schema = await EdgeSchema.from_class(_EdgeProps)
     edge = await omnigraph.mount_edge_target(db, "Supports", source, claim, edge_schema)
     edge.declare_edge(from_id="s1", to_id="c1", record=_EdgeProps(weight=7))
 
@@ -4030,8 +4078,8 @@ def test_declare_edge_without_a_record_rejects_a_non_nullable_schema() -> None:
     property missing. Omnigraph rejects that ("must provide non-nullable
     property"), naming neither this call nor the omitted argument.
     """
-    schema = NodeSchema(
-        properties={"is_organizer": PropertyDef("is_organizer", "Bool")}, key=()
+    schema = EdgeSchema(
+        properties={"is_organizer": PropertyDef("is_organizer", "Bool")}
     )
     target: omnigraph.EdgeTarget[_AttendedRel, Any] = omnigraph.EdgeTarget(
         cast(Any, None),
@@ -4055,118 +4103,39 @@ def test_declare_edge_without_a_record_rejects_a_non_nullable_schema() -> None:
 
 
 # ---------------------------------------------------------------------------
-# `declare_node`'s `row=` compatibility alias: table-shaped sibling
-# connectors (neo4j, falkordb, surrealdb) call `declare_record(row=...)`.
-# Since `declare_record = declare_node` is the same function object (not a
-# wrapper), that call previously raised `TypeError: declare_node() got an
-# unexpected keyword argument 'row'` — the one keyword mismatch the
-# meeting-notes-graph example port surfaced. See declare_node's docstring.
+# One vocabulary: node/edge. No `row=`, no `declare_record`, and no mount-time
+# `key=` — the schema already carries the key.
 # ---------------------------------------------------------------------------
 
 
-def test_declare_node_requires_exactly_one_of_node_or_row() -> None:
-    """Pure argument validation, ahead of any provider access — runs against
-    a bare `NodeTarget` (no live coco.App needed) exactly like the analogous
-    checks in TestEdgeTargetKeyFieldWiring above."""
+def test_declare_node_takes_only_node() -> None:
     schema = NodeSchema(
         properties={"slug": PropertyDef("slug", "String")}, key=("slug",)
     )
     target = _bare_node_target(schema, "Foo")
+    with pytest.raises(TypeError):
+        target.declare_node()  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        target.declare_node(row={"slug": "a"})  # type: ignore[call-arg]
 
-    with pytest.raises(TypeError, match="exactly one of `node` or `row`"):
-        target.declare_node()
-    with pytest.raises(TypeError, match="exactly one of `node` or `row`"):
-        target.declare_node(node={"slug": "a"}, row={"slug": "a"})
 
-
-async def _declare_article_from_row_alias(
-    db: coco.ContextKey[ConnectionFactory],
-) -> None:
+async def _mount_with_redundant_key(db: coco.ContextKey[ConnectionFactory]) -> None:
     schema = await NodeSchema.from_class(_Article, key="slug")
-    target = await omnigraph.mount_node_target(db, "Article", schema)
-    target.declare_record(
-        row=_Article(slug="a3", title="Row alias", published=datetime.date(2026, 3, 3))
-    )
+    await omnigraph.mount_node_target(db, "Article", schema, key="slug")  # type: ignore[call-arg]
 
 
-def test_declare_record_with_row_reaches_the_target_state(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """`declare_record(row=...)` — the exact call shape a ported neo4j app
-    uses — must reach the target state the same way `declare_node(node=...)`
-    does in test_declare_node_from_dataclass_reaches_the_target_state above."""
+def test_mount_node_has_no_key_kwarg(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The schema already names the key; a second `key=` at the mount call
+    site could only agree with it or be an error, so it is gone."""
     _patch_cli_schema_calls(monkeypatch)
-    captured = _capture_mutations(monkeypatch)
-    db = _fresh_db("declare_record_row_alias")
+    db = _fresh_db("mount_node_no_key_kwarg")
 
     app = coco.App(
-        coco.AppConfig(
-            name="test_declare_record_with_row_reaches_the_target_state",
-            environment=coco_env,
-        ),
-        _declare_article_from_row_alias,
+        coco.AppConfig(name="test_mount_node_has_no_key_kwarg", environment=coco_env),
+        _mount_with_redundant_key,
         db,
     )
-    app.update_blocking()
-
-    assert len(captured) == 1
-    m = captured[0]
-    assert "insert Article" in m.expr
-    assert m.params["s0_p_slug"] == "a3"
-    assert m.params["s0_p_title"] == "Row alias"
-    assert m.params["s0_p_coco_key"] == derive_coco_key(("a3",))
-
-
-# ---------------------------------------------------------------------------
-# `mount_node_target`'s optional `key=` — redundant validation for parity
-# with the sibling connectors' `primary_key=`, per the design spec's API
-# surface example (`mount_node_target(OG, "Source", schema, key="slug")`).
-# ---------------------------------------------------------------------------
-
-
-async def _mount_with_matching_key(db: coco.ContextKey[ConnectionFactory]) -> None:
-    schema = await NodeSchema.from_class(_Article, key="slug")
-    target = await omnigraph.mount_node_target(db, "Article", schema, key="slug")
-    target.declare_node(
-        node=_Article(slug="a4", title="Key ok", published=datetime.date(2026, 4, 4))
-    )
-
-
-def test_mount_node_accepts_matching_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    _patch_cli_schema_calls(monkeypatch)
-    captured = _capture_mutations(monkeypatch)
-    db = _fresh_db("mount_node_key_matches")
-
-    app = coco.App(
-        coco.AppConfig(
-            name="test_mount_node_accepts_matching_key", environment=coco_env
-        ),
-        _mount_with_matching_key,
-        db,
-    )
-    app.update_blocking()
-
-    assert len(captured) == 1
-    assert captured[0].params["s0_p_slug"] == "a4"
-
-
-async def _mount_with_mismatched_key(db: coco.ContextKey[ConnectionFactory]) -> None:
-    schema = await NodeSchema.from_class(_Article, key="slug")
-    await omnigraph.mount_node_target(db, "Article", schema, key="title")
-
-
-def test_mount_node_rejects_mismatched_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    _patch_cli_schema_calls(monkeypatch)
-    db = _fresh_db("mount_node_key_mismatch")
-
-    app = coco.App(
-        coco.AppConfig(
-            name="test_mount_node_rejects_mismatched_key", environment=coco_env
-        ),
-        _mount_with_mismatched_key,
-        db,
-    )
-    with pytest.raises(ValueError, match="does not match the schema's declared key"):
+    with pytest.raises(TypeError, match="key"):
         app.update_blocking()
 
 
@@ -5096,7 +5065,7 @@ class TestEndToEnd:
                 _ScSourceWide if wide["on"] else _ScSourceNarrow, key="slug"
             )
             claim_schema = await NodeSchema.from_class(_ScClaim, key="slug")
-            edge_schema = await NodeSchema.from_class(_ScEdgeProps, key="weight")
+            edge_schema = await EdgeSchema.from_class(_ScEdgeProps)
 
             sources = await omnigraph.mount_node_target(db, "Source", source_schema)
             claims = await omnigraph.mount_node_target(db, "Claim", claim_schema)
@@ -5151,7 +5120,7 @@ class TestEndToEnd:
                 _ScSourceNarrow if narrow["on"] else _ScSourceWide, key="slug"
             )
             claim_schema = await NodeSchema.from_class(_ScClaim, key="slug")
-            edge_schema = await NodeSchema.from_class(_ScEdgeProps, key="weight")
+            edge_schema = await EdgeSchema.from_class(_ScEdgeProps)
 
             sources = await omnigraph.mount_node_target(db, "Source", source_schema)
             claims = await omnigraph.mount_node_target(db, "Claim", claim_schema)
@@ -5226,7 +5195,7 @@ class TestEndToEnd:
                 _KcSource, key=("title" if keyed_by_title["on"] else "slug")
             )
             claim_schema = await NodeSchema.from_class(_ScClaim, key="slug")
-            edge_schema = await NodeSchema.from_class(_ScEdgeProps, key="weight")
+            edge_schema = await EdgeSchema.from_class(_ScEdgeProps)
 
             sources = await omnigraph.mount_node_target(db, "Source", source_schema)
             claims = await omnigraph.mount_node_target(db, "Claim", claim_schema)
@@ -5274,7 +5243,7 @@ class TestEndToEnd:
         async def main() -> None:
             source_schema = await NodeSchema.from_class(_ScSourceNarrow, key="slug")
             claim_schema = await NodeSchema.from_class(_ScClaim, key="slug")
-            edge_schema = await NodeSchema.from_class(_ScEdgeProps, key="weight")
+            edge_schema = await EdgeSchema.from_class(_ScEdgeProps)
 
             sources = await omnigraph.mount_node_target(db, "Source", source_schema)
             claims = await omnigraph.mount_node_target(db, "Claim", claim_schema)
@@ -5324,7 +5293,7 @@ class TestEndToEnd:
         async def main() -> None:
             source_schema = await NodeSchema.from_class(_ScSourceNarrow, key="slug")
             claim_schema = await NodeSchema.from_class(_ScClaim, key="slug")
-            edge_schema = await NodeSchema.from_class(_ScEdgeProps, key="weight")
+            edge_schema = await EdgeSchema.from_class(_ScEdgeProps)
 
             sources = await omnigraph.mount_node_target(db, "Source", source_schema)
             claims = await omnigraph.mount_node_target(db, "Claim", claim_schema)
@@ -5373,7 +5342,7 @@ class TestEndToEnd:
         async def main() -> None:
             source_schema = await NodeSchema.from_class(_ScSourceNarrow, key="slug")
             claim_schema = await NodeSchema.from_class(_ScClaim, key="slug")
-            edge_schema = await NodeSchema.from_class(_ScEdgeProps, key="weight")
+            edge_schema = await EdgeSchema.from_class(_ScEdgeProps)
 
             sources = await omnigraph.mount_node_target(db, "Source", source_schema)
             claims = await omnigraph.mount_node_target(db, "Claim", claim_schema)
@@ -5886,7 +5855,7 @@ class TestEndToEnd:
                 "Supports",
                 sources,
                 claims,
-                await NodeSchema.from_class(_ScEdgeProps, key="weight"),
+                await EdgeSchema.from_class(_ScEdgeProps),
             )
             sources.declare_node(node=_ScSourceNarrow(slug="a", title="A"))
             claims.declare_node(node=_ScClaim(slug="c1"))

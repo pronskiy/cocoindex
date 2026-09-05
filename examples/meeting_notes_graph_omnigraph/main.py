@@ -22,13 +22,14 @@ The pipeline runs in three phases:
      edges (ATTENDED, ASSIGNED_TO) using resolved names.
 
 Side-by-side diff with examples/meeting_notes_graph_neo4j/main.py: the flow
-is identical. Omnigraph's node/edge target API is graph-native, but
-table_target/declare_record/declare_relation and friends are aliases for
-node_target/declare_node/declare_edge — literally the same objects — so the
-call sites port unchanged. What does differ, and why:
+is identical, and the API is graph-native — node/edge targets, declare_node
+and declare_edge — where the neo4j version speaks in tables and relations.
+What else differs, and why:
 
   * The connector import, the ConnectionFactory arguments (uri + auth +
-    database vs store + branch), the AppConfig name, primary_key= -> key=.
+    database vs store + branch), the AppConfig name, and the schema
+    classes: NodeSchema.from_class(..., key=...) for node types and
+    EdgeSchema.from_class(...) for an edge type's own properties.
   * Meeting.id is `meeting_id` here. `id` is Omnigraph's own node identity
     column; declaring a property by that name makes the schema invalid.
   * Meeting's non-key properties are optional. An edge may be written before
@@ -104,7 +105,7 @@ async def coco_lifespan(
 
 
 # ---------------------------------------------------------------------------
-# Omnigraph row schemas (dataclasses for declare_record / declare_relation)
+# Omnigraph record schemas (dataclasses for declare_node / declare_edge)
 # ---------------------------------------------------------------------------
 
 
@@ -131,11 +132,9 @@ class Task:
 
 @dataclass
 class AttendedRel:
-    """ATTENDED edge payload. The relation's identity is auto-derived from
-    (from_id=person, to_id=meeting_id) by the Omnigraph connector, giving
-    exactly one edge per (person, meeting) — the `key=` below has no bearing
-    on it, and is only what TableSchema.from_class requires to build any
-    schema at all.
+    """ATTENDED edge payload. The edge's identity is always
+    (from_id=person, to_id=meeting_id), giving exactly one edge per
+    (person, meeting); these are only its properties.
     """
 
     is_organizer: bool
@@ -265,9 +264,9 @@ class MeetingExtraction:
 @coco.fn(memo=True)
 async def process_file(
     file: google_drive.DriveFile,
-    meeting_table: omnigraph.TableTarget[Meeting],
-    task_table: omnigraph.TableTarget[Task],
-    decided_rel: omnigraph.RelationTarget[Any],
+    meeting_table: omnigraph.NodeTarget[Meeting],
+    task_table: omnigraph.NodeTarget[Task],
+    decided_rel: omnigraph.EdgeTarget[Any],
 ) -> list[MeetingExtraction]:
     text = await file.read_text()
     note_file = file.file_path.path.as_posix()
@@ -277,8 +276,8 @@ async def process_file(
         extracted = await extract_meeting(section)
         meeting_id = await id_generator.next_id(extracted.time)
 
-        meeting_table.declare_record(
-            row=Meeting(
+        meeting_table.declare_node(
+            node=Meeting(
                 meeting_id=meeting_id,
                 note_file=note_file,
                 time=extracted.time,
@@ -287,8 +286,8 @@ async def process_file(
         )
 
         for task in extracted.tasks:
-            task_table.declare_record(row=Task(description=task.description))
-            decided_rel.declare_relation(from_id=meeting_id, to_id=task.description)
+            task_table.declare_node(node=Task(description=task.description))
+            decided_rel.declare_edge(from_id=meeting_id, to_id=task.description)
 
         extractions.append(
             MeetingExtraction(
@@ -327,13 +326,13 @@ async def _resolve_persons(raw_persons: set[str]) -> ResolvedEntities:
 async def create_person_relations(
     meetings: list[MeetingExtraction],
     persons: ResolvedEntities,
-    person_table: omnigraph.TableTarget[Person],
-    attended_rel: omnigraph.RelationTarget[Any],
-    assigned_rel: omnigraph.RelationTarget[Any],
+    person_table: omnigraph.NodeTarget[Person],
+    attended_rel: omnigraph.EdgeTarget[Any],
+    assigned_rel: omnigraph.EdgeTarget[Any],
 ) -> None:
     # Declare canonical Person nodes.
     for canonical_name in persons.canonicals():
-        person_table.declare_record(row=Person(name=canonical_name))
+        person_table.declare_node(node=Person(name=canonical_name))
 
     for m in meetings:
         # ATTENDED — aggregate organizer + participants. Organizer flag wins
@@ -345,7 +344,7 @@ async def create_person_relations(
             attendees.setdefault(persons.canonical_of(p), False)
 
         for canonical, is_organizer in attendees.items():
-            attended_rel.declare_relation(
+            attended_rel.declare_edge(
                 from_id=canonical,
                 to_id=m.meeting_id,
                 record=AttendedRel(is_organizer=is_organizer),
@@ -359,7 +358,7 @@ async def create_person_relations(
                 if canonical in seen:
                     continue
                 seen.add(canonical)
-                assigned_rel.declare_relation(from_id=canonical, to_id=task_desc)
+                assigned_rel.declare_edge(from_id=canonical, to_id=task_desc)
 
 
 # ---------------------------------------------------------------------------
@@ -369,41 +368,38 @@ async def create_person_relations(
 
 @coco.fn
 async def app_main() -> None:
-    # --- Mount node tables ---
-    meeting_table = await omnigraph.mount_table_target(
+    # --- Mount node types ---
+    meeting_table = await omnigraph.mount_node_target(
         KG_DB,
         "Meeting",
-        await omnigraph.TableSchema.from_class(Meeting, key="meeting_id"),
-        key="meeting_id",
+        await omnigraph.NodeSchema.from_class(Meeting, key="meeting_id"),
     )
-    person_table = await omnigraph.mount_table_target(
+    person_table = await omnigraph.mount_node_target(
         KG_DB,
         "Person",
-        await omnigraph.TableSchema.from_class(Person, key="name"),
-        key="name",
+        await omnigraph.NodeSchema.from_class(Person, key="name"),
     )
-    task_table = await omnigraph.mount_table_target(
+    task_table = await omnigraph.mount_node_target(
         KG_DB,
         "Task",
-        await omnigraph.TableSchema.from_class(Task, key="description"),
-        key="description",
+        await omnigraph.NodeSchema.from_class(Task, key="description"),
     )
 
-    # --- Mount relation targets ---
+    # --- Mount edge types ---
     # ATTENDED carries is_organizer, so it needs a schema: Omnigraph declares
     # an edge type's properties in `.pg` and refuses an insert naming one it
-    # doesn't have. Its identity is still (from_id, to_id), not this key.
-    attended_rel = await omnigraph.mount_relation_target(
+    # doesn't have.
+    attended_rel = await omnigraph.mount_edge_target(
         KG_DB,
         "ATTENDED",
         person_table,
         meeting_table,
-        await omnigraph.TableSchema.from_class(AttendedRel, key="is_organizer"),
+        await omnigraph.EdgeSchema.from_class(AttendedRel),
     )
-    decided_rel = await omnigraph.mount_relation_target(
+    decided_rel = await omnigraph.mount_edge_target(
         KG_DB, "DECIDED", meeting_table, task_table
     )
-    assigned_rel = await omnigraph.mount_relation_target(
+    assigned_rel = await omnigraph.mount_edge_target(
         KG_DB, "ASSIGNED_TO", person_table, task_table
     )
 

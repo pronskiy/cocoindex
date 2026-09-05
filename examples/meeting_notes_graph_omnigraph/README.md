@@ -41,10 +41,10 @@ async def process_file(file, meeting_table, task_table, decided_rel) -> list[Mee
     for section in _split_meetings(await file.read_text()):
         extracted = await extract_meeting(section)
         meeting_id = await id_generator.next_id(extracted.time)
-        meeting_table.declare_record(row=Meeting(meeting_id=meeting_id, ...))
+        meeting_table.declare_node(node=Meeting(meeting_id=meeting_id, ...))
         for task in extracted.tasks:
-            task_table.declare_record(row=Task(description=task.description))
-            decided_rel.declare_relation(from_id=meeting_id, to_id=task.description)
+            task_table.declare_node(node=Task(description=task.description))
+            decided_rel.declare_edge(from_id=meeting_id, to_id=task.description)
         ...
 
 @coco.fn(memo=True)  # Phase 2 — collapse "Alice" / "Alice Chen" / "alice c." into canonical names
@@ -54,7 +54,7 @@ async def _resolve_persons(raw_persons: set[str]) -> ResolvedEntities:
 
 @coco.fn              # Phase 3 — declare canonical Person nodes + ATTENDED / ASSIGNED_TO using resolved names
 async def create_person_relations(meetings, persons, person_table, attended_rel, assigned_rel) -> None:
-    for canonical_name in persons.canonicals():  person_table.declare_record(row=Person(name=canonical_name))
+    for canonical_name in persons.canonicals():  person_table.declare_node(node=Person(name=canonical_name))
     ...
 ```
 

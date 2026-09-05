@@ -186,8 +186,34 @@ def _pg_type_for(annotation: Any) -> str:
     raise TypeError(f"no Omnigraph type mapping for {annotation!r}")
 
 
+def _properties_from_class(target: type) -> dict[str, PropertyDef]:
+    """Introspect a dataclass into `PropertyDef`s, one per field, in order."""
+    hints = typing.get_type_hints(target, include_extras=True)
+    properties: dict[str, PropertyDef] = {}
+    for field in dataclasses.fields(target):
+        validate_identifier(field.name, "property name")
+        # `id` is the one name Omnigraph reserves whether this schema ends
+        # up describing a node or an edge, and it's by far the likeliest
+        # collision in a real dataclass — so it's worth catching here,
+        # where the class name is in scope. The name-set that depends on
+        # which kind of type this becomes (an edge's `src`/`dst`/`from`/
+        # `to`) is enforced by `_gq.render_edge_type` instead.
+        if field.name == "id":
+            raise ValueError(
+                f"{target.__name__}.id: 'id' is reserved by Omnigraph for "
+                f"the engine's own identity column and cannot be declared "
+                f"as a property. Rename the field (e.g. "
+                f"'{target.__name__.lower()}_id')."
+            )
+        pg_type = _pg_type_for(hints[field.name])
+        properties[field.name] = PropertyDef(field.name, pg_type, _encoder_for(pg_type))
+    return properties
+
+
 @dataclasses.dataclass(frozen=True)
 class NodeSchema:
+    """A node type's properties and the one of them that is its `@key`."""
+
     properties: dict[str, PropertyDef]
     key: tuple[str, ...]
 
@@ -208,27 +234,7 @@ class NodeSchema:
                 f"engine rejects a two-@key schema outright. Derive a single "
                 f"key field (e.g. a generated id) and key on that."
             )
-        hints = typing.get_type_hints(target, include_extras=True)
-        properties: dict[str, PropertyDef] = {}
-        for field in dataclasses.fields(target):
-            validate_identifier(field.name, "property name")
-            # `id` is the one name Omnigraph reserves whether this schema ends
-            # up describing a node or an edge, and it's by far the likeliest
-            # collision in a real dataclass — so it's worth catching here,
-            # where the class name is in scope. The name-set that depends on
-            # which kind of type this becomes (an edge's `src`/`dst`/`from`/
-            # `to`) is enforced by `_gq.render_edge_type` instead.
-            if field.name == "id":
-                raise ValueError(
-                    f"{target.__name__}.id: 'id' is reserved by Omnigraph for "
-                    f"the engine's own identity column and cannot be declared "
-                    f"as a property. Rename the field (e.g. "
-                    f"'{target.__name__.lower()}_id')."
-                )
-            pg_type = _pg_type_for(hints[field.name])
-            properties[field.name] = PropertyDef(
-                field.name, pg_type, _encoder_for(pg_type)
-            )
+        properties = _properties_from_class(target)
         for k in key_tuple:
             if k not in properties:
                 raise ValueError(
@@ -246,6 +252,21 @@ class NodeSchema:
             [(p.name, p.pg_type) for p in self.properties.values()],
             key=self.key,
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class EdgeSchema:
+    """An edge type's own properties.
+
+    An edge has no key of its own — its identity is always `(from_id,
+    to_id)` — so unlike `NodeSchema` there is none to declare.
+    """
+
+    properties: dict[str, PropertyDef]
+
+    @classmethod
+    async def from_class(cls, target: type) -> EdgeSchema:
+        return cls(properties=_properties_from_class(target))
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +300,7 @@ _TYPE_KEY_CHECKER: TypeChecker[tuple[str, str, str]] = TypeChecker(tuple[str, st
 
 @dataclasses.dataclass(frozen=True)
 class _TypeSpec:
-    schema: NodeSchema | None
+    schema: NodeSchema | EdgeSchema | None
     key: tuple[str, ...]
     from_type: str | None
     to_type: str | None
@@ -572,7 +593,7 @@ class _TypeHandlerBase(coco.TargetHandler[_TypeSpec, _TypeTrackingRecord, Any]):
 
 class _NodeTypeHandler(_TypeHandlerBase):
     def _render(self, key: _TypeKey, spec: _TypeSpec) -> str:
-        assert spec.schema is not None
+        assert isinstance(spec.schema, NodeSchema)
         return spec.schema.render(key.type_name)
 
 
@@ -1694,28 +1715,13 @@ class NodeTarget(
     def schema(self) -> NodeSchema:
         return self._schema
 
-    def declare_node(
-        self: NodeTarget[RowT], *, node: RowT | None = None, row: RowT | None = None
-    ) -> None:
-        """Declare a node (record) to be upserted to this node type.
-
-        `row` is a compatibility alias for `node` — table-shaped connectors
-        (Neo4j, FalkorDB, SurrealDB) call this method as `declare_record(row=...)`;
-        pass exactly one of `node`/`row`.
-        """
-        if (node is None) == (row is None):
-            raise TypeError(
-                "declare_node() requires exactly one of `node` or `row`, not "
-                f"{'both' if node is not None else 'neither'}"
-            )
-        value = node if node is not None else row
-        properties = _record_to_dict(value, self._schema)
+    def declare_node(self: NodeTarget[RowT], *, node: RowT) -> None:
+        """Declare a node (record) to be upserted to this node type."""
+        properties = _record_to_dict(node, self._schema)
         key = tuple(properties[k] for k in self._schema.key)
         coco.declare_target_state(
             self._provider.target_state(key, _NodeValue(properties))
         )
-
-    declare_record = declare_node
 
     def __coco_memo_key__(self) -> str:
         return self._provider.memo_key
@@ -1732,7 +1738,7 @@ class EdgeTarget(
     """A target for writing edges to an Omnigraph edge type."""
 
     _provider: coco.TargetStateProvider[_EdgeValue, None, coco.MaybePendingS]
-    _schema: NodeSchema | None
+    _schema: EdgeSchema | None
     _type_name: str
     _from_target: NodeTarget[Any]
     _to_target: NodeTarget[Any]
@@ -1740,7 +1746,7 @@ class EdgeTarget(
     def __init__(
         self,
         provider: coco.TargetStateProvider[_EdgeValue, None, coco.MaybePendingS],
-        schema: NodeSchema | None,
+        schema: EdgeSchema | None,
         type_name: str,
         from_target: NodeTarget[Any],
         to_target: NodeTarget[Any],
@@ -1772,8 +1778,8 @@ class EdgeTarget(
             raise TypeError(
                 f"Edge type {self._type_name!r} was mounted without a schema, "
                 f"so it cannot carry a record. Pass the edge's own property "
-                f"schema (e.g. `NodeSchema.from_class({type(record).__name__}, "
-                f"key=...)`) when mounting it, or drop the `record=` argument."
+                f"schema (e.g. `EdgeSchema.from_class({type(record).__name__})`) "
+                f"when mounting it, or drop the `record=` argument."
             )
         if record is None and self._schema is not None:
             # The mirror of the guard above. Omitting the record leaves every
@@ -1801,8 +1807,6 @@ class EdgeTarget(
         coco.declare_target_state(
             self._provider.target_state(key, _EdgeValue(from_id, to_id, properties))
         )
-
-    declare_relation = declare_edge
 
     def __coco_memo_key__(self) -> str:
         return self._provider.memo_key
@@ -1849,7 +1853,9 @@ def _check_endpoint_id(
         )
 
 
-def _record_to_dict(record: Any, schema: NodeSchema | None) -> dict[str, Any]:
+def _record_to_dict(
+    record: Any, schema: NodeSchema | EdgeSchema | None
+) -> dict[str, Any]:
     """Extract `{property_name: raw_value}` from a dataclass or dict record.
 
     Values are NOT encoded here — `_encode_properties` (used by
@@ -1948,7 +1954,7 @@ def _validate_edge_endpoint(target: NodeTarget[Any], role: str) -> None:
 
 
 def _build_edge_spec(
-    schema: NodeSchema | None,
+    schema: EdgeSchema | None,
     from_target: NodeTarget[Any],
     to_target: NodeTarget[Any],
     managed_by: ManagedBy,
@@ -1956,6 +1962,13 @@ def _build_edge_spec(
     """Pure seam between `edge_target()` and `_TypeSpec` construction — kept
     separate so the endpoint key-field wiring (Task 10 step 4) is directly
     testable without reaching into `coco.TargetState`'s private value."""
+    if schema is not None and not isinstance(schema, EdgeSchema):
+        raise TypeError(
+            f"An edge type's schema must be an EdgeSchema, not "
+            f"{type(schema).__name__}: an edge has no key of its own, its "
+            f"identity is always (from_id, to_id). Build it with "
+            f"`EdgeSchema.from_class(...)`."
+        )
     _validate_edge_endpoint(from_target, "from")
     _validate_edge_endpoint(to_target, "to")
     (from_key_field,) = from_target.schema.key
@@ -1976,27 +1989,11 @@ def _build_edge_spec(
 # ---------------------------------------------------------------------------
 
 
-def _validate_key_matches(key: str | Sequence[str] | None, schema: NodeSchema) -> None:
-    """Optional redundant `key=` on the node-target entry points, for parity
-    with the sibling connectors' `primary_key=` (see the design spec's API
-    surface example, which mounts with both `schema` and `key=` given). When
-    supplied it must match `schema.key` — same validate-and-ignore shape as
-    neo4j's `primary_key` cross-check against `table_schema.primary_key`."""
-    if key is None:
-        return
-    key_tuple = (key,) if isinstance(key, str) else tuple(key)
-    if key_tuple != schema.key:
-        raise ValueError(
-            f"key {key_tuple!r} does not match the schema's declared key {schema.key!r}"
-        )
-
-
 def node_target(
     db: coco.ContextKey[ConnectionFactory],
     type_name: str,
     schema: NodeSchema,
     *,
-    key: str | Sequence[str] | None = None,
     managed_by: ManagedBy = ManagedBy.SYSTEM,
 ) -> coco.TargetState[_NodeHandler]:
     """Create a `TargetState` for an Omnigraph node type."""
@@ -2016,7 +2013,6 @@ def node_target(
             f"with `NodeSchema.from_class(..., key=...)`, or pass a non-empty "
             f"`key` to `NodeSchema`."
         )
-    _validate_key_matches(key, schema)
     type_key = _TypeKey(db_key=db.key, type_kind="node", type_name=type_name)
     spec = _TypeSpec(
         schema=schema,
@@ -2033,7 +2029,6 @@ def declare_node_target(
     type_name: str,
     schema: NodeSchema,
     *,
-    key: str | Sequence[str] | None = None,
     managed_by: ManagedBy = ManagedBy.SYSTEM,
 ) -> NodeTarget[Any, coco.PendingS]:
     """Declare a node type target.
@@ -2042,7 +2037,7 @@ def declare_node_target(
     flow into this declaration's own handler.
     """
     provider = coco.declare_target_state_with_child(
-        node_target(db, type_name, schema, key=key, managed_by=managed_by)
+        node_target(db, type_name, schema, managed_by=managed_by)
     )
     return NodeTarget(provider, schema, type_name)
 
@@ -2052,12 +2047,11 @@ async def mount_node_target(
     type_name: str,
     schema: NodeSchema,
     *,
-    key: str | Sequence[str] | None = None,
     managed_by: ManagedBy = ManagedBy.SYSTEM,
 ) -> NodeTarget[Any]:
     """Mount a node type target ready to receive `declare_node` calls."""
     provider = await coco.mount_target(
-        node_target(db, type_name, schema, key=key, managed_by=managed_by)
+        node_target(db, type_name, schema, managed_by=managed_by)
     )
     return NodeTarget(provider, schema, type_name)
 
@@ -2067,7 +2061,7 @@ def edge_target(
     type_name: str,
     from_target: NodeTarget[Any],
     to_target: NodeTarget[Any],
-    schema: NodeSchema | None = None,
+    schema: EdgeSchema | None = None,
     *,
     managed_by: ManagedBy = ManagedBy.SYSTEM,
 ) -> coco.TargetState[_EdgeHandler]:
@@ -2083,7 +2077,7 @@ def declare_edge_target(
     type_name: str,
     from_target: NodeTarget[Any],
     to_target: NodeTarget[Any],
-    schema: NodeSchema | None = None,
+    schema: EdgeSchema | None = None,
     *,
     managed_by: ManagedBy = ManagedBy.SYSTEM,
 ) -> EdgeTarget[Any, coco.PendingS]:
@@ -2101,7 +2095,7 @@ async def mount_edge_target(
     type_name: str,
     from_target: NodeTarget[Any],
     to_target: NodeTarget[Any],
-    schema: NodeSchema | None = None,
+    schema: EdgeSchema | None = None,
     *,
     managed_by: ManagedBy = ManagedBy.SYSTEM,
 ) -> EdgeTarget[Any]:
@@ -2118,44 +2112,19 @@ async def mount_edge_target(
 # Public exports
 # ---------------------------------------------------------------------------
 
-#: Three sibling connectors (neo4j, falkordb, surrealdb) share one
-#: table/relation-shaped public surface. Omnigraph is graph-native, so
-#: node/edge are the primary names here; table/relation/record are kept as
-#: aliases — literally the same objects, not wrappers — so a Neo4j app can
-#: port to Omnigraph by changing one import.
-TableTarget = NodeTarget
-RelationTarget = EdgeTarget
-TableSchema = NodeSchema
-ColumnDef = PropertyDef
-table_target = node_target
-declare_table_target = declare_node_target
-mount_table_target = mount_node_target
-relation_target = edge_target
-declare_relation_target = declare_edge_target
-mount_relation_target = mount_edge_target
-
 __all__ = [
-    "ColumnDef",
     "ConnectionFactory",
+    "EdgeSchema",
     "EdgeTarget",
     "NodeSchema",
     "NodeTarget",
     "OmnigraphType",
     "PropertyDef",
-    "RelationTarget",
-    "TableSchema",
-    "TableTarget",
     "ValueEncoder",
     "declare_edge_target",
     "declare_node_target",
-    "declare_relation_target",
-    "declare_table_target",
     "edge_target",
     "mount_edge_target",
     "mount_node_target",
-    "mount_relation_target",
-    "mount_table_target",
     "node_target",
-    "relation_target",
-    "table_target",
 ]

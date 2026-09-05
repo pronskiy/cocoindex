@@ -3746,6 +3746,27 @@ class TestNodeTargetKeyValidation:
                 schema,
             )
 
+    def test_a_built_in_encoder_of_another_type_is_refused_on_a_key(self) -> None:
+        """`datetime.date.isoformat` was accepted on a DateTime key, and on a
+        datetime it drops the time: noon and 14:00 on one date were stored
+        as one midnight node while tracked as two instants, and removing
+        one declaration deleted the node the other still declared. A
+        built-in encoder is built in for the one type it encodes."""
+        for pg_type, encoder in (
+            ("DateTime", datetime.date.isoformat),
+            ("Date", datetime.datetime.isoformat),
+            ("String", ogt._ENCODERS["DateTime"]),
+        ):
+            schema = NodeSchema(
+                properties={"k": PropertyDef("k", pg_type, encoder)}, key=("k",)
+            )
+            with pytest.raises(ValueError, match=r"key property 'k'"):
+                omnigraph.node_target(
+                    ContextKey[ConnectionFactory](f"db_{uuid.uuid4().hex}"),
+                    "T",
+                    schema,
+                )
+
     @pytest.mark.asyncio
     async def test_the_built_in_date_encoder_on_a_key_is_allowed(self) -> None:
         """Only the fixed `Date`/`DateTime` encoders may sit on a key: they

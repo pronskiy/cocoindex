@@ -115,15 +115,18 @@ _ENCODERS: dict[str, ValueEncoder] = {
     "DateTime": _isoformat,
 }
 
-#: Encoders a key property may carry: the built-in ones, and the `isoformat`
-#: methods a person writing a schema by hand would reach for, which are the
-#: same encoding. Anything else changes what the graph keys on and is
-#: refused at `node_target`.
-_BUILTIN_KEY_ENCODERS: tuple[ValueEncoder, ...] = (
-    *_ENCODERS.values(),
-    datetime.date.isoformat,
-    datetime.datetime.isoformat,
-)
+#: Encoders a key property of each `.pg` type may carry: the built-in one
+#: for that type, and the `isoformat` method a person writing a schema by
+#: hand would reach for, which is the same encoding. Keyed by type, not one
+#: flat list: `datetime.date.isoformat` on a DateTime key drops the time
+#: from every value, so two instants on one date were stored as a single
+#: midnight node while tracked as two, and removing one declaration deleted
+#: the node the other still declared. Anything else changes what the graph
+#: keys on and is refused at `node_target`.
+_KEY_ENCODERS: dict[str, tuple[ValueEncoder, ...]] = {
+    "Date": (_ENCODERS["Date"], datetime.date.isoformat),
+    "DateTime": (_ENCODERS["DateTime"], datetime.datetime.isoformat),
+}
 
 
 def _list_encoder(element: ValueEncoder) -> ValueEncoder:
@@ -2138,8 +2141,9 @@ def node_target(
             f"`key` to `NodeSchema`."
         )
     for key_field in schema.key:
-        encoder = schema.properties[key_field].encoder
-        if encoder is not None and encoder not in _BUILTIN_KEY_ENCODERS:
+        prop = schema.properties[key_field]
+        allowed = _KEY_ENCODERS.get(prop.pg_type.rstrip("?"), ())
+        if prop.encoder is not None and prop.encoder not in allowed:
             # The key is the node's identity, and an edge addresses that
             # identity by the raw key value its author passed to
             # `declare_edge`. A custom encoder would make the graph key on
@@ -2147,14 +2151,16 @@ def node_target(
             # upserted a second node under the new spelling and left the old
             # one behind, and an edge declared with the raw value would never
             # find either. Only the fixed Date/DateTime encoders are allowed
-            # on a key — pure functions of the value, never changing, and
-            # such types cannot be edge endpoints at all.
+            # on a key, each on the type it encodes — pure functions of the
+            # value, never changing, and such types cannot be edge endpoints
+            # at all.
             raise ValueError(
                 f"Node type {type_name!r}: key property {key_field!r} has a custom "
                 f"encoder. The key is the node's identity, and edges address it by "
                 f"the raw key value, so an encoder there would make the graph's key "
                 f"disagree with what edges reference. Normalize the key value before "
-                f"declaring the node instead."
+                f"declaring the node instead; only the built-in ISO encoding may sit "
+                f"on a Date or DateTime key."
             )
     type_key = _TypeKey(db_key=db.key, type_kind="node", type_name=type_name)
     spec = _TypeSpec(

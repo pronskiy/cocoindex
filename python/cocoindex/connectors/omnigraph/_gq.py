@@ -207,6 +207,12 @@ _EDGE_ENDPOINTS_RE = re.compile(r"\s*:\s*(\w+)\s*->\s*(\w+)")
 _BODY_OPEN_RE = re.compile(r"\s*\{")
 
 
+def _blank_comments(pg: str) -> str:
+    """`pg` with every `//` comment replaced by spaces of the same length, so
+    offsets into it are offsets into the original."""
+    return _COMMENT_RE.sub(lambda m: " " * len(m.group(0)), pg)
+
+
 class _TypeBlock(NamedTuple):
     kind: str
     name: str
@@ -237,7 +243,7 @@ def _scan_type_blocks(existing_pg: str) -> list[_TypeBlock]:
     balance: either way the splice point would land mid-declaration and
     produce corrupt `.pg` that goes straight to `schema apply`.
     """
-    text = _COMMENT_RE.sub(lambda m: " " * len(m.group(0)), existing_pg)
+    text = _blank_comments(existing_pg)
     blocks: list[_TypeBlock] = []
     pos = 0
     while (head := _TYPE_HEAD_RE.search(text, pos)) is not None:
@@ -323,23 +329,39 @@ def _find_type_block(
     return matching[0].start, matching[0].end
 
 
-_COCO_MANAGED_DECL_RE = re.compile(rf"\s*\b{COCO_MANAGED}\s*:\s*Bool\??")
+#: A `coco_managed` declaration together with the whitespace that is its
+#: own: the line break and indentation before it, or the run of spaces
+#: before it in a one-line block — never more, or a release would eat the
+#: (blanked) comment ending the previous line.
+_COCO_MANAGED_DECL_RE = re.compile(
+    rf"(?:\n[ \t]*|[ \t]+)?\b{COCO_MANAGED}\s*:\s*Bool\??"
+)
 
 
 def is_connector_managed(existing_pg: str, kind: str, type_name: str) -> bool:
     """Whether the block for `kind` `type_name` declares `COCO_MANAGED` —
     present on every block this connector renders and currently owns, and
-    on nothing a user or another tool wrote."""
+    on nothing a user or another tool wrote.
+
+    Declarations only: the block is searched with its comments blanked, so
+    a user-owned block whose comment merely mentions the property is not
+    mistaken for the connector's (which once let an app drop delete it).
+    """
     span = _find_type_block(existing_pg, kind, type_name)
-    return span is not None and bool(
-        _COCO_MANAGED_DECL_RE.search(existing_pg[span[0] : span[1]])
+    if span is None:
+        return False
+    start, end = span
+    return (
+        _COCO_MANAGED_DECL_RE.search(_blank_comments(existing_pg)[start:end])
+        is not None
     )
 
 
 def release_ownership(existing_pg: str, kind: str, type_name: str) -> str:
     """Remove the `COCO_MANAGED` declaration from the block for `kind`
-    `type_name`, leaving everything else in it — and the rest of the schema
-    — untouched. A no-op if the block is absent or already released.
+    `type_name`, leaving everything else in it — comments included — and
+    the rest of the schema untouched. A no-op if the block is absent or
+    already released.
 
     This is the one schema write a `managed_by=user` declaration causes: a
     type the connector created and the app then handed to the user still
@@ -352,7 +374,12 @@ def release_ownership(existing_pg: str, kind: str, type_name: str) -> str:
     if span is None:
         return existing_pg
     start, end = span
-    block = _COCO_MANAGED_DECL_RE.sub("", existing_pg[start:end])
+    block = existing_pg[start:end]
+    blanked = _blank_comments(existing_pg)[start:end]
+    # Cut the declarations found on the comment-blanked view out of the
+    # original text; offsets line up because blanking preserves length.
+    for m in reversed(list(_COCO_MANAGED_DECL_RE.finditer(blanked))):
+        block = block[: m.start()] + block[m.end() :]
     return existing_pg[:start] + block + existing_pg[end:]
 
 

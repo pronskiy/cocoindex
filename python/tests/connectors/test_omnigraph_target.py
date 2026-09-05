@@ -45,7 +45,9 @@ from cocoindex.connectors.omnigraph._gq import (
     build_endpoint_stub,
     build_node_delete,
     build_node_upsert,
+    is_connector_managed,
     merge_type_into_schema,
+    release_ownership,
     remove_type_from_schema,
     render_edge_type,
     render_node_type,
@@ -437,6 +439,38 @@ class TestRemoveTypeFromSchema:
         assert a2 in rebuilt
         assert b in rebuilt
         assert a1 not in rebuilt  # A's old (slug-keyed) definition is gone
+
+
+class TestOwnershipDetection:
+    """`coco_managed` is a declared property. Ownership detection searched the
+    block's raw text, comments included, so a user-owned block whose comment
+    merely mentioned the property counted as the connector's — and an app
+    drop deleted it. Detection and release must look at declarations only."""
+
+    USER_EDGE = (
+        "edge E: A -> B {\n"
+        "  // coco_managed: Bool? was deliberately omitted\n"
+        "  coco_key: String\n"
+        "}\n"
+    )
+    OWNED_EDGE = (
+        "edge E: A -> B {\n"
+        "  coco_key: String // no coco_managed here, only below\n"
+        "  coco_managed: Bool?\n"
+        "}\n"
+    )
+
+    def test_a_comment_does_not_confer_ownership(self) -> None:
+        assert not is_connector_managed(self.USER_EDGE, "edge", "E")
+        assert release_ownership(self.USER_EDGE, "edge", "E") == self.USER_EDGE
+
+    def test_a_declaration_confers_ownership_whatever_the_comments_say(self) -> None:
+        assert is_connector_managed(self.OWNED_EDGE, "edge", "E")
+        assert release_ownership(self.OWNED_EDGE, "edge", "E") == (
+            "edge E: A -> B {\n"
+            "  coco_key: String // no coco_managed here, only below\n"
+            "}\n"
+        )
 
 
 class TestNodeMutations:
@@ -6132,3 +6166,49 @@ class TestEndToEnd:
         rows = _export_rows(store)
         assert len([r for r in rows if r.get("edge") == "Supports"]) == 1
         assert len([r for r in rows if r.get("type")]) == 2
+
+    def test_a_comment_in_a_user_owned_edge_does_not_authorize_its_deletion(
+        self, store: str
+    ) -> None:
+        """The user's edge type mentions `coco_managed` in a comment only.
+        Ownership detection read the raw block text, so an app drop took
+        the edge type along with the nodes and deleted the user's edges."""
+        store_dir = Path(store[len("file://") :])
+        owned = "  coco_key: String\n  coco_managed: Bool?\n"
+        hand_written = (
+            f"node Source {{\n  slug: String @key\n  title: String?\n{owned}}}\n\n"
+            f"node Claim {{\n  slug: String @key\n{owned}}}\n\n"
+            "edge Supports: Source -> Claim {\n"
+            "  // coco_managed: Bool? was deliberately omitted\n"
+            "  coco_key: String\n"
+            "}\n"
+        )
+        assert _init_live(store_dir, hand_written).returncode == 0
+        db = _e2e_db(store, "comment_ownership")
+
+        async def main() -> None:
+            sources = await omnigraph.mount_node_target(
+                db, "Source", await NodeSchema.from_class(_ScSourceNarrow, key="slug")
+            )
+            claims = await omnigraph.mount_node_target(
+                db, "Claim", await NodeSchema.from_class(_ScClaim, key="slug")
+            )
+            supports = await omnigraph.mount_edge_target(
+                db, "Supports", sources, claims, managed_by=ManagedBy.USER
+            )
+            sources.declare_node(node=_ScSourceNarrow(slug="a", title="A"))
+            claims.declare_node(node=_ScClaim(slug="c1"))
+            supports.declare_edge(from_id="a", to_id="c1")
+
+        app = coco.App(
+            coco.AppConfig(name="e2e_comment_ownership", environment=coco_env), main
+        )
+        app.update_blocking()
+        assert len([r for r in _export_rows(store) if r.get("edge") == "Supports"]) == 1
+
+        with pytest.raises(
+            ValueError, match=r"Supports.*not managed by this connector"
+        ):
+            app.drop_blocking()
+        assert "was deliberately omitted" in _read_schema_source(store)
+        assert len([r for r in _export_rows(store) if r.get("edge") == "Supports"]) == 1

@@ -274,7 +274,7 @@ schema = NodeSchema(
 
 - `name` — The property name (must match its key in `properties`).
 - `pg_type` — The `.pg` type string (see the table above; `?` suffix for nullable).
-- `encoder` — Optional `Callable[[Any], Any]` applied to non-`None` values before they're sent to Omnigraph.
+- `encoder` — Optional `Callable[[Any], Any]` applied to non-`None` values before they're sent to Omnigraph. Change detection fingerprints the encoded value, so changing an encoder rewrites every node or edge it applies to on the next update. `Date`/`DateTime` properties get an ISO-format encoder by default, and a list of either gets it mapped over the elements.
 
 Note that `NodeSchema`'s fields (`properties`, `key`) are named differently from the sibling connectors' explicit-construction form (neo4j's `TableSchema(columns=..., primary_key=...)`) — `TableSchema = NodeSchema` is a straight alias, not a wrapper, so it keeps `NodeSchema`'s own field names.
 

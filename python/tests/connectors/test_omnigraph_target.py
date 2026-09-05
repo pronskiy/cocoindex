@@ -668,6 +668,30 @@ class TestTypeMapping:
         assert schema.properties["note"].encoder is None
 
     @pytest.mark.asyncio
+    async def test_list_of_dates_encodes_every_element(self) -> None:
+        """`list[datetime.date]` maps to `[Date]`, which the schema accepts —
+        but `json.dumps` cannot serialize the elements, so the encoder has
+        to reach into the list. A nullable list stays `None` when absent."""
+
+        @dataclass
+        class _L:
+            slug: str
+            days: list[datetime.date]
+            maybe: list[datetime.datetime] | None
+
+        schema = await NodeSchema.from_class(_L, key="slug")
+        assert schema.properties["days"].pg_type == "[Date]"
+        assert schema.properties["maybe"].pg_type == "[DateTime]?"
+        encoded = ogt._encode_properties(
+            {"slug": "a", "days": [datetime.date(2026, 1, 1)], "maybe": None},
+            schema.properties,
+        )
+        by_name = {p.name: p.value for p in encoded}
+        assert by_name["days"] == ["2026-01-01"]
+        assert by_name["maybe"] is None
+        json.dumps(by_name)
+
+    @pytest.mark.asyncio
     async def test_key_normalised_to_tuple(self) -> None:
         schema = await NodeSchema.from_class(_Doc, key="slug")
         assert schema.key == ("slug",)
@@ -1529,11 +1553,17 @@ _SOURCE_PROPS = {
 _SUPPORTS_PROPS = {"w": PropertyDef("w", "I64")}
 
 
-def _node_handler() -> _NodeHandler:
-    return _NodeHandler("Source", ("slug",), _NK, _SOURCE_PROPS)
+def _node_handler(title_encoder: ogt.ValueEncoder | None = None) -> _NodeHandler:
+    props = dict(_SOURCE_PROPS)
+    if title_encoder is not None:
+        props["title"] = PropertyDef("title", "String", title_encoder)
+    return _NodeHandler("Source", ("slug",), _NK, props)
 
 
-def _edge_handler() -> _EdgeHandler:
+def _edge_handler(w_encoder: ogt.ValueEncoder | None = None) -> _EdgeHandler:
+    props = dict(_SUPPORTS_PROPS)
+    if w_encoder is not None:
+        props["w"] = PropertyDef("w", "I64", w_encoder)
     return _EdgeHandler(
         "Supports",
         _EK,
@@ -1541,7 +1571,7 @@ def _edge_handler() -> _EdgeHandler:
         "Claim",
         _SOURCE_PROPS["slug"],
         _SOURCE_PROPS["slug"],
-        _SUPPORTS_PROPS,
+        props,
     )
 
 
@@ -1551,6 +1581,21 @@ class TestNodeReconcile:
             "s1", _NodeValue({"slug": "s1", "title": "T"}), [], False
         )
         assert out is not None and out.action.op == "upsert"
+
+    def test_encoder_change_forces_a_write(self) -> None:
+        """Change detection has to see what the engine will be sent, not the
+        raw Python value: swapping a property's encoder changes every stored
+        value while leaving every raw value alone, so a fingerprint taken
+        before encoding scheduled no write at all."""
+        v = _NodeValue({"slug": "s1", "title": "Title"})
+        first = _node_handler(str.lower).reconcile("s1", v, [], False)
+        assert first is not None
+        assert not isinstance(first.tracking_record, coco.NonExistenceType)
+        out = _node_handler(str.upper).reconcile(
+            "s1", v, [first.tracking_record], False
+        )
+        assert out is not None and out.action.op == "upsert"
+        assert {p.name: p.value for p in out.action.properties}["title"] == "TITLE"
 
     def test_unchanged_is_noop(self) -> None:
         h, v = _node_handler(), _NodeValue({"slug": "s1", "title": "T"})
@@ -1630,6 +1675,19 @@ class TestEdgeReconcile:
     def test_new_edge_inserts(self) -> None:
         out = _edge_handler().reconcile(("a", "b"), _EdgeValue("a", "b", {}), [], False)
         assert out is not None and out.action.op == "insert"
+
+    def test_encoder_change_forces_a_replace(self) -> None:
+        """Edge counterpart of the node case: the fingerprint must cover the
+        encoded value, or an encoder change never reaches the graph."""
+        v = _EdgeValue("a", "b", {"w": 2})
+        first = _edge_handler(lambda w: w * 10).reconcile(("a", "b"), v, [], False)
+        assert first is not None
+        assert not isinstance(first.tracking_record, coco.NonExistenceType)
+        out = _edge_handler(lambda w: w * 100).reconcile(
+            ("a", "b"), v, [first.tracking_record], False
+        )
+        assert out is not None and out.action.op == "replace"
+        assert {p.name: p.value for p in out.action.properties}["w"] == 200
 
     def test_unchanged_is_noop(self) -> None:
         h, v = _edge_handler(), _EdgeValue("a", "b", {"w": 1})
@@ -3571,6 +3629,37 @@ def test_declare_edge_rejects_a_non_scalar_endpoint_id() -> None:
         target.declare_edge(from_id="p", to_id=datetime.date(2026, 1, 5))
 
 
+def test_declare_edge_rejects_an_endpoint_id_of_the_wrong_key_type() -> None:
+    """An endpoint id is rendered with `str()` into the node's `id`. An
+    integer given for a String-keyed endpoint would silently address
+    whichever node's slug happens to be those digits, and a string given
+    for an integer-keyed endpoint can never match a node at all — both are
+    a mismatch against the endpoint type's declared key, caught here where
+    the `declare_edge` call is on the stack."""
+    target: omnigraph.EdgeTarget[Any, Any] = omnigraph.EdgeTarget(
+        cast(Any, None),
+        None,
+        "ATTENDED",
+        _bare_node_target(
+            NodeSchema(
+                properties={"slug": PropertyDef("slug", "String")}, key=("slug",)
+            ),
+            "Person",
+        ),
+        _bare_node_target(
+            NodeSchema(
+                properties={"meeting_id": PropertyDef("meeting_id", "I64")},
+                key=("meeting_id",),
+            ),
+            "Meeting",
+        ),
+    )
+    with pytest.raises(TypeError, match=r"from_id=7 .*'Person'.*'slug'.*String"):
+        target.declare_edge(from_id=7, to_id=1)
+    with pytest.raises(TypeError, match=r"to_id='m1' .*'Meeting'.*'meeting_id'.*I64"):
+        target.declare_edge(from_id="p", to_id="m1")
+
+
 def test_declare_edge_without_a_schema_rejects_a_record() -> None:
     """A schema-less edge type declares no properties in `.pg`, and the
     engine refuses an insert naming one it doesn't have ("type `X` has no
@@ -5221,4 +5310,66 @@ class TestEndToEnd:
         assert len([r for r in rows if r.get("edge") == "Attended"]) == 1
         assert [r["data"]["note"] for r in rows if r.get("type") == "Meeting"] == [
             "Kickoff"
+        ]
+
+    def test_list_of_dates_round_trips(self, store: str) -> None:
+        """`list[datetime.date]` renders as `[Date]`, which the engine accepts
+        at `init` — and then every write of such a node died in `json.dumps`
+        because only the bare `Date`/`DateTime` scalars had an encoder."""
+        db = _e2e_db(store, "list_of_dates")
+
+        @dataclass
+        class _Holiday:
+            slug: str
+            days: list[datetime.date]
+
+        async def main() -> None:
+            holidays = await omnigraph.mount_node_target(
+                db, "Holiday", await NodeSchema.from_class(_Holiday, key="slug")
+            )
+            holidays.declare_node(
+                node=_Holiday(
+                    slug="xmas",
+                    days=[datetime.date(2026, 12, 25), datetime.date(2026, 12, 26)],
+                )
+            )
+
+        app = coco.App(
+            coco.AppConfig(name="e2e_list_of_dates", environment=coco_env), main
+        )
+        app.update_blocking()
+
+        (row,) = [r for r in _export_rows(store) if r.get("type") == "Holiday"]
+        assert len(row["data"]["days"]) == 2
+
+    def test_encoder_change_rewrites_the_stored_value(self, store: str) -> None:
+        """Same raw record, different `PropertyDef.encoder`: the value the
+        graph holds must follow the encoder, which only happens if change
+        detection fingerprints the encoded value rather than the raw one."""
+        db = _e2e_db(store, "encoder_change")
+        encoder = {"fn": str.lower}
+
+        async def main() -> None:
+            schema = NodeSchema(
+                properties={
+                    "slug": PropertyDef("slug", "String"),
+                    "name": PropertyDef("name", "String", encoder["fn"]),
+                },
+                key=("slug",),
+            )
+            people = await omnigraph.mount_node_target(db, "Person", schema)
+            people.declare_node(node={"slug": "ada", "name": "Ada Lovelace"})
+
+        app = coco.App(
+            coco.AppConfig(name="e2e_encoder_change", environment=coco_env), main
+        )
+        app.update_blocking()
+        assert [r["data"]["name"] for r in _export_rows(store) if r.get("type")] == [
+            "ada lovelace"
+        ]
+
+        encoder["fn"] = str.upper
+        app.update_blocking()
+        assert [r["data"]["name"] for r in _export_rows(store) if r.get("type")] == [
+            "ADA LOVELACE"
         ]

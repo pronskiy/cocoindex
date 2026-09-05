@@ -107,12 +107,25 @@ _ENCODERS: dict[str, ValueEncoder] = {
 }
 
 
+def _list_encoder(element: ValueEncoder) -> ValueEncoder:
+    return lambda values: [element(v) for v in values]
+
+
 def _encoder_for(pg_type: str) -> ValueEncoder | None:
     """Look up by the *resolved* pg_type string (stripped of `?`), not the
     Python annotation — this way it applies the same whether the field came
     from a plain `datetime.date` or an `Annotated[..., OmnigraphType(...)]`
-    override that happens to resolve to `Date`/`DateTime`."""
-    return _ENCODERS.get(pg_type.rstrip("?"))
+    override that happens to resolve to `Date`/`DateTime`.
+
+    A list type `[T]` gets its element's encoder mapped over the list: the
+    schema accepts `[Date]`, and without this every write of such a value
+    died in `json.dumps` while the type itself had been declared fine.
+    """
+    base = pg_type.rstrip("?")
+    if base.startswith("[") and base.endswith("]"):
+        element = _ENCODERS.get(base[1:-1])
+        return _list_encoder(element) if element is not None else None
+    return _ENCODERS.get(base)
 
 
 def _pg_type_for(annotation: Any) -> str:
@@ -591,7 +604,11 @@ class _EdgeTypeHandler(_TypeHandlerBase):
 
 
 class _EntityTrackingRecord(msgspec.Struct, frozen=True, array_like=True):
-    """Fingerprint of the property values, not the values themselves.
+    """Fingerprint of the *encoded* property values, not the values themselves.
+
+    Encoded, because that is what the graph holds: fingerprinting the raw
+    Python values let a changed `PropertyDef.encoder` rewrite every stored
+    value without change detection ever noticing.
 
     Internal-state size grows with target-state count, so storing full property
     blobs for every entity in a large graph would bloat LMDB for no
@@ -640,8 +657,10 @@ class _EdgeAction(NamedTuple):
     to_key_property: PropertyDef
 
 
-def _entity_record(properties: dict[str, Any]) -> _EntityTrackingRecord:
-    return _EntityTrackingRecord(fingerprint=fingerprint_object(properties))
+def _entity_record(encoded: Sequence[PropertyValue]) -> _EntityTrackingRecord:
+    return _EntityTrackingRecord(
+        fingerprint=fingerprint_object({p.name: p.value for p in encoded})
+    )
 
 
 def _needs_write(
@@ -734,20 +753,16 @@ class _NodeHandler(coco.TargetHandler[_NodeValue, _EntityTrackingRecord, Any]):
 
         # A keyed node `insert` merges by key tuple, so a new node and a
         # changed node are both an "upsert" — unlike edges, there is no
-        # separate insert/replace distinction to make here.
-        desired = _entity_record(desired_target_state.properties)
+        # separate insert/replace distinction to make here. Encode first:
+        # the fingerprint covers what the engine is sent.
+        encoded = _encode_properties(
+            desired_target_state.properties, self._property_defs
+        )
+        desired = _entity_record(encoded)
         if not _needs_write(desired, prev_possible_records, prev_may_be_missing):
             return None
         return coco.TargetReconcileOutput(
-            action=_NodeAction(
-                "upsert",
-                self._key,
-                self._type_name,
-                _encode_properties(
-                    desired_target_state.properties, self._property_defs
-                ),
-                coco_key,
-            ),
+            action=_NodeAction("upsert", self._key, self._type_name, encoded, coco_key),
             sink=_entity_sink,
             tracking_record=desired,
         )
@@ -839,7 +854,10 @@ class _EdgeHandler(coco.TargetHandler[_EdgeValue, _EntityTrackingRecord, Any]):
         # a live edge every time internal state was lost. The container
         # handler above uses `statediff` precisely because a type CAN be
         # re-declared idempotently; an edge cannot.
-        desired = _entity_record(desired_target_state.properties)
+        encoded = _encode_properties(
+            desired_target_state.properties, self._property_defs
+        )
+        desired = _entity_record(encoded)
         if not prev_possible_records and not prev_may_be_missing:
             op = "insert"
         elif not _needs_write(desired, prev_possible_records, prev_may_be_missing):
@@ -855,9 +873,7 @@ class _EdgeHandler(coco.TargetHandler[_EdgeValue, _EntityTrackingRecord, Any]):
                 coco_key,
                 desired_target_state.from_id,
                 desired_target_state.to_id,
-                _encode_properties(
-                    desired_target_state.properties, self._property_defs
-                ),
+                encoded,
                 self._from_type,
                 self._to_type,
                 self._from_key_property,
@@ -1681,8 +1697,8 @@ class EdgeTarget(
                     f"{required!r}, so `record=` is required. Pass the record, "
                     f"or declare those properties as optional."
                 )
-        _check_endpoint_id(from_id, self._type_name, "from_id")
-        _check_endpoint_id(to_id, self._type_name, "to_id")
+        _check_endpoint_id(from_id, self._type_name, "from_id", self._from_target)
+        _check_endpoint_id(to_id, self._type_name, "to_id", self._to_target)
         properties = _record_to_dict(record, self._schema) if record is not None else {}
         key = (from_id, to_id)
         coco.declare_target_state(
@@ -1695,12 +1711,25 @@ class EdgeTarget(
         return self._provider.memo_key
 
 
-def _check_endpoint_id(value: Any, type_name: str, what: str) -> None:
+def _endpoint_key_family(pg_type: str) -> str:
+    """`String` keys and integer keys are the two shapes `str(value)` can
+    reproduce as a node id; every integer width renders the same way."""
+    return "String" if pg_type == "String" else "integer"
+
+
+def _check_endpoint_id(
+    value: Any, type_name: str, what: str, endpoint: NodeTarget[Any]
+) -> None:
     """An edge endpoint is addressed by its node's single key VALUE, spliced
     into the insert as `from: $e_from`. Checked here, where the offending
     `declare_edge` call is on the stack, rather than at sink time — where
     `_endpoint_ref` would raise the same underlying `TypeError` from inside
     `plan_commits`, with nothing pointing at the declaration that caused it.
+
+    The value is also checked against the endpoint type's own key: the id
+    is `str(value)`, so an integer handed to a String-keyed endpoint would
+    silently address whichever node's key happens to be those digits, and a
+    string handed to an integer-keyed endpoint can never match a node.
     """
     try:
         pg_type = _pg_type_for(type(value))
@@ -1712,6 +1741,14 @@ def _check_endpoint_id(value: Any, type_name: str, what: str) -> None:
             f"endpoint reference. It must be the endpoint node's key value — a "
             f"single string or integer, matching what `mount_edge_target` "
             f"already required of the endpoint type's key."
+        )
+    (key_field,) = endpoint.schema.key
+    key_type = endpoint.schema.properties[key_field].pg_type
+    if _endpoint_key_family(pg_type) != _endpoint_key_family(key_type):
+        raise TypeError(
+            f"Edge type {type_name!r}: {what}={value!r} is a {pg_type} value, but "
+            f"the endpoint node type {endpoint.type_name!r} is keyed by "
+            f"{key_field!r}: {key_type}. Pass that node's key value."
         )
 
 

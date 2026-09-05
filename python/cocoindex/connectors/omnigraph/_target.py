@@ -25,7 +25,7 @@ from cocoindex.connectors.omnigraph._client import (
     _CliClient,
 )
 from cocoindex.connectors.omnigraph._gq import (
-    MANAGED_MARKER,
+    COCO_MANAGED,
     Mutation,
     PropertyValue,
     Statement,
@@ -38,6 +38,7 @@ from cocoindex.connectors.omnigraph._gq import (
     edge_types_referencing,
     is_connector_managed,
     merge_type_into_schema,
+    release_ownership,
     remove_type_from_schema,
     render_edge_type,
     render_node_type,
@@ -384,6 +385,10 @@ class _TypeAction(NamedTuple):
     pg_fragment: str | None
     main_action: statediff.DiffAction | None
     property_actions: dict[str, statediff.DiffAction]
+    # A `managed_by=user` declaration of a type the connector created: the
+    # block's ownership property is stale and has to be removed, or a later
+    # drop of a node type it references takes the user's type along.
+    release_ownership: bool = False
 
 
 _ChildInvalidation = Literal["destructive", "lossy"] | None
@@ -577,6 +582,14 @@ class _TypeHandlerBase(coco.TargetHandler[_TypeSpec, _TypeTrackingRecord, Any]):
             # the whole fragment, so every child must re-upsert defensively.
             child_invalidation = "lossy"
 
+        # Handing a type the connector created to the user is the one thing
+        # a USER declaration writes: the block keeps its ownership property
+        # otherwise, and a later drop of a node type it references reads
+        # that as current ownership and removes the user's type with it.
+        release_ownership = spec.managed_by == ManagedBy.USER and any(
+            p.managed_by == ManagedBy.SYSTEM for p in prev_possible_records
+        )
+
         return coco.TargetReconcileOutput(
             action=_TypeAction(
                 key=key,
@@ -584,6 +597,7 @@ class _TypeHandlerBase(coco.TargetHandler[_TypeSpec, _TypeTrackingRecord, Any]):
                 pg_fragment=self._render(key, spec),
                 main_action=main_action,
                 property_actions=property_actions,
+                release_ownership=release_ownership,
             ),
             sink=_type_sink,
             tracking_record=desired,
@@ -1451,7 +1465,7 @@ def _orphaned_endpoint_error(
         many = len(foreign) > 1
         advice = (
             f"{list(foreign)!r} {'are' if many else 'is'} not managed by this "
-            f"connector (no `{MANAGED_MARKER}` in the block), so "
+            f"connector (its block declares no `{COCO_MANAGED}` property), so "
             f"{'they' if many else 'it'} will not be removed for you: remove "
             f"{'them' if many else 'it'} from the schema yourself, or keep the "
             f"node type."
@@ -1512,7 +1526,11 @@ async def _apply_type_schema(
     must be re-declared from scratch, which is exactly what the drop half
     does at the schema level.
     """
-    pending = [a for a in actions if a.main_action is not None or a.property_actions]
+    pending = [
+        a
+        for a in actions
+        if a.main_action is not None or a.property_actions or a.release_ownership
+    ]
     if not pending:
         return
 
@@ -1538,7 +1556,8 @@ async def _apply_type_schema_locked(
         # the graph in a single call.
         merged = ""
         for action in pending:
-            if coco.is_non_existence(action.spec):
+            if coco.is_non_existence(action.spec) or action.release_ownership:
+                # Nothing to drop from, and nothing of the user's to release.
                 continue
             assert action.pg_fragment is not None
             merged = merge_type_into_schema(
@@ -1557,7 +1576,7 @@ async def _apply_type_schema_locked(
     # deadlocks until a timeout (verified live). Its removal is coming
     # regardless, so take the connector's own edge types along now; the
     # edge's batch then finds nothing left to remove. An edge type without
-    # the ownership marker is a user's or another tool's and is never
+    # the ownership property is a user's or another tool's and is never
     # removed on their behalf, and a `@key` change keeps the edge declared,
     # so both still fail here.
     taken_along: list[str] = []
@@ -1587,6 +1606,10 @@ async def _apply_type_schema_locked(
     for action in pending:
         if coco.is_non_existence(action.spec):
             desired = remove_type_from_schema(
+                desired, action.key.type_kind, action.key.type_name
+            )
+        elif action.release_ownership:
+            desired = release_ownership(
                 desired, action.key.type_kind, action.key.type_name
             )
         else:

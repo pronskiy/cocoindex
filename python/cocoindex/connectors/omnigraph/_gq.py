@@ -18,12 +18,15 @@ from typing import NamedTuple
 #: entity for deletion. Non-nullable, which is legal at init time.
 COCO_KEY = "coco_key"
 
-#: Trailing comment on the `coco_key` line of every block this connector
-#: renders. `schema show` returns the source verbatim, comments included, so
-#: it survives every round trip — and it is how the schema sink tells the
+#: Synthetic, nullable, never-written property declared on every block this
+#: connector renders, and on nothing else. It is how the schema sink tells the
 #: connector's own types from ones a user declared: a `managed_by=user` type
-#: must declare `coco_key` as well, so the property alone cannot.
-MANAGED_MARKER = "// managed by cocoindex"
+#: must declare `coco_key` as well, so that property alone cannot. It is a
+#: property rather than a comment because the engine stores an applied
+#: schema's source only when the apply changes something structural — a
+#: comment-only change reports `applied: false` and keeps the old source
+#: (verified against the binary), so a comment could never be released.
+COCO_MANAGED = "coco_managed"
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -109,11 +112,12 @@ _RESERVED_EDGE_PROPERTIES = ("id", "src", "dst", "from", "to")
 def _check_not_reserved(
     properties: Sequence[tuple[str, str]], type_name: str, reserved: Sequence[str]
 ) -> None:
-    if any(name == COCO_KEY for name, _ in properties):
-        raise ValueError(
-            f"{COCO_KEY!r} is reserved by the CocoIndex connector and cannot be "
-            f"declared on {type_name!r}"
-        )
+    for synthetic in (COCO_KEY, COCO_MANAGED):
+        if any(name == synthetic for name, _ in properties):
+            raise ValueError(
+                f"{synthetic!r} is reserved by the CocoIndex connector and cannot be "
+                f"declared on {type_name!r}"
+            )
     clashes = sorted({name for name, _ in properties} & set(reserved))
     if clashes:
         raise ValueError(
@@ -146,13 +150,16 @@ def render_node_type(
         f"  {render_property(name, pg_type, is_key=name in key)}"
         for name, pg_type in properties
     ]
-    lines.append(_render_coco_key_line())
+    lines.extend(_render_synthetic_properties())
     body = "\n".join(lines)
     return f"node {type_name} {{\n{body}\n}}"
 
 
-def _render_coco_key_line() -> str:
-    return f"  {render_property(COCO_KEY, 'String', is_key=False)} {MANAGED_MARKER}"
+def _render_synthetic_properties() -> list[str]:
+    return [
+        f"  {render_property(COCO_KEY, 'String', is_key=False)}",
+        f"  {render_property(COCO_MANAGED, 'Bool?', is_key=False)}",
+    ]
 
 
 def render_edge_type(
@@ -169,7 +176,7 @@ def render_edge_type(
         f"  {render_property(name, pg_type, is_key=False)}"
         for name, pg_type in properties
     ]
-    lines.append(_render_coco_key_line())
+    lines.extend(_render_synthetic_properties())
     body = "\n".join(lines)
     return f"edge {type_name}: {from_type} -> {to_type} {{\n{body}\n}}"
 
@@ -316,12 +323,37 @@ def _find_type_block(
     return matching[0].start, matching[0].end
 
 
+_COCO_MANAGED_DECL_RE = re.compile(rf"\s*\b{COCO_MANAGED}\s*:\s*Bool\??")
+
+
 def is_connector_managed(existing_pg: str, kind: str, type_name: str) -> bool:
-    """Whether the block for `kind` `type_name` carries `MANAGED_MARKER` —
-    present on every block this connector renders, and on nothing a user or
-    another tool wrote."""
+    """Whether the block for `kind` `type_name` declares `COCO_MANAGED` —
+    present on every block this connector renders and currently owns, and
+    on nothing a user or another tool wrote."""
     span = _find_type_block(existing_pg, kind, type_name)
-    return span is not None and MANAGED_MARKER in existing_pg[span[0] : span[1]]
+    return span is not None and bool(
+        _COCO_MANAGED_DECL_RE.search(existing_pg[span[0] : span[1]])
+    )
+
+
+def release_ownership(existing_pg: str, kind: str, type_name: str) -> str:
+    """Remove the `COCO_MANAGED` declaration from the block for `kind`
+    `type_name`, leaving everything else in it — and the rest of the schema
+    — untouched. A no-op if the block is absent or already released.
+
+    This is the one schema write a `managed_by=user` declaration causes: a
+    type the connector created and the app then handed to the user still
+    carried the ownership property, and a later drop of a node type it
+    referenced read that as current ownership and removed the user's edge
+    type with it. Dropping a nullable, never-written property is a
+    migration the engine applies without flags (verified).
+    """
+    span = _find_type_block(existing_pg, kind, type_name)
+    if span is None:
+        return existing_pg
+    start, end = span
+    block = _COCO_MANAGED_DECL_RE.sub("", existing_pg[start:end])
+    return existing_pg[:start] + block + existing_pg[end:]
 
 
 def merge_type_into_schema(
@@ -489,9 +521,9 @@ def _bind(props: Sequence[PropertyValue], prefix: str) -> tuple[list[Bind], list
     for prop in props:
         validate_identifier(prop.name, "property name")
         validate_pg_type(prop.pg_type)
-        if prop.name == COCO_KEY:
+        if prop.name in (COCO_KEY, COCO_MANAGED):
             raise ValueError(
-                f"{COCO_KEY!r} is reserved by the CocoIndex connector and cannot be "
+                f"{prop.name!r} is reserved by the CocoIndex connector and cannot be "
                 f"supplied as a property value"
             )
         if prop.name in seen:

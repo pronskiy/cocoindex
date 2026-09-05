@@ -8,8 +8,11 @@ import dataclasses
 import hashlib
 import json
 import pathlib
+import posixpath
 import sys
 import tempfile
+import urllib.parse
+import urllib.request
 from collections.abc import AsyncIterator, Iterator
 from typing import BinaryIO
 
@@ -32,6 +35,18 @@ if sys.platform == "win32":
         lock_file.seek(0)
         msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
 
+    def _try_lock_file(lock_file: BinaryIO) -> bool:
+        lock_file.seek(0, 2)
+        if lock_file.tell() == 0:
+            lock_file.write(b"\0")
+            lock_file.flush()
+        lock_file.seek(0)
+        try:
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+
     def _unlock_file(lock_file: BinaryIO) -> None:
         lock_file.seek(0)
         msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
@@ -41,8 +56,37 @@ else:
     def _lock_file(lock_file: BinaryIO) -> None:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
 
+    def _try_lock_file(lock_file: BinaryIO) -> bool:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        return True
+
     def _unlock_file(lock_file: BinaryIO) -> None:
         fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def canonical_store(uri: str) -> str:
+    """One identity for every spelling of the same store.
+
+    The store lock is keyed by this. Keyed by the raw URI text, two
+    processes addressing one store as `file:///a/store` and
+    `file:///a/./store` took different locks — and one of them reaped the
+    scratch branch the other was still using (verified live). A `file://`
+    URI resolves to its real path; any other scheme gets a lower-cased
+    scheme and host and a normalised path.
+    """
+    parts = urllib.parse.urlsplit(uri)
+    scheme = parts.scheme.lower()
+    if scheme == "file":
+        return pathlib.Path(urllib.request.url2pathname(parts.path)).resolve().as_uri()
+    path = posixpath.normpath(parts.path) if parts.path else ""
+    return urllib.parse.urlunsplit((scheme, parts.netloc.lower(), path, "", ""))
+
+
+def _lock_dir() -> pathlib.Path:
+    return pathlib.Path(tempfile.gettempdir())
 
 
 @contextlib.contextmanager
@@ -91,13 +135,33 @@ class _CliClient:
     def __init__(self, conn: ConnectionFactory) -> None:
         self._conn = conn
 
+    @property
+    def store_lock_path(self) -> pathlib.Path:
+        digest = hashlib.sha256(canonical_store(self._conn.store).encode()).hexdigest()
+        return _lock_dir() / f"cocoindex-omnigraph-{digest}.lock"
+
+    @staticmethod
+    def _scratch_branch_lock_path(name: str) -> pathlib.Path:
+        return _lock_dir() / f"cocoindex-omnigraph-scratch-{name}.lock"
+
     @contextlib.asynccontextmanager
     async def store_lock(self) -> AsyncIterator[None]:
-        """Serialize operations that require exclusive access to this store."""
-        digest = hashlib.sha256(self._conn.store.encode()).hexdigest()
-        path = (
-            pathlib.Path(tempfile.gettempdir()) / f"cocoindex-omnigraph-{digest}.lock"
-        )
+        """Serialize operations that require exclusive access to this store,
+        across components and processes on this host."""
+        lock_file = await asyncio.to_thread(self.store_lock_path.open, "a+b")
+        try:
+            await asyncio.to_thread(_lock_file, lock_file)
+            yield
+        finally:
+            await asyncio.to_thread(_unlock_file, lock_file)
+            await asyncio.to_thread(lock_file.close)
+
+    @contextlib.asynccontextmanager
+    async def hold_scratch_branch(self, name: str) -> AsyncIterator[None]:
+        """Hold the liveness lock of scratch branch `name` for the block —
+        from before the branch is created until after it is deleted — so a
+        reaper anywhere on this host can tell the branch is in use."""
+        path = self._scratch_branch_lock_path(name)
         lock_file = await asyncio.to_thread(path.open, "a+b")
         try:
             await asyncio.to_thread(_lock_file, lock_file)
@@ -105,6 +169,28 @@ class _CliClient:
         finally:
             await asyncio.to_thread(_unlock_file, lock_file)
             await asyncio.to_thread(lock_file.close)
+            with contextlib.suppress(OSError):
+                await asyncio.to_thread(path.unlink)
+
+    @contextlib.asynccontextmanager
+    async def claim_scratch_branch(self, name: str) -> AsyncIterator[bool]:
+        """Try to take the liveness lock of scratch branch `name` without
+        waiting. Yields True if it was free — its owner is gone, so the
+        branch is abandoned and the block may delete it — and False while
+        another process still holds it."""
+        path = self._scratch_branch_lock_path(name)
+        lock_file = await asyncio.to_thread(path.open, "a+b")
+        claimed = False
+        try:
+            claimed = await asyncio.to_thread(_try_lock_file, lock_file)
+            yield claimed
+        finally:
+            if claimed:
+                await asyncio.to_thread(_unlock_file, lock_file)
+            await asyncio.to_thread(lock_file.close)
+            if claimed:
+                with contextlib.suppress(OSError):
+                    await asyncio.to_thread(path.unlink)
 
     # --- argv builders (pure, unit-tested) ---
 

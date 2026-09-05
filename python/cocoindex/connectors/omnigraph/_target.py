@@ -1233,9 +1233,10 @@ async def _scratch_branch(client: _CliClient, *, frm: str) -> AsyncIterator[str]
     is deleted: a non-main branch makes Omnigraph reject every schema apply
     on the store, and schema reconciliation takes the same lock, so a
     concurrent type update never observes the transient branch and fails
-    spuriously. That lock discipline is also what lets
-    `_reap_abandoned_scratch_branches` tell an abandoned branch from a live
-    one.
+    spuriously. The branch's own liveness lock is held for the same span,
+    which is what lets `_reap_abandoned_scratch_branches` tell an abandoned
+    branch from a live one even when the store lock did not cover both
+    parties.
 
     The branch is deleted whether the body succeeded or failed — `branch
     merge` does not delete its source (we don't pass `--delete-branch`,
@@ -1248,29 +1249,35 @@ async def _scratch_branch(client: _CliClient, *, frm: str) -> AsyncIterator[str]
     """
     async with client.store_lock():
         name = f"{_SCRATCH_BRANCH_PREFIX}{uuid.uuid4().hex}"
-        await client.branch_create(name, frm=frm)
-        try:
-            yield name
-        finally:
-            await client.branch_delete(name)
+        async with client.hold_scratch_branch(name):
+            await client.branch_create(name, frm=frm)
+            try:
+                yield name
+            finally:
+                await client.branch_delete(name)
 
 
 async def _reap_abandoned_scratch_branches(client: _CliClient) -> list[str]:
-    """Delete every `coco_scratch_*` branch and return their names.
+    """Delete every abandoned `coco_scratch_*` branch and return their names.
 
-    Must run under the store lock. A live scratch branch exists only inside
-    `_scratch_branch`, which holds that lock for the branch's whole
-    lifetime — so any branch under the prefix visible to a lock holder was
-    left behind by a process that died between creating and deleting it.
-    User branches are never touched.
+    Runs under the store lock, and deletes only a branch whose liveness
+    lock it can take: a live scratch branch holds that lock for its whole
+    lifetime inside `_scratch_branch`, so one whose lock is free was left
+    behind by a process that died between creating and deleting it.
+    Abandonment is established before deletion, not inferred from the
+    branch merely being visible — a reaper that took a different store
+    lock than the branch's owner (verified live with two spellings of one
+    store URI) deleted a branch that was still in use. User branches are
+    never touched.
     """
-    reaped = [
-        name
-        for name in await client.branch_list()
-        if name.startswith(_SCRATCH_BRANCH_PREFIX)
-    ]
-    for name in reaped:
-        await client.branch_delete(name)
+    reaped: list[str] = []
+    for name in await client.branch_list():
+        if not name.startswith(_SCRATCH_BRANCH_PREFIX):
+            continue
+        async with client.claim_scratch_branch(name) as abandoned:
+            if abandoned:
+                await client.branch_delete(name)
+                reaped.append(name)
     return reaped
 
 

@@ -2090,6 +2090,56 @@ def _edge(op: str, a: str, b: str) -> ogt._EdgeAction:
     )
 
 
+class TestStoreLocks:
+    def test_equivalent_file_uris_share_one_lock(self) -> None:
+        """The store lock is what makes a visible scratch branch provably
+        abandoned. It used to be keyed by the raw URI text, so
+        `file:///a/store` and `file:///a/./store` took different locks: a
+        schema apply through one reaped the scratch branch another process
+        was still using through the other, and that process then failed
+        its own cleanup."""
+        paths = {
+            _CliClient(ConnectionFactory(store=f"file://{root}")).store_lock_path
+            for root in (
+                "/tmp/locks/store",
+                "/tmp/locks/./store",
+                "/tmp/locks/../locks/store",
+                "/tmp//locks/store",
+            )
+        }
+        assert len(paths) == 1
+        other = _CliClient(ConnectionFactory(store="file:///tmp/locks/other"))
+        assert other.store_lock_path not in paths
+
+    def test_non_file_uris_are_normalised_too(self) -> None:
+        a = _CliClient(ConnectionFactory(store="s3://Bucket/graphs/./g/"))
+        b = _CliClient(ConnectionFactory(store="s3://bucket/graphs/g"))
+        assert a.store_lock_path == b.store_lock_path
+
+    @pytest.mark.asyncio
+    async def test_reaper_skips_a_scratch_branch_whose_owner_is_alive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Abandonment is established before deletion: a live scratch branch
+        is held under a per-branch lock for its whole lifetime, and the
+        reaper deletes only branches whose lock it can take."""
+        deleted: list[str] = []
+
+        async def fake_branch_list(self: object) -> list[str]:
+            return ["coco_scratch_live", "coco_scratch_dead", "main"]
+
+        async def fake_branch_delete(self: object, name: str) -> None:
+            deleted.append(name)
+
+        monkeypatch.setattr(_CliClient, "branch_list", fake_branch_list)
+        monkeypatch.setattr(_CliClient, "branch_delete", fake_branch_delete)
+        client = _client()
+        async with client.hold_scratch_branch("coco_scratch_live"):
+            reaped = await ogt._reap_abandoned_scratch_branches(client)
+        assert reaped == ["coco_scratch_dead"]
+        assert deleted == ["coco_scratch_dead"]
+
+
 class TestCliCancellation:
     @pytest.mark.asyncio
     async def test_cancelling_a_call_kills_and_reaps_the_child(
@@ -4985,6 +5035,60 @@ class TestEndpointRetryLive:
             "c2",
         ]
         assert _branch_names(store_uri) == ["main"]
+
+
+@_live
+class TestScratchBranchLivenessLive:
+    @pytest.mark.asyncio
+    async def test_a_schema_apply_through_an_equivalent_uri_waits_for_a_live_branch(
+        self, tmp_path: Path
+    ) -> None:
+        """Process A holds a scratch branch through `file:///.../g.omni`;
+        process B applies a schema through `file:///..././g.omni`. B used to
+        take a different lock, hit the engine's non-main-branch refusal,
+        reap A's live branch, and succeed — and A then failed its own
+        cleanup. B must wait for A instead, and A's cleanup must succeed."""
+        store_dir = tmp_path / "g.omni"
+        store_uri = f"file://{store_dir}"
+        a = _CliClient(_live_conn(store_dir))
+        b = _CliClient(
+            ConnectionFactory(store=f"file://{tmp_path}/./g.omni", cli=_OMNIGRAPH_BIN)
+        )
+        await a.init_graph(_basic_pg())
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def hold_a_scratch_branch() -> None:
+            async with ogt._scratch_branch(a, frm="main"):
+                entered.set()
+                await release.wait()
+
+        holder = asyncio.create_task(hold_a_scratch_branch())
+        await entered.wait()
+        assert len(_branch_names(store_uri)) == 2
+
+        applier = asyncio.create_task(
+            ogt._apply_type_schema(
+                b,
+                [
+                    _type_action(
+                        "insert",
+                        "Extra",
+                        "node Extra {\n  slug: String @key\n  coco_key: String\n}",
+                    )
+                ],
+            )
+        )
+        await asyncio.sleep(1.0)
+        assert not applier.done(), "B ran ahead instead of waiting for A's lock"
+        assert len(_branch_names(store_uri)) == 2  # A's branch was not reaped
+
+        release.set()
+        await holder  # A's own cleanup found its branch and deleted it
+        await applier
+        assert _branch_names(store_uri) == ["main"]
+        assert "node Extra" in _read_schema_source(store_uri)
 
 
 # ---------------------------------------------------------------------------

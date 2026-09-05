@@ -403,67 +403,88 @@ class PropertyValue(NamedTuple):
     value: object
 
 
+class Bind(NamedTuple):
+    """One parameter slot of a `Statement`: its label, `.pg` type and value.
+
+    The label (`p_email`, `e_from`, `p_coco_key`, ...) is unique within its
+    statement; `render_query` turns it into a query-wide parameter name.
+    """
+
+    label: str
+    pg_type: str
+    value: object
+
+
+class Statement(NamedTuple):
+    """One GQ statement with positional parameter slots.
+
+    `body` holds a `$?` slot wherever a bound value goes, and `binds` lists
+    each slot's label, type and value in slot order. Parameter names are
+    allocated only when a query is rendered — `s{i}_{label}` for the i-th
+    statement — so any number of statements combine into one query with no
+    renaming, and a value never enters the statement text at all.
+    """
+
+    body: str
+    binds: tuple[Bind, ...]
+
+
 class Mutation(NamedTuple):
-    """A complete `query <name>(...) { ... }` source plus its bound params.
-
-    Values are never interpolated into `expr`, so a property value containing
-    quotes or braces cannot alter the statement.
-
-    `binds` (the `(name, gq_type)` pairs) and `body` (the single statement,
-    unwrapped) are the structured pieces `expr` was rendered from. They exist
-    so `combine_mutations` can merge several single-statement mutations into
-    one query without re-parsing `expr`; `expr` itself remains the standalone
-    rendering and is what every builder's own tests assert against.
+    """A rendered `query m(...) { ... }` source plus its bound params — the
+    form the transport sends. Values are never interpolated into `expr`, so
+    a property value containing quotes or braces cannot alter the query.
     """
 
     expr: str
     params: dict[str, object]
-    binds: tuple[tuple[str, str], ...] = ()
-    body: str = ""
 
 
-def _wrap(binds: Sequence[tuple[str, str]], body: str) -> str:
-    sig = ", ".join(f"${n}: {t}" for n, t in binds)
-    return f"query m({sig}) {{ {body} }}"
+#: Marks a parameter position in a `Statement.body`. `$` never appears in a
+#: statement otherwise (identifiers are validated to `[A-Za-z0-9_]`), so the
+#: slot can be found by plain splitting.
+_SLOT = "$?"
 
 
-def combine_mutations(muts: Sequence[Mutation]) -> Mutation:
-    """Merge single-statement mutations into ONE query — i.e. one commit.
+def render_query(statements: Sequence[Statement]) -> Mutation:
+    """Render statements into ONE `query m(...) { ... }` — one CLI
+    invocation, one commit. N separate `mutate` calls would be N commits
+    and no atomicity.
 
-    One CLI invocation is one commit, so N separate `mutate` calls give N
-    commits and no atomicity. Every builder reuses the same parameter names
-    (`p_coco_key`, `p_email`, ...), so each statement's params are
-    re-prefixed `s{i}_` before merging into one query signature and body.
+    Each statement's binds become parameters `s{i}_{label}`, declared in the
+    signature in slot order and substituted for the statement's `$?` slots
+    in the same order.
     """
-    if not muts:
-        raise ValueError("combine_mutations requires at least one mutation")
-    all_binds: list[tuple[str, str]] = []
+    if not statements:
+        raise ValueError("render_query requires at least one statement")
+    signature: list[str] = []
+    params: dict[str, object] = {}
     bodies: list[str] = []
-    params: dict[str, object] = {}
-    for i, m in enumerate(muts):
-        body = m.body
-        for name, gq_type in m.binds:
-            new = f"s{i}_{name}"
-            # A `$` sentinel plus a trailing word boundary is enough to avoid
-            # one param name being a prefix of another (e.g. `$p_a` inside
-            # `$p_ab`) — `\b` after the name stops the match at a non-word
-            # character, so `$p_a` never matches inside `$p_ab`.
-            body = re.sub(rf"\${re.escape(name)}\b", f"${new}", body)
-            all_binds.append((new, gq_type))
-            params[new] = m.params[name]
-        bodies.append(body)
-    combined_body = " ".join(bodies)
-    return Mutation(
-        _wrap(all_binds, combined_body), params, tuple(all_binds), combined_body
-    )
+    for i, statement in enumerate(statements):
+        parts = statement.body.split(_SLOT)
+        if len(parts) != len(statement.binds) + 1:
+            raise ValueError(
+                f"statement has {len(parts) - 1} slots but "
+                f"{len(statement.binds)} bind{'s' if len(statement.binds) != 1 else ''}: "
+                f"{statement.body!r}"
+            )
+        rendered = [parts[0]]
+        for bind, rest in zip(statement.binds, parts[1:], strict=True):
+            name = f"s{i}_{bind.label}"
+            if name in params:
+                raise ValueError(
+                    f"Duplicate parameter label {bind.label!r} in {statement.body!r}"
+                )
+            signature.append(f"${name}: {bind.pg_type}")
+            params[name] = bind.value
+            rendered.append(f"${name}{rest}")
+        bodies.append("".join(rendered))
+    return Mutation(f"query m({', '.join(signature)}) {{ {' '.join(bodies)} }}", params)
 
 
-def _bind(
-    props: Sequence[PropertyValue], prefix: str
-) -> tuple[list[tuple[str, str]], list[str], dict[str, object]]:
-    binds: list[tuple[str, str]] = []
+def _bind(props: Sequence[PropertyValue], prefix: str) -> tuple[list[Bind], list[str]]:
+    """Validate `props` and turn them into binds plus `name: $?` assignments."""
+    binds: list[Bind] = []
     assigns: list[str] = []
-    params: dict[str, object] = {}
     seen: set[str] = set()
     for prop in props:
         validate_identifier(prop.name, "property name")
@@ -476,52 +497,45 @@ def _bind(
         if prop.name in seen:
             raise ValueError(f"Duplicate property name: {prop.name!r}")
         seen.add(prop.name)
-        param = f"{prefix}_{prop.name}"
-        binds.append((param, prop.pg_type))
-        assigns.append(f"{prop.name}: ${param}")
-        params[param] = prop.value
-    return binds, assigns, params
+        binds.append(Bind(f"{prefix}_{prop.name}", prop.pg_type, prop.value))
+        assigns.append(f"{prop.name}: {_SLOT}")
+    return binds, assigns
 
 
-def _coco_key_bind(coco_key: str) -> tuple[tuple[str, str], str, dict[str, object]]:
-    param = f"p_{COCO_KEY}"
-    return (param, "String"), f"{COCO_KEY}: ${param}", {param: coco_key}
+def _coco_key_bind(coco_key: str) -> Bind:
+    return Bind(f"p_{COCO_KEY}", "String", coco_key)
 
 
 def build_node_upsert(
     type_name: str, props: Sequence[PropertyValue], coco_key: str
-) -> Mutation:
+) -> Statement:
     """Keyed node `insert` is an upsert by the derived key tuple."""
     validate_identifier(type_name, "node type")
-    binds, assigns, params = _bind(props, "p")
-    ck_bind, ck_assign, ck_params = _coco_key_bind(coco_key)
-    binds.append(ck_bind)
-    assigns.append(ck_assign)
-    params.update(ck_params)
+    binds, assigns = _bind(props, "p")
+    assigns.append(f"{COCO_KEY}: {_SLOT}")
     body = f"insert {type_name} {{ {', '.join(assigns)} }}"
-    return Mutation(_wrap(binds, body), params, tuple(binds), body)
+    return Statement(body, (*binds, _coco_key_bind(coco_key)))
 
 
 def build_endpoint_stub(
     type_name: str, key_props: Sequence[PropertyValue], coco_key: str
-) -> Mutation:
+) -> Statement:
     """Key-only upsert, so an edge can reference a node its owning component
     has not written yet. The owner's own upsert later fills in the rest."""
     return build_node_upsert(type_name, key_props, coco_key)
 
 
-def _delete_by_coco_key(type_name: str, coco_key: str) -> Mutation:
-    ck_bind, _, ck_params = _coco_key_bind(coco_key)
-    body = f"delete {type_name} where {COCO_KEY} = ${ck_bind[0]}"
-    return Mutation(_wrap([ck_bind], body), ck_params, (ck_bind,), body)
+def _delete_by_coco_key(type_name: str, coco_key: str) -> Statement:
+    body = f"delete {type_name} where {COCO_KEY} = {_SLOT}"
+    return Statement(body, (_coco_key_bind(coco_key),))
 
 
-def build_node_delete(type_name: str, coco_key: str) -> Mutation:
+def build_node_delete(type_name: str, coco_key: str) -> Statement:
     validate_identifier(type_name, "node type")
     return _delete_by_coco_key(type_name, coco_key)
 
 
-def build_edge_delete(type_name: str, coco_key: str) -> Mutation:
+def build_edge_delete(type_name: str, coco_key: str) -> Statement:
     validate_identifier(type_name, "edge type")
     return _delete_by_coco_key(type_name, coco_key)
 
@@ -532,7 +546,7 @@ def build_edge_insert(
     to_ref: PropertyValue,
     props: Sequence[PropertyValue],
     coco_key: str,
-) -> Mutation:
+) -> Statement:
     """Edge `insert` always creates a new edge — Omnigraph never deduplicates
     and provides no settable id. Idempotence comes entirely from the connector
     refusing to re-insert an edge whose `coco_key` it already tracks, and from
@@ -550,16 +564,14 @@ def build_edge_insert(
                 f"{prop.name!r} is reserved for the edge endpoint and cannot be "
                 f"supplied as a property value"
             )
-    binds = [("e_from", from_ref.pg_type), ("e_to", to_ref.pg_type)]
-    assigns = ["from: $e_from", "to: $e_to"]
-    params: dict[str, object] = {"e_from": from_ref.value, "e_to": to_ref.value}
-    pbinds, passigns, pparams = _bind(props, "p")
-    binds += pbinds
-    assigns += passigns
-    params.update(pparams)
-    ck_bind, ck_assign, ck_params = _coco_key_bind(coco_key)
-    binds.append(ck_bind)
-    assigns.append(ck_assign)
-    params.update(ck_params)
+    binds = [
+        Bind("e_from", from_ref.pg_type, from_ref.value),
+        Bind("e_to", to_ref.pg_type, to_ref.value),
+    ]
+    assigns = [f"from: {_SLOT}", f"to: {_SLOT}"]
+    prop_binds, prop_assigns = _bind(props, "p")
+    binds += prop_binds
+    assigns += prop_assigns
+    assigns.append(f"{COCO_KEY}: {_SLOT}")
     body = f"insert {type_name} {{ {', '.join(assigns)} }}"
-    return Mutation(_wrap(binds, body), params, tuple(binds), body)
+    return Statement(body, (*binds, _coco_key_bind(coco_key)))

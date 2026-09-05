@@ -35,19 +35,21 @@ from cocoindex.connectors.omnigraph._client import (
 )
 from cocoindex.connectors.omnigraph._gq import (
     COCO_KEY,
+    Bind,
     Mutation,
     PropertyValue,
+    Statement,
     build_edge_delete,
     build_edge_insert,
     build_endpoint_stub,
     build_node_delete,
     build_node_upsert,
-    combine_mutations,
     merge_type_into_schema,
     remove_type_from_schema,
     render_edge_type,
     render_node_type,
     render_property,
+    render_query,
     validate_identifier,
     validate_pg_type,
 )
@@ -434,7 +436,12 @@ class TestRemoveTypeFromSchema:
 
 
 class TestNodeMutations:
-    def test_upsert_is_wrapped_and_parameterized(self) -> None:
+    def test_upsert_is_a_statement_with_positional_slots(self) -> None:
+        """A builder returns a statement, not query text: its body holds a
+        `$?` slot per bound value, and the binds carry each slot's label,
+        type and value. Names are allocated only when a query is rendered,
+        so the value never touches the text and no renaming is ever needed
+        to combine statements."""
         m = build_node_upsert(
             "Person",
             [
@@ -443,47 +450,65 @@ class TestNodeMutations:
             ],
             coco_key="k1",
         )
-        assert m.expr == (
-            "query m($p_email: String, $p_display_name: String, $p_coco_key: String) "
-            "{ insert Person { email: $p_email, display_name: $p_display_name, "
-            "coco_key: $p_coco_key } }"
+        assert m == Statement(
+            "insert Person { email: $?, display_name: $?, coco_key: $? }",
+            (
+                Bind("p_email", "String", "ada@x.com"),
+                Bind("p_display_name", "String", "Ada"),
+                Bind("p_coco_key", "String", "k1"),
+            ),
         )
-        assert m.params == {
-            "p_email": "ada@x.com",
-            "p_display_name": "Ada",
-            "p_coco_key": "k1",
+        rendered = render_query([m])
+        assert rendered.expr == (
+            "query m($s0_p_email: String, $s0_p_display_name: String, "
+            "$s0_p_coco_key: String) { insert Person { email: $s0_p_email, "
+            "display_name: $s0_p_display_name, coco_key: $s0_p_coco_key } }"
+        )
+        assert rendered.params == {
+            "s0_p_email": "ada@x.com",
+            "s0_p_display_name": "Ada",
+            "s0_p_coco_key": "k1",
         }
 
     def test_delete_uses_coco_key_single_predicate(self) -> None:
-        m = build_node_delete("Person", coco_key="k1")
+        m = render_query([build_node_delete("Person", coco_key="k1")])
         assert m.expr == (
-            "query m($p_coco_key: String) { delete Person where coco_key = $p_coco_key }"
+            "query m($s0_p_coco_key: String) "
+            "{ delete Person where coco_key = $s0_p_coco_key }"
         )
-        assert m.params == {"p_coco_key": "k1"}
+        assert m.params == {"s0_p_coco_key": "k1"}
 
     def test_endpoint_stub_is_key_plus_coco_key(self) -> None:
-        m = build_endpoint_stub(
-            "Person", [PropertyValue("email", "String", "ada@x.com")], coco_key="k1"
+        m = render_query(
+            [
+                build_endpoint_stub(
+                    "Person", [PropertyValue("email", "String", "ada@x.com")], "k1"
+                )
+            ]
         )
         assert m.expr == (
-            "query m($p_email: String, $p_coco_key: String) "
-            "{ insert Person { email: $p_email, coco_key: $p_coco_key } }"
+            "query m($s0_p_email: String, $s0_p_coco_key: String) "
+            "{ insert Person { email: $s0_p_email, coco_key: $s0_p_coco_key } }"
         )
 
     def test_value_is_never_interpolated(self) -> None:
-        # A value containing GQ-syntax characters must not change `expr`'s
+        # A value containing GQ-syntax characters must not change the query's
         # shape at all — asserting the full string, not just `not in`, is
         # what actually proves the value never reaches the query text.
         nasty = '", role: "pwned'
-        m = build_node_upsert(
-            "Person", [PropertyValue("email", "String", nasty)], coco_key="k1"
+        m = render_query(
+            [
+                build_node_upsert(
+                    "Person", [PropertyValue("email", "String", nasty)], coco_key="k1"
+                )
+            ]
         )
         assert m.expr == (
-            "query m($p_email: String, $p_coco_key: String) "
-            "{ insert Person { email: $p_email, coco_key: $p_coco_key } }"
+            "query m($s0_p_email: String, $s0_p_coco_key: String) "
+            "{ insert Person { email: $s0_p_email, coco_key: $s0_p_coco_key } }"
         )
         assert nasty not in m.expr
-        assert m.params == {"p_email": nasty, "p_coco_key": "k1"}
+        assert m.params == {"s0_p_email": nasty, "s0_p_coco_key": "k1"}
 
     def test_type_is_never_interpolated(self) -> None:
         # Unlike `value`, `pg_type` lands directly in the signature text — it
@@ -528,43 +553,53 @@ class TestNodeMutations:
 
 class TestEdgeMutations:
     def test_insert_carries_coco_key_not_id(self) -> None:
-        m = build_edge_insert(
-            "WorksAt",
-            PropertyValue("from", "String", "ada@x.com"),
-            PropertyValue("to", "String", "acme"),
-            [PropertyValue("role", "String", "Eng")],
-            coco_key="e1",
+        m = render_query(
+            [
+                build_edge_insert(
+                    "WorksAt",
+                    PropertyValue("from", "String", "ada@x.com"),
+                    PropertyValue("to", "String", "acme"),
+                    [PropertyValue("role", "String", "Eng")],
+                    coco_key="e1",
+                )
+            ]
         )
         assert m.expr == (
-            "query m($e_from: String, $e_to: String, $p_role: String, $p_coco_key: String) "
-            "{ insert WorksAt { from: $e_from, to: $e_to, role: $p_role, "
-            "coco_key: $p_coco_key } }"
+            "query m($s0_e_from: String, $s0_e_to: String, $s0_p_role: String, "
+            "$s0_p_coco_key: String) { insert WorksAt { from: $s0_e_from, "
+            "to: $s0_e_to, role: $s0_p_role, coco_key: $s0_p_coco_key } }"
         )
         assert "id:" not in m.expr
         assert m.params == {
-            "e_from": "ada@x.com",
-            "e_to": "acme",
-            "p_role": "Eng",
-            "p_coco_key": "e1",
+            "s0_e_from": "ada@x.com",
+            "s0_e_to": "acme",
+            "s0_p_role": "Eng",
+            "s0_p_coco_key": "e1",
         }
 
     def test_insert_without_properties(self) -> None:
-        m = build_edge_insert(
-            "Supports",
-            PropertyValue("from", "String", "load-test"),
-            PropertyValue("to", "String", "lower-latency"),
-            [],
-            coco_key="e2",
+        m = render_query(
+            [
+                build_edge_insert(
+                    "Supports",
+                    PropertyValue("from", "String", "load-test"),
+                    PropertyValue("to", "String", "lower-latency"),
+                    [],
+                    coco_key="e2",
+                )
+            ]
         )
         assert m.expr == (
-            "query m($e_from: String, $e_to: String, $p_coco_key: String) "
-            "{ insert Supports { from: $e_from, to: $e_to, coco_key: $p_coco_key } }"
+            "query m($s0_e_from: String, $s0_e_to: String, $s0_p_coco_key: String) "
+            "{ insert Supports { from: $s0_e_from, to: $s0_e_to, "
+            "coco_key: $s0_p_coco_key } }"
         )
 
     def test_delete_uses_coco_key(self) -> None:
-        m = build_edge_delete("WorksAt", coco_key="e1")
+        m = render_query([build_edge_delete("WorksAt", coco_key="e1")])
         assert m.expr == (
-            "query m($p_coco_key: String) { delete WorksAt where coco_key = $p_coco_key }"
+            "query m($s0_p_coco_key: String) "
+            "{ delete WorksAt where coco_key = $s0_p_coco_key }"
         )
 
     def test_no_edge_update_builder_exists(self) -> None:
@@ -2019,43 +2054,65 @@ class TestCliCancellation:
                 await proc.wait()
 
 
-class TestCombineMutations:
-    def test_single_is_unchanged_in_effect(self) -> None:
-        m = combine_mutations(
-            [
-                Mutation(
-                    "query m($p_a: String) { insert P { a: $p_a } }",
-                    {"p_a": "1"},
-                    (("p_a", "String"),),
-                    "insert P { a: $p_a }",
-                )
-            ]
+class TestRenderQuery:
+    def test_single_statement_gets_the_first_prefix(self) -> None:
+        m = render_query(
+            [Statement("insert P { a: $? }", (Bind("p_a", "String", "1"),))]
         )
         assert m.params == {"s0_p_a": "1"}
         assert m.expr == "query m($s0_p_a: String) { insert P { a: $s0_p_a } }"
 
-    def test_colliding_param_names_are_reprefixed(self) -> None:
-        one = Mutation(
-            "",
-            {"p_coco_key": "A"},
-            (("p_coco_key", "String"),),
-            "insert P { coco_key: $p_coco_key }",
+    def test_statements_with_the_same_labels_never_collide(self) -> None:
+        """Every builder uses the same labels (`p_coco_key`, ...). Naming
+        happens per statement at render time, so two of them share one
+        query without any rewriting of the statement text."""
+        one = Statement(
+            "insert P { coco_key: $? }", (Bind("p_coco_key", "String", "A"),)
         )
-        two = Mutation(
-            "",
-            {"p_coco_key": "B"},
-            (("p_coco_key", "String"),),
-            "insert P { coco_key: $p_coco_key }",
+        two = Statement(
+            "insert P { coco_key: $? }", (Bind("p_coco_key", "String", "B"),)
         )
-        m = combine_mutations([one, two])
+        m = render_query([one, two])
         assert m.params == {"s0_p_coco_key": "A", "s1_p_coco_key": "B"}
-        assert "$s0_p_coco_key" in m.expr and "$s1_p_coco_key" in m.expr
-        assert m.expr.count("insert P") == 2
-        assert m.expr.count("query m(") == 1
+        assert m.expr == (
+            "query m($s0_p_coco_key: String, $s1_p_coco_key: String) "
+            "{ insert P { coco_key: $s0_p_coco_key } insert P { coco_key: $s1_p_coco_key } }"
+        )
+
+    def test_a_label_that_is_a_prefix_of_another_is_rendered_whole(self) -> None:
+        m = render_query(
+            [
+                Statement(
+                    "insert P { a: $?, ab: $? }",
+                    (Bind("p_a", "String", "1"), Bind("p_ab", "String", "2")),
+                )
+            ]
+        )
+        assert m.expr == (
+            "query m($s0_p_a: String, $s0_p_ab: String) "
+            "{ insert P { a: $s0_p_a, ab: $s0_p_ab } }"
+        )
+
+    def test_slot_and_bind_counts_must_agree(self) -> None:
+        with pytest.raises(ValueError, match="2 slots but 1 bind"):
+            render_query(
+                [Statement("insert P { a: $?, b: $? }", (Bind("p_a", "String", 1),))]
+            )
+
+    def test_duplicate_labels_in_one_statement_are_rejected(self) -> None:
+        with pytest.raises(ValueError, match="Duplicate parameter label"):
+            render_query(
+                [
+                    Statement(
+                        "insert P { a: $?, b: $? }",
+                        (Bind("p_x", "String", 1), Bind("p_x", "String", 2)),
+                    )
+                ]
+            )
 
     def test_empty_raises(self) -> None:
         with pytest.raises(ValueError):
-            combine_mutations([])
+            render_query([])
 
 
 class TestPlanCommits:
@@ -2265,7 +2322,7 @@ class TestPlanCommitsEncoding:
         assert out is not None
         (commit,) = plan_commits([out.action])
         json.dumps(commit.params)  # must not raise
-        # plan_commits always runs a chunk through combine_mutations, even a
+        # plan_commits always renders a chunk with render_query, even a
         # single one — so params carry the `s0_` commit prefix.
         assert commit.params["s0_p_on"] == "2026-01-01"
         assert commit.params["s0_p_at"] == "2026-01-01T12:00:00"
@@ -2308,9 +2365,10 @@ class TestBuildEndpointStub:
         stub = ogt._build_endpoint_stub("src", "7", "Source", [action])
 
         assert stub is not None
-        assert "$p_source_id: I32" in stub.expr
-        assert "$p_source_id: I64" not in stub.expr
-        assert stub.params["p_source_id"] == 7
+        rendered = render_query([stub])
+        assert "$s0_p_source_id: I32" in rendered.expr
+        assert "$s0_p_source_id: I64" not in rendered.expr
+        assert rendered.params["s0_p_source_id"] == 7
 
     def test_delete_actions_are_not_stub_candidates(self) -> None:
         """A delete `_EdgeAction` carries `from_id=None`/`to_id=None`, so
@@ -2552,7 +2610,7 @@ class TestApplyEntityActions:
                 return
             # Anything else is a key-only endpoint stub.
             type_name = mutation.expr.split("insert ")[1].split(" ")[0]
-            present.add((type_name, str(mutation.params["p_slug"])))
+            present.add((type_name, str(mutation.params["s0_p_slug"])))
 
         async def noop(self: object, *args: object, **kwargs: object) -> None:
             return None
@@ -4243,7 +4301,7 @@ class TestEngineSchemaLimitsLive:
         store = f"file://{store_dir}"
         _mutate_live(
             store,
-            combine_mutations(
+            render_query(
                 [
                     build_node_upsert(
                         "A", (PropertyValue("slug", "String", "a1"),), "ck-a"
@@ -4256,12 +4314,16 @@ class TestEngineSchemaLimitsLive:
         )
         r = _mutate_live(
             store,
-            build_edge_insert(
-                "Link",
-                PropertyValue("ref", "String", "a1"),
-                PropertyValue("ref", "String", "b1"),
-                (),
-                "ck-e",
+            render_query(
+                [
+                    build_edge_insert(
+                        "Link",
+                        PropertyValue("ref", "String", "a1"),
+                        PropertyValue("ref", "String", "b1"),
+                        (),
+                        "ck-e",
+                    )
+                ]
             ),
             check=False,
         )
@@ -4347,7 +4409,7 @@ class TestFullCapCommitLive:
         )
 
         n = ogt._MAX_ENTITIES_PER_TYPE
-        commit = combine_mutations(
+        commit = render_query(
             [
                 build_node_upsert(
                     "Source",
@@ -4377,7 +4439,7 @@ class TestFullCapCommitLive:
 class TestMutationAtomicityLive:
     """A failed multi-statement `mutate` must apply NOTHING.
 
-    Everything above rests on this and nothing pinned it. `combine_mutations`
+    Everything above rests on this and nothing pinned it. `render_query`
     merges N statements into one query precisely to get one commit, and
     `_mutate_with_endpoint_retry` re-runs the WHOLE commit after stubbing a
     missing endpoint — so if a failed invocation left its earlier statements
@@ -4406,7 +4468,7 @@ class TestMutationAtomicityLive:
         )
         _mutate_live(
             store,
-            combine_mutations(
+            render_query(
                 [
                     build_node_upsert(
                         "Source", (PropertyValue("slug", "String", "s1"),), "ck-s1"
@@ -4441,7 +4503,7 @@ class TestMutationAtomicityLive:
             (),
             "ck-e2",
         )
-        r = _mutate_live(store, combine_mutations([good, doomed]), check=False)
+        r = _mutate_live(store, render_query([good, doomed]), check=False)
         assert r.returncode != 0
         assert "not found in Claim" in r.stderr
 
@@ -4458,7 +4520,7 @@ class TestMutationAtomicityLive:
 
         r = _mutate_live(
             store,
-            combine_mutations(
+            render_query(
                 [
                     build_node_upsert(
                         "Source",

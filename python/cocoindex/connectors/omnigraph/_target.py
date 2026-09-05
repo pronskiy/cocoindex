@@ -28,19 +28,20 @@ from cocoindex.connectors.omnigraph._gq import (
     MANAGED_MARKER,
     Mutation,
     PropertyValue,
+    Statement,
     _find_type_block,
     build_edge_delete,
     build_edge_insert,
     build_endpoint_stub,
     build_node_delete,
     build_node_upsert,
-    combine_mutations,
     edge_types_referencing,
     is_connector_managed,
     merge_type_into_schema,
     remove_type_from_schema,
     render_edge_type,
     render_node_type,
+    render_query,
     validate_identifier,
     validate_pg_type,
 )
@@ -876,7 +877,7 @@ class _EdgeHandler(coco.TargetHandler[_EdgeValue, _EntityTrackingRecord, Any]):
 # Commit planning: reconcile actions -> ordered Mutations, one per commit
 # ---------------------------------------------------------------------------
 
-#: Chunk cap for combine_mutations: a single commit combining more than this
+#: Chunk cap for render_query: a single commit combining more than this
 #: many entities of one type risks an unreasonably large query. Deliberately
 #: a module constant, not a public kwarg — tests monkeypatch it directly.
 _MAX_ENTITIES_PER_TYPE = 8192
@@ -921,8 +922,8 @@ def _endpoint_ref(value: Any) -> PropertyValue:
 
 
 def _chunk_by_type(
-    items: Sequence[tuple[str, Mutation]], cap: int, total_cap: int
-) -> list[list[Mutation]]:
+    items: Sequence[tuple[str, Statement]], cap: int, total_cap: int
+) -> list[list[Statement]]:
     """Split into chunks bounded two ways: no chunk holds more than `cap`
     mutations for any single `type_name`, and none holds more than
     `total_cap` overall.
@@ -933,8 +934,8 @@ def _chunk_by_type(
     without it a sync touching N types emitted one commit of N x `cap`
     entities, which is re-sent whole on every endpoint-stub retry.
     """
-    chunks: list[list[Mutation]] = []
-    current: list[Mutation] = []
+    chunks: list[list[Statement]] = []
+    current: list[Statement] = []
     counts: dict[str, int] = {}
     for type_name, mutation in items:
         if counts.get(type_name, 0) >= cap or len(current) >= total_cap:
@@ -983,11 +984,11 @@ def plan_commits(actions: Sequence[Any]) -> list[Mutation]:
     A and C cannot merge into one commit even though both are deletes: A
     must precede B and C must follow it.
     """
-    phase_a: list[tuple[str, Mutation]] = []
-    phase_b_nodes: list[tuple[str, Mutation]] = []
-    phase_b_edges: list[tuple[str, Mutation]] = []
-    phase_c_edges: list[tuple[str, Mutation]] = []
-    phase_c_nodes: list[tuple[str, Mutation]] = []
+    phase_a: list[tuple[str, Statement]] = []
+    phase_b_nodes: list[tuple[str, Statement]] = []
+    phase_b_edges: list[tuple[str, Statement]] = []
+    phase_c_edges: list[tuple[str, Statement]] = []
+    phase_c_nodes: list[tuple[str, Statement]] = []
 
     for action in actions:
         if isinstance(action, _NodeAction):
@@ -1053,7 +1054,7 @@ def plan_commits(actions: Sequence[Any]) -> list[Mutation]:
         for chunk in _chunk_by_type(
             phase, _MAX_ENTITIES_PER_TYPE, _MAX_ENTITIES_PER_COMMIT
         ):
-            commits.append(combine_mutations(chunk))
+            commits.append(render_query(chunk))
     return commits
 
 
@@ -1091,7 +1092,7 @@ def _parse_missing_endpoint(error: OmnigraphCliError) -> tuple[str, str, str] | 
 
 def _build_endpoint_stub(
     role: str, key_str: str, type_name: str, edge_actions: Sequence[_EdgeAction]
-) -> Mutation | None:
+) -> Statement | None:
     """Build the key-only stub for the endpoint the engine reported missing.
     Returns `None` if no action in this batch accounts for the (type, key)
     — nothing safe to build a stub from.
@@ -1180,7 +1181,7 @@ async def _mutate_with_endpoint_retry(
             if stub is None:
                 raise
             stubbed.add((type_name, key_str))
-            await client.mutate(stub, branch=branch)
+            await client.mutate(render_query([stub]), branch=branch)
 
 
 #: Prefix of every branch this connector creates. Nothing else creates

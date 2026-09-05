@@ -4179,6 +4179,46 @@ async def _declare_a_day(db: coco.ContextKey[ConnectionFactory]) -> None:
     days.declare_node(node=_Day(on=datetime.date(2026, 1, 5), note="n"))
 
 
+class TestDateTimeKeyIdentity:
+    """Omnigraph identifies a `DateTime`-keyed node by the instant, as epoch
+    milliseconds: `12:00+00:00` and `14:00+02:00` are one node, sub-millisecond
+    precision is dropped, and a naive value is read as UTC (all verified
+    against the engine). Tracking by the ISO spelling gave one graph node two
+    tracking keys; removing one declaration then deleted the node the other
+    still declared, and its later unchanged updates left it missing."""
+
+    AT = PropertyDef("at", "DateTime", ogt._isoformat)
+
+    def test_two_offsets_of_one_instant_share_a_tracking_key(self) -> None:
+        utc = datetime.datetime(2026, 1, 1, 12, 0, tzinfo=datetime.UTC)
+        plus_two = datetime.datetime(
+            2026, 1, 1, 14, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=2))
+        )
+        assert ogt._tracking_key_value(self.AT, utc) == ogt._tracking_key_value(
+            self.AT, plus_two
+        )
+        assert ogt._tracking_key_value(self.AT, utc) == 1767268800000
+
+    def test_a_naive_value_is_read_as_utc(self) -> None:
+        naive = datetime.datetime(2026, 1, 1, 12, 0)  # noqa: DTZ001
+        assert ogt._tracking_key_value(self.AT, naive) == 1767268800000
+
+    def test_sub_millisecond_precision_is_dropped(self) -> None:
+        a = datetime.datetime(2026, 1, 1, 12, 0, 0, 100, tzinfo=datetime.UTC)
+        b = datetime.datetime(2026, 1, 1, 12, 0, 0, 900, tzinfo=datetime.UTC)
+        c = datetime.datetime(2026, 1, 1, 12, 0, 0, 500000, tzinfo=datetime.UTC)
+        assert ogt._tracking_key_value(self.AT, a) == ogt._tracking_key_value(
+            self.AT, b
+        )
+        assert ogt._tracking_key_value(self.AT, a) != ogt._tracking_key_value(
+            self.AT, c
+        )
+
+    def test_a_date_key_is_still_tracked_by_its_iso_form(self) -> None:
+        on = PropertyDef("on", "Date", ogt._isoformat)
+        assert ogt._tracking_key_value(on, datetime.date(2026, 1, 5)) == "2026-01-05"
+
+
 def test_declare_node_keyed_by_a_date_tracks_the_encoded_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6326,3 +6366,46 @@ class TestEndToEnd:
 
         (row,) = [r for r in _export_rows(store) if r.get("type") == "Day"]
         assert row["data"]["note"] == "n"
+
+    def test_two_spellings_of_one_instant_are_one_node(self, store: str) -> None:
+        """The regression: `12:00+00:00` and `14:00+02:00` used to get two
+        tracking keys for one graph node. Declared together they are now the
+        same target state, which the engine refuses as a duplicate; declared
+        one after the other they are one node whose removal is one delete."""
+        db = _e2e_db(store, "datetime_key")
+
+        @dataclass
+        class _Event:
+            at: datetime.datetime
+            note: str | None
+
+        utc = datetime.datetime(2026, 1, 1, 12, 0, tzinfo=datetime.UTC)
+        plus_two = datetime.datetime(
+            2026, 1, 1, 14, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=2))
+        )
+        declare = {"ats": [utc, plus_two]}
+
+        async def main() -> None:
+            events = await omnigraph.mount_node_target(
+                db, "Event", await NodeSchema.from_class(_Event, key="at")
+            )
+            for at in declare["ats"]:
+                events.declare_node(node=_Event(at=at, note=at.isoformat()))
+
+        app = coco.App(
+            coco.AppConfig(name="e2e_datetime_key", environment=coco_env), main
+        )
+        with pytest.raises(ValueError, match="already declared"):
+            app.update_blocking()
+
+        declare["ats"] = [utc]
+        app.update_blocking()
+        declare["ats"] = [plus_two]  # same instant, respelled: still that node
+        app.update_blocking()
+        (row,) = [r for r in _export_rows(store) if r.get("type") == "Event"]
+        assert row["data"]["at"] == 1767268800000
+        assert row["data"]["note"] == plus_two.isoformat()
+
+        declare["ats"] = []
+        app.update_blocking()
+        assert [r for r in _export_rows(store) if r.get("type") == "Event"] == []

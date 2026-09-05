@@ -728,6 +728,29 @@ def _encode_properties(
     return tuple(out)
 
 
+_EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.UTC)
+
+
+def _tracking_key_value(prop_def: PropertyDef, value: Any) -> Any:
+    """The value a key property is tracked by: the graph's own identity.
+
+    Omnigraph identifies a `DateTime`-keyed node by the instant, as epoch
+    milliseconds — `12:00+00:00` and `14:00+02:00` are one node, precision
+    below a millisecond is dropped, and a naive value is read as UTC (all
+    verified against the engine). Tracking by the ISO spelling gave one
+    graph node two tracking keys; removing one declaration then deleted the
+    node the other still declared. Every other key is tracked by the
+    encoded value the graph is sent, which is what it keys on.
+    """
+    if prop_def.pg_type.rstrip("?") == "DateTime" and isinstance(
+        value, datetime.datetime
+    ):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=datetime.UTC)
+        return (value - _EPOCH) // datetime.timedelta(milliseconds=1)
+    return _encode_property(prop_def, value).value
+
+
 def _encode_property(prop_def: PropertyDef, value: Any) -> PropertyValue:
     if value is not None and prop_def.encoder is not None:
         value = prop_def.encoder(value)
@@ -1761,15 +1784,16 @@ class NodeTarget(
     def declare_node(self: NodeTarget[RowT], *, node: RowT) -> None:
         """Declare a node (record) to be upserted to this node type.
 
-        The target-state key is the key property's *encoded* value — for a
-        `Date` key its ISO form, the same string the graph is sent and keys
-        on. The raw `datetime.date` is not a type the engine's StableKey
-        accepts, and tracking one form while storing the other would let
-        the two identities drift apart.
+        The target-state key is the graph's identity for the key value —
+        see `_tracking_key_value`: epoch milliseconds for a `DateTime`, the
+        ISO form for a `Date`, the value itself for a string or integer. A
+        raw `datetime` is not a type the engine's StableKey accepts, and
+        tracking a spelling the graph does not key on let two declarations
+        of one node get two tracking keys.
         """
         properties = _record_to_dict(node, self._schema)
         key: tuple[Any, ...] = tuple(
-            _encode_property(self._schema.properties[k], properties[k]).value
+            _tracking_key_value(self._schema.properties[k], properties[k])
             for k in self._schema.key
         )
         coco.declare_target_state(

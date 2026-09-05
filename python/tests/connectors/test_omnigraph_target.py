@@ -2664,6 +2664,93 @@ class TestApplyTypeSchema:
     """Unit coverage for _apply_type_schema's init-vs-merge branching,
     mocked so it doesn't need the live binary."""
 
+    _REFUSAL = (
+        "schema apply exited 1: schema apply requires a graph with only main; "
+        "found non-main branches: {names}"
+    )
+
+    @pytest.mark.asyncio
+    async def test_abandoned_scratch_branch_is_reaped_and_the_apply_retried(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A process killed between creating and deleting its scratch branch
+        leaves a `coco_scratch_*` branch behind, and Omnigraph refuses every
+        later `schema apply` while it exists. Nothing ever recovered it. Any
+        such branch seen while holding the store lock is abandoned — a live
+        one is held under that same lock — so the sink deletes it and
+        retries the apply once."""
+        calls: list[str] = []
+        branches = ["coco_scratch_deadbeef", "main"]
+
+        async def fake_read_schema(self: object) -> str | None:
+            return "node A {\n  slug: String @key\n  coco_key: String\n}\n"
+
+        async def fake_apply_schema(self: object, pg_fragment: str) -> None:
+            calls.append("apply")
+            stale = [b for b in branches if b != "main"]
+            if stale:
+                raise OmnigraphCliError(
+                    TestApplyTypeSchema._REFUSAL.format(names=", ".join(stale))
+                )
+
+        async def fake_branch_list(self: object) -> list[str]:
+            calls.append("branch_list")
+            return list(branches)
+
+        async def fake_branch_delete(self: object, name: str) -> None:
+            calls.append(f"branch_delete:{name}")
+            branches.remove(name)
+
+        monkeypatch.setattr(_CliClient, "read_schema", fake_read_schema)
+        monkeypatch.setattr(_CliClient, "apply_schema", fake_apply_schema)
+        monkeypatch.setattr(_CliClient, "branch_list", fake_branch_list, raising=False)
+        monkeypatch.setattr(_CliClient, "branch_delete", fake_branch_delete)
+
+        fragment = "node B {\n  slug: String @key\n  coco_key: String\n}"
+        await ogt._apply_type_schema(_client(), [_type_action("insert", "B", fragment)])
+        assert calls == [
+            "apply",
+            "branch_list",
+            "branch_delete:coco_scratch_deadbeef",
+            "apply",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_user_branch_is_never_reaped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only the connector's own `coco_scratch_*` prefix is fair game. A
+        user's branch blocks the apply exactly as documented, and the
+        refusal propagates untouched."""
+        calls: list[str] = []
+
+        async def fake_read_schema(self: object) -> str | None:
+            return "node A {\n  slug: String @key\n  coco_key: String\n}\n"
+
+        async def fake_apply_schema(self: object, pg_fragment: str) -> None:
+            calls.append("apply")
+            raise OmnigraphCliError(
+                TestApplyTypeSchema._REFUSAL.format(names="staging")
+            )
+
+        async def fake_branch_list(self: object) -> list[str]:
+            return ["main", "staging"]
+
+        async def fake_branch_delete(self: object, name: str) -> None:
+            calls.append(f"branch_delete:{name}")
+
+        monkeypatch.setattr(_CliClient, "read_schema", fake_read_schema)
+        monkeypatch.setattr(_CliClient, "apply_schema", fake_apply_schema)
+        monkeypatch.setattr(_CliClient, "branch_list", fake_branch_list, raising=False)
+        monkeypatch.setattr(_CliClient, "branch_delete", fake_branch_delete)
+
+        fragment = "node B {\n  slug: String @key\n  coco_key: String\n}"
+        with pytest.raises(OmnigraphCliError, match="non-main branches: staging"):
+            await ogt._apply_type_schema(
+                _client(), [_type_action("insert", "B", fragment)]
+            )
+        assert calls == ["apply"]
+
     @pytest.mark.asyncio
     async def test_inits_when_graph_absent(
         self, monkeypatch: pytest.MonkeyPatch
@@ -5408,3 +5495,55 @@ class TestEndToEnd:
         assert [r["data"]["name"] for r in _export_rows(store) if r.get("type")] == [
             "ADA LOVELACE"
         ]
+
+    def test_abandoned_scratch_branch_is_reaped_before_a_schema_change(
+        self, store: str
+    ) -> None:
+        """An interrupted update leaves its `coco_scratch_*` branch behind,
+        and Omnigraph refuses every later schema change on the store while
+        it exists. The next schema change must recover on its own: reap the
+        abandoned branch, apply, and leave only `main` behind."""
+        db = _e2e_db(store, "abandoned_scratch")
+        wide = {"on": False}
+
+        async def main() -> None:
+            schema = await NodeSchema.from_class(
+                _ScSourceWide if wide["on"] else _ScSourceNarrow, key="slug"
+            )
+            sources = await omnigraph.mount_node_target(db, "Source", schema)
+            node: Any = (
+                _ScSourceWide(slug="a", title="A", note=None)
+                if wide["on"]
+                else _ScSourceNarrow(slug="a", title="A")
+            )
+            sources.declare_node(node=node)
+
+        app = coco.App(
+            coco.AppConfig(name="e2e_abandoned_scratch", environment=coco_env), main
+        )
+        app.update_blocking()
+
+        # What a process killed mid-sync leaves behind.
+        subprocess.run(
+            [
+                _OMNIGRAPH_BIN,
+                "branch",
+                "create",
+                "coco_scratch_deadbeef",
+                "--from",
+                "main",
+                "--store",
+                store,
+                "--json",
+                "--quiet",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        assert "coco_scratch_deadbeef" in _branch_names(store)
+
+        wide["on"] = True
+        app.update_blocking()
+
+        assert _branch_names(store) == ["main"]
+        assert "note: String?" in _read_schema_source(store)

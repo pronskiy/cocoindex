@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime
 import re
 import types
 import typing
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from typing import Any, Generic, Literal, NamedTuple
 
 import cocoindex as coco
@@ -1195,6 +1196,85 @@ async def _mutate_with_endpoint_retry(
             await client.mutate(stub, branch=branch)
 
 
+#: Prefix of every branch this connector creates. Nothing else creates
+#: branches under it, so a branch carrying it that is visible while the
+#: store lock is held was abandoned by a process that died mid-sync.
+_SCRATCH_BRANCH_PREFIX = "coco_scratch_"
+
+
+@contextlib.asynccontextmanager
+async def _scratch_branch(client: _CliClient, *, frm: str) -> AsyncIterator[str]:
+    """Own a scratch branch for the duration of the block.
+
+    Holds the store lock from before the branch is created until after it
+    is deleted: a non-main branch makes Omnigraph reject every schema apply
+    on the store, and schema reconciliation takes the same lock, so a
+    concurrent type update never observes the transient branch and fails
+    spuriously. That lock discipline is also what lets
+    `_reap_abandoned_scratch_branches` tell an abandoned branch from a live
+    one.
+
+    The branch is deleted whether the body succeeded or failed — `branch
+    merge` does not delete its source (we don't pass `--delete-branch`,
+    which would only cover the success path anyway), and a leftover
+    non-main branch blocks every subsequent `schema apply` on the store
+    (verified live). `branch_delete` itself raises when the branch doesn't
+    exist, so if `branch_create` never landed there is nothing to delete;
+    once it did, a cleanup failure must be reported — treating the sync as
+    successful would persist a hidden operational failure.
+    """
+    async with client.store_lock():
+        name = f"{_SCRATCH_BRANCH_PREFIX}{uuid.uuid4().hex}"
+        await client.branch_create(name, frm=frm)
+        try:
+            yield name
+        finally:
+            await client.branch_delete(name)
+
+
+async def _reap_abandoned_scratch_branches(client: _CliClient) -> list[str]:
+    """Delete every `coco_scratch_*` branch and return their names.
+
+    Must run under the store lock. A live scratch branch exists only inside
+    `_scratch_branch`, which holds that lock for the branch's whole
+    lifetime — so any branch under the prefix visible to a lock holder was
+    left behind by a process that died between creating and deleting it.
+    User branches are never touched.
+    """
+    reaped = [
+        name
+        for name in await client.branch_list()
+        if name.startswith(_SCRATCH_BRANCH_PREFIX)
+    ]
+    for name in reaped:
+        await client.branch_delete(name)
+    return reaped
+
+
+async def _apply_schema_recovering_abandoned_branches(
+    client: _CliClient, schema_pg: str
+) -> None:
+    """`schema apply`, recovering from a scratch branch an interrupted sync
+    left behind.
+
+    Omnigraph refuses every schema change while any non-main branch exists
+    ("schema apply requires a graph with only main; found non-main
+    branches: ..."). An abandoned `coco_scratch_*` branch therefore blocked
+    the store's schema for good, since nothing ever listed or deleted it.
+    On that refusal, reap the connector's own abandoned branches and retry
+    once; if the refusal was about a user's branch, nothing is reaped and
+    the original error propagates.
+    """
+    try:
+        await client.apply_schema(schema_pg)
+    except OmnigraphCliError as e:
+        if "non-main branches" not in str(e):
+            raise
+        if not await _reap_abandoned_scratch_branches(client):
+            raise
+        await client.apply_schema(schema_pg)
+
+
 async def _apply_entity_actions(
     context_provider: ContextProvider, actions: Sequence[_NodeAction | _EdgeAction]
 ) -> None:
@@ -1236,37 +1316,12 @@ async def _apply_entity_actions(
         # takes `--if-commit`); a conflicted merge simply surfaces as a
         # non-zero exit from `branch_merge` and propagates like any other
         # failure below.
-        # A non-main branch makes Omnigraph reject every schema apply on the
-        # store. Hold the same store lock as schema reconciliation from before
-        # branch creation until after deletion, so a concurrent type update
-        # never observes this transient branch and fails spuriously.
-        async with client.store_lock():
-            scratch = f"coco_scratch_{uuid.uuid4().hex}"
-            scratch_created = False
-            try:
-                await client.branch_create(scratch, frm=conn.branch)
-                scratch_created = True
-                for commit in commits:
-                    await _mutate_with_endpoint_retry(
-                        client, commit, branch=scratch, edge_actions=edge_actions
-                    )
-                await client.branch_merge(scratch, into=conn.branch)
-            finally:
-                # Delete the scratch branch whether the merge succeeded or
-                # failed — `branch_merge` does not delete its source branch
-                # (we don't pass `--delete-branch`, which would only cover the
-                # success path anyway), so a bare
-                # try/except-only cleanup left one behind on every SUCCESSFUL
-                # multi-commit sync, and a leftover non-main branch blocks
-                # every subsequent `schema apply` on that store outright
-                # (verified live). `branch_delete` itself raises when the
-                # branch doesn't exist (verified against the binary) — if
-                # `branch_create` never landed, there is nothing to delete. Once
-                # it did land, however, cleanup failure must be reported: a stale
-                # non-main branch prevents later schema changes, so treating this
-                # update as successful would persist a hidden operational failure.
-                if scratch_created:
-                    await client.branch_delete(scratch)
+        async with _scratch_branch(client, frm=conn.branch) as scratch:
+            for commit in commits:
+                await _mutate_with_endpoint_retry(
+                    client, commit, branch=scratch, edge_actions=edge_actions
+                )
+            await client.branch_merge(scratch, into=conn.branch)
 
 
 _entity_sink = coco.TargetActionSink.from_async_fn(_apply_entity_actions)
@@ -1468,7 +1523,7 @@ async def _apply_type_schema_locked(
         intermediate = existing
         for kind, type_name in replaced:
             intermediate = remove_type_from_schema(intermediate, kind, type_name)
-        await client.apply_schema(intermediate)
+        await _apply_schema_recovering_abandoned_branches(client, intermediate)
         existing = intermediate
 
     for action in pending:
@@ -1481,7 +1536,7 @@ async def _apply_type_schema_locked(
             existing = merge_type_into_schema(
                 existing, action.key.type_kind, action.key.type_name, action.pg_fragment
             )
-    await client.apply_schema(existing)
+    await _apply_schema_recovering_abandoned_branches(client, existing)
 
 
 async def _apply_type_actions(

@@ -221,6 +221,17 @@ class _CliClient:
             "--quiet",
         ]
 
+    def _branch_list_argv(self) -> list[str]:
+        return [
+            self._conn.cli,
+            "branch",
+            "list",
+            "--store",
+            self._conn.store,
+            "--json",
+            "--quiet",
+        ]
+
     # --- execution ---
 
     async def _run(self, argv: list[str]) -> dict[str, object]:
@@ -306,3 +317,9 @@ class _CliClient:
 
     async def branch_delete(self, name: str) -> None:
         await self._run(self._branch_delete_argv(name))
+
+    async def branch_list(self) -> list[str]:
+        result = await self._run(self._branch_list_argv())
+        branches = result["branches"]
+        assert isinstance(branches, list)
+        return [str(name) for name in branches]

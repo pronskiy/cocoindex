@@ -498,6 +498,19 @@ class _TypeHandlerBase(coco.TargetHandler[_TypeSpec, _TypeTrackingRecord, Any]):
                 if action is not None:
                     property_actions[sub_key] = action
 
+        # The reverse handoff. A SYSTEM declaration after a USER-managed
+        # record has to re-render the block even when the schema is otherwise
+        # unchanged: the release dropped `coco_managed`, and until it is back
+        # a drop of a node type this type references treats it as the user's
+        # and refuses.
+        if (
+            main_action is None
+            and not property_actions
+            and spec.managed_by == ManagedBy.SYSTEM
+            and any(p.managed_by == ManagedBy.USER for p in prev_possible_records)
+        ):
+            main_action = "upsert"
+
         # --- The tracked path: what CocoIndex has actually seen before. ---
         #
         # The same records, diffed as if `prev` were known complete and

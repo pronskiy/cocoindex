@@ -1232,6 +1232,25 @@ class TestNodeTypeReconcile:
         assert out.action.release_ownership is True
 
     @pytest.mark.asyncio
+    async def test_taking_a_type_back_from_the_user_rewrites_its_block(self) -> None:
+        """The reverse handoff. A system-managed declaration after a
+        user-managed record wrote nothing when the schema was otherwise
+        unchanged, so `coco_managed` stayed absent and the next drop of a
+        node type it referenced treated it as the user's. Reclaiming must
+        re-render the block even with nothing else to change."""
+        schema = await NodeSchema.from_class(_Doc, key="slug")
+        prev = _type_tracking_record_from_spec(_spec(schema, ManagedBy.USER))
+        out = _NodeTypeHandler().reconcile(
+            _TypeKey("og", "node", "Doc"),
+            _spec(schema, ManagedBy.SYSTEM),
+            [prev],
+            False,
+        )
+        assert out is not None
+        assert out.action.main_action == "upsert"
+        assert out.action.release_ownership is False
+
+    @pytest.mark.asyncio
     async def test_a_type_already_user_managed_releases_nothing(self) -> None:
         schema = await NodeSchema.from_class(_Doc, key="slug")
         prev = _type_tracking_record_from_spec(_spec(schema, ManagedBy.USER))
@@ -1534,19 +1553,20 @@ class TestTypeOwnershipMatrix:
         [
             ([], True),
             ([ManagedBy.SYSTEM], False),
-            ([ManagedBy.USER], False),
-            ([ManagedBy.SYSTEM, ManagedBy.USER], False),
+            ([ManagedBy.USER], True),
+            ([ManagedBy.SYSTEM, ManagedBy.USER], True),
         ],
         ids=["no-prev", "system", "user", "mixed"],
     )
     async def test_declared_system_managed(
         self, prev_ownerships: list[ManagedBy], writes: bool
     ) -> None:
-        """A system-managed declaration writes DDL only when the graph might
-        not already match it: on a first run, where nothing is tracked and the
-        engine reports `prev_may_be_missing`. A tracked record already
-        carrying this exact schema means there is nothing to apply, whoever
-        owned it."""
+        """A system-managed declaration writes DDL when the graph might not
+        already match it: on a first run, where nothing is tracked and the
+        engine reports `prev_may_be_missing`, and whenever any tracked record
+        was user-managed — the block then lacks `coco_managed`, and only a
+        re-render puts it back. A system-managed record already carrying this
+        exact schema means there is nothing to apply."""
         schema = await NodeSchema.from_class(_Doc, key="slug")
         out = _NodeTypeHandler().reconcile(
             _TypeKey("og", "node", "Doc"),
@@ -6212,3 +6232,45 @@ class TestEndToEnd:
             app.drop_blocking()
         assert "was deliberately omitted" in _read_schema_source(store)
         assert len([r for r in _export_rows(store) if r.get("edge") == "Supports"]) == 1
+
+    def test_reclaiming_an_edge_type_restores_its_ownership(self, store: str) -> None:
+        """system -> user -> system with the schema unchanged throughout.
+        The second handoff wrote nothing, so the edge block stayed without
+        `coco_managed`, and dropping the connected app then failed because
+        its own edge type looked user-owned."""
+        db = _e2e_db(store, "reclaim")
+        edge_owner = {"m": ManagedBy.SYSTEM}
+
+        async def main() -> None:
+            sources = await omnigraph.mount_node_target(
+                db, "Source", await NodeSchema.from_class(_ScSourceNarrow, key="slug")
+            )
+            claims = await omnigraph.mount_node_target(
+                db, "Claim", await NodeSchema.from_class(_ScClaim, key="slug")
+            )
+            supports = await omnigraph.mount_edge_target(
+                db,
+                "Supports",
+                sources,
+                claims,
+                await EdgeSchema.from_class(_ScEdgeProps),
+                managed_by=edge_owner["m"],
+            )
+            sources.declare_node(node=_ScSourceNarrow(slug="a", title="A"))
+            claims.declare_node(node=_ScClaim(slug="c1"))
+            supports.declare_edge(
+                from_id="a", to_id="c1", record=_ScEdgeProps(weight=1)
+            )
+
+        app = coco.App(coco.AppConfig(name="e2e_reclaim", environment=coco_env), main)
+        app.update_blocking()
+        edge_owner["m"] = ManagedBy.USER
+        app.update_blocking()
+        assert _read_schema_source(store).count("coco_managed") == 2
+        edge_owner["m"] = ManagedBy.SYSTEM
+        app.update_blocking()
+        assert _read_schema_source(store).count("coco_managed") == 3
+
+        app.drop_blocking()
+        assert _read_schema_source(store).strip() == ""
+        assert _export_rows(store) == []

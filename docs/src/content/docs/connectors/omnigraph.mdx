@@ -298,7 +298,7 @@ For each managed type, the connector maintains a `.pg` fragment and reconciles i
 
 When `managed_by="user"` is set, the connector never mutates `.pg` for that type. Node/edge-level upserts and deletes still work normally — **provided your own `.pg` declares `coco_key: String` on that type.**
 
-The one exception is the handoff itself. When a type the connector created is re-declared with `managed_by="user"`, the next update writes once to drop the `coco_managed` property from its block and touches nothing else; from then on the block is yours, and a later drop of a node type it references refuses rather than removing it.
+The one exception is the handoff itself. When a type the connector created is re-declared with `managed_by="user"`, the next update writes once to drop the `coco_managed` property from its block and touches nothing else; from then on the block is yours, and a later drop of a node type it references refuses rather than removing it. Declaring it `managed_by="system"` again re-renders the block from your dataclass, `coco_managed` included, and the connector owns it once more.
 
 :::caution[`managed_by="user"` types must declare `coco_key` yourself]
 The connector addresses every entity through the synthetic `coco_key` property, and under `managed_by="user"` it never writes the schema — so it cannot add that column for you. Every insert names `coco_key`, and every delete filters on it. Against a type whose `.pg` lacks it, *all* row writes fail with `type 'X' has no property 'coco_key'`.

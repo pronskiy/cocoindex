@@ -312,7 +312,7 @@ node Source {
 ```
 :::
 
-The check is against what CocoIndex has previously *tracked*, not against the live schema. On the first run there is nothing tracked, so the type is adopted as-is — that's the normal way to start using this mode against a graph you created yourself. It raises only once the app changes a type it had already tracked, which is the case worth reporting: your dataclass and your `.pg` have drifted apart.
+The connector does not compare your declaration against the graph, on the first run or later: the type is adopted as declared. If your dataclass and your `.pg` drift apart, the first write that names a property the graph lacks fails with the engine's own error, which names the property.
 
 Removing a `managed_by="user"` type from your app is also never destructive: the connector didn't create the type and won't drop it.
 

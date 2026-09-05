@@ -25,6 +25,7 @@ from cocoindex.connectors.omnigraph._client import (
     _CliClient,
 )
 from cocoindex.connectors.omnigraph._gq import (
+    MANAGED_MARKER,
     Mutation,
     PropertyValue,
     _find_type_block,
@@ -35,6 +36,7 @@ from cocoindex.connectors.omnigraph._gq import (
     build_node_upsert,
     combine_mutations,
     edge_types_referencing,
+    is_connector_managed,
     merge_type_into_schema,
     remove_type_from_schema,
     render_edge_type,
@@ -1369,10 +1371,19 @@ def _check_no_kind_clash_within_batch(pending: Sequence[_TypeAction]) -> None:
             )
 
 
-def _check_no_orphaned_edge_endpoints(
+class _BlockedRemoval(NamedTuple):
+    """A node type this batch removes or rebuilds, and the edge types not in
+    this batch that still point at it."""
+
+    node_name: str
+    is_drop: bool  # False for a "replace" (a `@key` change)
+    edge_names: list[str]
+
+
+def _blocked_node_removals(
     existing_pg: str, pending: Sequence[_TypeAction]
-) -> None:
-    """Refuse to remove a node type that an edge type still points at.
+) -> list[_BlockedRemoval]:
+    """Node removals in `pending` that would leave an edge type dangling.
 
     The engine rejects such a schema outright — `catalog error: edge 'X' has
     an unresolved endpoint`, verified against the binary — and the connector
@@ -1380,41 +1391,61 @@ def _check_no_orphaned_edge_endpoints(
     dangling edge in the FINAL schema, and a "replace" (a `@key` change)
     leaves it in the INTERMEDIATE schema that the drop half applies first.
 
-    Edge types reconcile under a separate provider, so a referencing edge is
-    never in this batch to be removed alongside the node. That is precisely
-    why this has to be caught here: the engine's own error names the edge but
+    Every mounted type is its own processing component, so a referencing
+    edge type's removal reaches the sink in its own batch, not alongside
+    the node's — unless the batcher happened to group them. That is why
+    this has to be checked here: the engine's own error names the edge but
     offers no way forward, and arrives after the connector has already
     decided to write.
     """
     going_away = {
-        a.key.type_name
+        a.key.type_name: coco.is_non_existence(a.spec)
         for a in pending
         if a.key.type_kind == "node"
         and (coco.is_non_existence(a.spec) or a.main_action == "replace")
     }
     if not going_away:
-        return
+        return []
     also_dropped = {
         a.key.type_name
         for a in pending
         if a.key.type_kind == "edge" and coco.is_non_existence(a.spec)
     }
-    for node_name in sorted(going_away):
-        blocking = sorted(
+    blocked = []
+    for node_name, is_drop in sorted(going_away.items()):
+        edge_names = sorted(
             set(edge_types_referencing(existing_pg, node_name)) - also_dropped
         )
-        if not blocking:
-            continue
-        plural = len(blocking) > 1
-        raise ValueError(
-            f"Cannot remove Omnigraph node type {node_name!r}: edge "
-            f"type{'s' if plural else ''} {blocking!r} still "
-            f"{'reference' if plural else 'references'} it as an endpoint, "
-            f"and the engine rejects a schema with an unresolved endpoint. "
-            f"Stop declaring {'those edge types' if plural else 'that edge type'} "
-            f"as well, or keep the node type. A `@key` change counts here too: "
-            f"it drops and recreates the type, so its endpoints go with it."
+        if edge_names:
+            blocked.append(_BlockedRemoval(node_name, is_drop, edge_names))
+    return blocked
+
+
+def _orphaned_endpoint_error(
+    blocked: _BlockedRemoval, *, foreign: Sequence[str]
+) -> ValueError:
+    plural = len(blocked.edge_names) > 1
+    if foreign:
+        many = len(foreign) > 1
+        advice = (
+            f"{list(foreign)!r} {'are' if many else 'is'} not managed by this "
+            f"connector (no `{MANAGED_MARKER}` in the block), so "
+            f"{'they' if many else 'it'} will not be removed for you: remove "
+            f"{'them' if many else 'it'} from the schema yourself, or keep the "
+            f"node type."
         )
+    else:
+        advice = (
+            f"Stop declaring {'those edge types' if plural else 'that edge type'} "
+            f"as well, or keep the node type. A `@key` change counts here too: it "
+            f"drops and recreates the type, so its endpoints go with it."
+        )
+    return ValueError(
+        f"Cannot remove Omnigraph node type {blocked.node_name!r}: edge "
+        f"type{'s' if plural else ''} {blocked.edge_names!r} still "
+        f"{'reference' if plural else 'references'} it as an endpoint, "
+        f"and the engine rejects a schema with an unresolved endpoint. {advice}"
+    )
 
 
 async def _apply_type_schema(
@@ -1474,7 +1505,6 @@ async def _apply_type_schema(
 async def _apply_type_schema_locked(
     client: _CliClient, pending: Sequence[_TypeAction]
 ) -> None:
-
     # Before the `init` path below, not after it: on a fresh graph that path
     # returns first, so a clash inside the very first batch was never checked.
     _check_no_kind_clash_within_batch(pending)
@@ -1497,7 +1527,27 @@ async def _apply_type_schema_locked(
         return
 
     _check_no_kind_clash(existing, pending)
-    _check_no_orphaned_edge_endpoints(existing, pending)
+
+    # A node type's drop may find a connector-managed edge type still
+    # pointing at it. Every mounted type is its own component and all of
+    # them share one sink batcher, so when an app is dropped the edge type's
+    # own removal is queued behind this very batch — waiting for it here
+    # deadlocks until a timeout (verified live). Its removal is coming
+    # regardless, so take the connector's own edge types along now; the
+    # edge's batch then finds nothing left to remove. An edge type without
+    # the ownership marker is a user's or another tool's and is never
+    # removed on their behalf, and a `@key` change keeps the edge declared,
+    # so both still fail here.
+    taken_along: list[str] = []
+    for removal in _blocked_node_removals(existing, pending):
+        foreign = [
+            name
+            for name in removal.edge_names
+            if not is_connector_managed(existing, "edge", name)
+        ]
+        if not removal.is_drop or foreign:
+            raise _orphaned_endpoint_error(removal, foreign=foreign)
+        taken_along.extend(removal.edge_names)
 
     replaced = [
         (a.key.type_kind, a.key.type_name)
@@ -1511,17 +1561,23 @@ async def _apply_type_schema_locked(
         await _apply_schema_recovering_abandoned_branches(client, intermediate)
         existing = intermediate
 
+    desired = existing
     for action in pending:
         if coco.is_non_existence(action.spec):
-            existing = remove_type_from_schema(
-                existing, action.key.type_kind, action.key.type_name
+            desired = remove_type_from_schema(
+                desired, action.key.type_kind, action.key.type_name
             )
         else:
             assert action.pg_fragment is not None
-            existing = merge_type_into_schema(
-                existing, action.key.type_kind, action.key.type_name, action.pg_fragment
+            desired = merge_type_into_schema(
+                desired, action.key.type_kind, action.key.type_name, action.pg_fragment
             )
-    await _apply_schema_recovering_abandoned_branches(client, existing)
+    for edge_name in taken_along:
+        desired = remove_type_from_schema(desired, "edge", edge_name)
+    # An unchanged schema needs no write — the edge type's own removal
+    # arriving after a node's batch took it along is the common case.
+    if desired != existing:
+        await _apply_schema_recovering_abandoned_branches(client, desired)
 
 
 async def _apply_type_actions(

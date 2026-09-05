@@ -18,6 +18,13 @@ from typing import NamedTuple
 #: entity for deletion. Non-nullable, which is legal at init time.
 COCO_KEY = "coco_key"
 
+#: Trailing comment on the `coco_key` line of every block this connector
+#: renders. `schema show` returns the source verbatim, comments included, so
+#: it survives every round trip — and it is how the schema sink tells the
+#: connector's own types from ones a user declared: a `managed_by=user` type
+#: must declare `coco_key` as well, so the property alone cannot.
+MANAGED_MARKER = "// managed by cocoindex"
+
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 #: Scalar type keywords `.pg`/`.gq` accept. `DateTime` must precede `Date` in
@@ -139,9 +146,13 @@ def render_node_type(
         f"  {render_property(name, pg_type, is_key=name in key)}"
         for name, pg_type in properties
     ]
-    lines.append(f"  {render_property(COCO_KEY, 'String', is_key=False)}")
+    lines.append(_render_coco_key_line())
     body = "\n".join(lines)
     return f"node {type_name} {{\n{body}\n}}"
+
+
+def _render_coco_key_line() -> str:
+    return f"  {render_property(COCO_KEY, 'String', is_key=False)} {MANAGED_MARKER}"
 
 
 def render_edge_type(
@@ -158,7 +169,7 @@ def render_edge_type(
         f"  {render_property(name, pg_type, is_key=False)}"
         for name, pg_type in properties
     ]
-    lines.append(f"  {render_property(COCO_KEY, 'String', is_key=False)}")
+    lines.append(_render_coco_key_line())
     body = "\n".join(lines)
     return f"edge {type_name}: {from_type} -> {to_type} {{\n{body}\n}}"
 
@@ -303,6 +314,14 @@ def _find_type_block(
             f"{len(matching)} times; refusing to edit an ambiguous schema"
         )
     return matching[0].start, matching[0].end
+
+
+def is_connector_managed(existing_pg: str, kind: str, type_name: str) -> bool:
+    """Whether the block for `kind` `type_name` carries `MANAGED_MARKER` —
+    present on every block this connector renders, and on nothing a user or
+    another tool wrote."""
+    span = _find_type_block(existing_pg, kind, type_name)
+    return span is not None and MANAGED_MARKER in existing_pg[span[0] : span[1]]
 
 
 def merge_type_into_schema(

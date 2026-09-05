@@ -132,16 +132,22 @@ class TestRenderProperty:
 
 
 class TestRenderNodeType:
-    def test_injects_coco_key(self) -> None:
+    def test_injects_coco_key_and_the_ownership_marker(self) -> None:
+        """Every block this connector renders carries `coco_key` and, on that
+        line, a `// managed by cocoindex` comment. The comment is what lets
+        the schema sink tell its own types from ones a user declared — a
+        user-managed type must declare `coco_key` too, so the property
+        alone cannot."""
         assert render_node_type(
             "Source", [("slug", "String"), ("title", "String")], key=("slug",)
         ) == (
-            "node Source {\n  slug: String @key\n  title: String\n  coco_key: String\n}"
+            "node Source {\n  slug: String @key\n  title: String\n"
+            "  coco_key: String // managed by cocoindex\n}"
         )
 
     def test_zero_properties_still_gets_coco_key(self) -> None:
         assert render_node_type("Empty", [], key=()) == (
-            "node Empty {\n  coco_key: String\n}"
+            "node Empty {\n  coco_key: String // managed by cocoindex\n}"
         )
 
     def test_composite_key_raises(self) -> None:
@@ -182,14 +188,16 @@ class TestRenderNodeType:
 class TestRenderEdgeType:
     def test_no_properties_still_gets_coco_key(self) -> None:
         assert render_edge_type("Supports", "Source", "Claim", []) == (
-            "edge Supports: Source -> Claim {\n  coco_key: String\n}"
+            "edge Supports: Source -> Claim {\n"
+            "  coco_key: String // managed by cocoindex\n}"
         )
 
     def test_with_properties(self) -> None:
         assert render_edge_type(
             "WorksAt", "Person", "Company", [("role", "String")]
         ) == (
-            "edge WorksAt: Person -> Company {\n  role: String\n  coco_key: String\n}"
+            "edge WorksAt: Person -> Company {\n  role: String\n"
+            "  coco_key: String // managed by cocoindex\n}"
         )
 
 
@@ -247,7 +255,7 @@ class TestMergeTypeIntoSchema:
         merged = merge_type_into_schema(existing, "edge", "E", e2)
         assert "node A {\n  slug: String @key\n  coco_key: String\n}" in merged
         assert "node B {\n  slug: String @key\n  coco_key: String\n}" in merged
-        assert "edge E: A -> B {\n  weight: I64\n  coco_key: String\n}" in merged
+        assert e2 in merged
         # The old brace-less form must be gone -- not just shadowed by the
         # new braced one, which also starts with "edge E: A -> B".
         assert "edge E: A -> B\n" not in merged
@@ -904,7 +912,8 @@ class TestTypeMapping:
 
         schema = await NodeSchema.from_class(_Src, key="slug")
         assert schema.render("Source") == (
-            "node Source {\n  slug: String @key\n  title: String\n  coco_key: String\n}"
+            "node Source {\n  slug: String @key\n  title: String\n"
+            "  coco_key: String // managed by cocoindex\n}"
         )
 
 
@@ -3219,37 +3228,73 @@ class TestOrphanedEdgeEndpoints:
     """Removing a node type that an edge type still points at.
 
     The engine rejects the resulting schema outright (`catalog error: edge
-    'WorksAt' has an unresolved endpoint`, verified against the binary), and
-    edge types reconcile under a separate provider so they are never in the
-    same batch to be removed alongside.
+    'WorksAt' has an unresolved endpoint`, verified against the binary).
+    Every mounted type is its own processing component, and all of them
+    share one sink batcher — so when an app is dropped, the node type's
+    removal can run alone while the edge type's removal waits behind it in
+    the batcher's queue. Waiting inside the sink can therefore never see
+    the edge go: the node's batch has to take the connector's own edge
+    types along, and leave everyone else's in place.
     """
 
+    _MARKED = "  coco_key: String // managed by cocoindex\n"
     SCHEMA = (
-        "node Person {\n  slug: String @key\n  coco_key: String\n}\n"
-        "node Company {\n  slug: String @key\n  coco_key: String\n}\n"
-        "edge WorksAt: Person -> Company {\n  coco_key: String\n}\n"
+        f"node Person {{\n  slug: String @key\n{_MARKED}}}\n"
+        f"node Company {{\n  slug: String @key\n{_MARKED}}}\n"
+        f"edge WorksAt: Person -> Company {{\n{_MARKED}}}\n"
+    )
+    #: The same graph with an edge type the connector did not create: no
+    #: ownership marker, though it declares `coco_key` the way a
+    #: `managed_by=user` type must.
+    SCHEMA_WITH_FOREIGN_EDGE = SCHEMA.replace(
+        f"edge WorksAt: Person -> Company {{\n{_MARKED}}}\n",
+        "edge WorksAt: Person -> Company {\n  coco_key: String\n}\n",
     )
 
     @staticmethod
-    def _mock(monkeypatch: pytest.MonkeyPatch, schema: str) -> None:
+    def _mock(monkeypatch: pytest.MonkeyPatch, schema: str) -> list[str]:
+        """Serve `schema` on every read; return the list every write lands in."""
+        applied: list[str] = []
+
         async def fake_read_schema(self: object) -> str | None:
             return schema
 
-        async def fail_apply(self: object, pg_fragment: str) -> None:
-            raise AssertionError("must not write a schema with a dangling endpoint")
+        async def record_apply(self: object, pg_fragment: str) -> None:
+            applied.append(pg_fragment)
 
         monkeypatch.setattr(_CliClient, "read_schema", fake_read_schema)
-        monkeypatch.setattr(_CliClient, "apply_schema", fail_apply)
+        monkeypatch.setattr(_CliClient, "apply_schema", record_apply)
+        return applied
 
     @pytest.mark.asyncio
-    async def test_dropping_a_referenced_node_type_is_refused(
+    async def test_dropping_a_node_type_takes_its_own_edge_types_along(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        self._mock(monkeypatch, self.SCHEMA)
-        with pytest.raises(ValueError, match="WorksAt"):
+        """Dropping Person while WorksAt is still declared: WorksAt carries
+        the connector's marker, so its own removal is coming (it is queued
+        behind this very batch when the app is dropped), and taking it
+        along now is exactly what that removal would do. Company stays."""
+        applied = self._mock(monkeypatch, self.SCHEMA)
+        await ogt._apply_type_schema(
+            _client(), [_type_action("delete", "Person", None)]
+        )
+        (final,) = applied
+        assert "node Person" not in final and "edge WorksAt" not in final
+        assert "node Company" in final
+
+    @pytest.mark.asyncio
+    async def test_dropping_a_node_type_referenced_by_a_foreign_edge_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No marker means the edge type is a user's (`managed_by=user`,
+        which must declare `coco_key` too) or another tool's. The connector
+        never removes those, so the drop fails naming it and writes nothing."""
+        applied = self._mock(monkeypatch, self.SCHEMA_WITH_FOREIGN_EDGE)
+        with pytest.raises(ValueError, match=r"WorksAt.*not managed by this connector"):
             await ogt._apply_type_schema(
                 _client(), [_type_action("delete", "Person", None)]
             )
+        assert applied == []
 
     @pytest.mark.asyncio
     async def test_key_changing_a_referenced_node_type_is_refused(
@@ -3257,8 +3302,9 @@ class TestOrphanedEdgeEndpoints:
     ) -> None:
         """A `@key` change is a drop-and-recreate: the FIRST of its two
         applies lands the schema with the node type removed, so the dangling
-        endpoint appears there even though the final schema would be sound."""
-        self._mock(monkeypatch, self.SCHEMA)
+        endpoint appears there even though the final schema would be sound.
+        The edge stays declared, marker or not, so it is never taken along."""
+        applied = self._mock(monkeypatch, self.SCHEMA)
         with pytest.raises(ValueError, match="WorksAt"):
             await ogt._apply_type_schema(
                 _client(),
@@ -3270,6 +3316,7 @@ class TestOrphanedEdgeEndpoints:
                     )
                 ],
             )
+        assert applied == []
 
     @pytest.mark.asyncio
     async def test_dropping_the_edge_type_too_is_allowed(
@@ -3298,6 +3345,20 @@ class TestOrphanedEdgeEndpoints:
         )
         assert applied and "Person" not in applied[-1]
         assert "WorksAt" not in applied[-1]
+
+    @pytest.mark.asyncio
+    async def test_removing_an_edge_type_already_taken_along_writes_nothing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The edge type's own removal, arriving after the node's batch took
+        it along, finds nothing to remove and must not spend a `schema
+        apply` on an unchanged schema."""
+        already_gone = remove_type_from_schema(self.SCHEMA, "edge", "WorksAt")
+        applied = self._mock(monkeypatch, already_gone)
+        await ogt._apply_type_schema(
+            _client(), [_type_action("delete", "WorksAt", None, type_kind="edge")]
+        )
+        assert applied == []
 
 
 class TestPublicSurface:
@@ -5742,3 +5803,42 @@ class TestEndToEnd:
         assert "node Other {" in source and "node Extra {" in source
         (row,) = [r for r in _export_rows(store) if r.get("type") == "Source"]
         assert row["data"]["note"] == "n"
+
+    def test_dropping_a_connected_app_removes_every_type(self, store: str) -> None:
+        """Source, Claim and Supports are three processing components, torn
+        down concurrently by `drop()`. Whichever node type's removal ran
+        ahead of the edge's used to hit the endpoint guard and stay behind,
+        so the first drop failed and only a second one finished the job.
+        One drop must leave nothing."""
+        db = _e2e_db(store, "drop_connected")
+
+        async def main() -> None:
+            sources = await omnigraph.mount_node_target(
+                db, "Source", await NodeSchema.from_class(_ScSourceNarrow, key="slug")
+            )
+            claims = await omnigraph.mount_node_target(
+                db, "Claim", await NodeSchema.from_class(_ScClaim, key="slug")
+            )
+            supports = await omnigraph.mount_edge_target(
+                db,
+                "Supports",
+                sources,
+                claims,
+                await NodeSchema.from_class(_ScEdgeProps, key="weight"),
+            )
+            sources.declare_node(node=_ScSourceNarrow(slug="a", title="A"))
+            claims.declare_node(node=_ScClaim(slug="c1"))
+            supports.declare_edge(
+                from_id="a", to_id="c1", record=_ScEdgeProps(weight=1)
+            )
+
+        app = coco.App(
+            coco.AppConfig(name="e2e_drop_connected", environment=coco_env), main
+        )
+        app.update_blocking()
+        assert "edge Supports" in _read_schema_source(store)
+
+        app.drop_blocking()
+
+        assert _read_schema_source(store).strip() == ""
+        assert _export_rows(store) == []

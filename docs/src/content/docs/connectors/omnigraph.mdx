@@ -181,7 +181,7 @@ Omnigraph assigns every edge its own internal id (a ULID) that isn't addressable
 
 ### The synthetic `coco_key` property
 
-Every type this connector manages — node or edge — gets one extra, non-nullable property: `coco_key: String`. You never set it yourself; it isn't a field on your dataclass, and declaring a property literally named `coco_key` raises `ValueError`.
+Every type this connector manages — node or edge — gets one extra, non-nullable property: `coco_key: String`. You never set it yourself; it isn't a field on your dataclass, and declaring a property literally named `coco_key` raises `ValueError`. The connector also writes a trailing `// managed by cocoindex` comment on that line. Omnigraph preserves comments in `schema show`, and that marker is how the connector tells the types it created from ones you declared — don't copy it into a `managed_by="user"` block.
 
 It exists because Omnigraph gives the connector no other way to address one specific entity for an update or delete:
 
@@ -315,6 +315,8 @@ The check is against what CocoIndex has previously *tracked*, not against the li
 
 Removing a `managed_by="user"` type from your app is also never destructive: the connector didn't create the type and won't drop it.
 
+**Dropping a node type that an edge type still references.** Omnigraph rejects a schema with an unresolved endpoint, and each mounted type is torn down by its own component — so when you drop an app, or stop declaring a node type and its edge types together, the node type's removal may reach the graph before the edge type's. The connector removes its own referencing edge types (those whose block carries the `// managed by cocoindex` marker) in the same schema write; the edge type's own removal then finds nothing left to do. An edge type without the marker — one you declared with `managed_by="user"`, or another tool's — is never removed on your behalf: the drop fails naming it, and you either remove it from the schema yourself or keep the node type. A `@key` change on a referenced node type fails the same way, since the edge stays declared.
+
 ### Cross-component ordering
 
 An edge's endpoint node is routinely owned by a *different* component than the edge itself — in a per-file pipeline, a corpus-wide "attended" edge might reference a `Meeting` node a per-file component declares independently, and the two commit on their own schedules. The connector handles an edge arriving before its endpoint reactively: it applies the edge insert optimistically first, and only on an engine "not found" failure does it insert a key-only stub for the reported-missing endpoint and retry — one stub-and-retry round per distinct endpoint the component's edges reference, since the engine names only the first missing endpoint per attempt. The endpoint's own owning component later upserts its real row over the stub (a keyed `insert` is an upsert), so nothing is duplicated. Stubbing reactively rather than unconditionally matters: a keyed `insert` is a full-record *replace* in Omnigraph, not a partial merge, so stubbing an endpoint that already has real data would silently null out its other nullable properties.
@@ -391,17 +393,17 @@ Generated schema:
 node Source {
   slug: String @key
   title: String?
-  coco_key: String
+  coco_key: String // managed by cocoindex
 }
 
 node Claim {
   slug: String @key
   statement: String?
-  coco_key: String
+  coco_key: String // managed by cocoindex
 }
 
 edge Supports: Source -> Claim {
-  coco_key: String
+  coco_key: String // managed by cocoindex
 }
 ```
 

@@ -306,6 +306,80 @@ class TestMergeTypeIntoSchema:
         with pytest.raises(ValueError, match="must be 'node' or 'edge'"):
             merge_type_into_schema("", "relation", "A", "node A {\n}")
 
+    # `schema show` returns the source exactly as it was written (verified
+    # against the engine), so a schema a person wrote or edited by hand keeps
+    # its formatting — and a merger that only recognised `node X {` at the
+    # start of a line, ended blocks at the first `}` it saw, and appended
+    # what it failed to find, produced schemas the engine then refused
+    # ("duplicate node name", "expected EOI or schema_decl").
+
+    def test_finds_an_indented_block(self) -> None:
+        existing = "  node Person {\n    slug: String @key\n    coco_key: String\n  }\n"
+        frag = render_node_type(
+            "Person", [("slug", "String"), ("age", "I64?")], key=("slug",)
+        )
+        merged = merge_type_into_schema(existing, "node", "Person", frag)
+        assert merged.count("node Person") == 1
+        assert frag in merged
+        assert "    slug: String @key" not in merged
+
+    def test_finds_the_second_of_two_declarations_on_one_line(self) -> None:
+        person = "node Person { slug: String @key coco_key: String }"
+        company = "node Company { slug: String @key coco_key: String }"
+        existing = f"{person} {company}\n"
+        frag = render_node_type(
+            "Company", [("slug", "String"), ("name", "String?")], key=("slug",)
+        )
+        merged = merge_type_into_schema(existing, "node", "Company", frag)
+        assert merged.count("node Company") == 1
+        assert person in merged
+        assert frag in merged
+
+    def test_a_brace_inside_a_comment_does_not_end_the_block(self) -> None:
+        existing = (
+            "node Person {\n  slug: String @key // closes } here\n  coco_key: String\n}\n\n"
+            "node Company {\n  slug: String @key\n  coco_key: String\n}\n"
+        )
+        frag = render_node_type(
+            "Person", [("slug", "String"), ("age", "I64?")], key=("slug",)
+        )
+        merged = merge_type_into_schema(existing, "node", "Person", frag)
+        assert merged.count("node Person") == 1
+        assert "} here" not in merged
+        assert "node Company {\n  slug: String @key\n  coco_key: String\n}" in merged
+
+    def test_a_declaration_inside_a_comment_is_not_a_block(self) -> None:
+        existing = (
+            "// node Ghost { slug: String @key }\n"
+            "node A {\n  slug: String @key\n  coco_key: String\n}\n"
+        )
+        assert remove_type_from_schema(existing, "node", "Ghost") == existing
+        frag = render_node_type(
+            "A", [("slug", "String"), ("t", "String?")], key=("slug",)
+        )
+        merged = merge_type_into_schema(existing, "node", "A", frag)
+        assert merged.startswith("// node Ghost { slug: String @key }\n")
+        assert merged.count("node A") == 1
+
+    def test_a_property_named_like_a_keyword_is_not_a_block(self) -> None:
+        existing = (
+            "node A {\n  slug: String @key\n  edge: String?\n  node: String?\n"
+            "  coco_key: String\n}\n"
+        )
+        assert remove_type_from_schema(existing, "edge", "String") == existing
+        frag = render_node_type("A", [("slug", "String")], key=("slug",))
+        assert merge_type_into_schema(existing, "node", "A", frag) == frag + "\n"
+
+    def test_edge_endpoints_are_read_from_an_indented_declaration(self) -> None:
+        from cocoindex.connectors.omnigraph._gq import edge_types_referencing
+
+        existing = (
+            "node A {\n  slug: String @key\n  coco_key: String\n}\n"
+            "  edge E: A -> A {\n    coco_key: String\n  }\n"
+            "// edge Ghost: A -> A\n"
+        )
+        assert edge_types_referencing(existing, "A") == ["E"]
+
 
 class TestRemoveTypeFromSchema:
     """The first half of the two-step `@key`-change rebuild: the engine
@@ -5632,3 +5706,39 @@ class TestEndToEnd:
         assert row["data"]["title"] == "T"
         # The connector still never wrote the schema: the user's block is verbatim.
         assert _read_schema_source(store) == v2
+
+    def test_hand_formatted_schema_survives_a_merge(self, store: str) -> None:
+        """`schema show` hands back the source verbatim, formatting and all,
+        so a schema somebody wrote by hand — indented, commented, two
+        declarations on one line — is what the merger has to edit. Each of
+        those used to produce a schema the engine refused."""
+        store_dir = Path(store[len("file://") :])
+        hand_written = (
+            "  node Source {\n"
+            "    slug: String @key // the key } not a block end\n"
+            "    title: String?\n"
+            "    coco_key: String\n"
+            "  }\n"
+            "node Other { slug: String @key coco_key: String } "
+            "node Extra { slug: String @key coco_key: String }\n"
+        )
+        assert _init_live(store_dir, hand_written).returncode == 0
+        db = _e2e_db(store, "hand_formatted")
+
+        async def main() -> None:
+            sources = await omnigraph.mount_node_target(
+                db, "Source", await NodeSchema.from_class(_ScSourceWide, key="slug")
+            )
+            sources.declare_node(node=_ScSourceWide(slug="a", title="A", note="n"))
+
+        app = coco.App(
+            coco.AppConfig(name="e2e_hand_formatted", environment=coco_env), main
+        )
+        app.update_blocking()
+
+        source = _read_schema_source(store)
+        assert source.count("node Source") == 1
+        assert "note: String?" in source
+        assert "node Other {" in source and "node Extra {" in source
+        (row,) = [r for r in _export_rows(store) if r.get("type") == "Source"]
+        assert row["data"]["note"] == "n"

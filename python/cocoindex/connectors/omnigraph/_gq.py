@@ -163,27 +163,114 @@ def render_edge_type(
     return f"edge {type_name}: {from_type} -> {to_type} {{\n{body}\n}}"
 
 
-#: The start of a type block: `node NAME {` or `edge NAME:` at the
-#: beginning of a line. Both forms this connector's own builders emit,
-#: braced or not, share this prefix. The KIND is captured, not just the
-#: name — a `.pg` may legally hold `node Link` and `edge Link` side by side
-#: (the engine accepts it), and matching on the name alone made an edge's
-#: fragment overwrite the node's block, destroying the node type and
-#: leaving two `edge Link` blocks behind.
-_TYPE_BLOCK_START_RE = re.compile(r"^(node|edge)\s+(\w+)\b", re.MULTILINE)
+#: A `//` line comment. Blanked out — replaced by spaces of the same length,
+#: so every offset stays valid — before the schema is scanned: `schema show`
+#: returns the source verbatim, comments included, and a `}` or a `node X {`
+#: inside one is text, not structure. `//` is the only comment syntax the
+#: engine accepts (`#` and `--` are parse errors, verified against the
+#: binary).
+_COMMENT_RE = re.compile(r"//[^\n]*")
 
-#: An edge block's declaration line: `edge NAME: FROM -> TO`. Matches what
-#: `render_edge_type` emits and what the engine accepts.
-_EDGE_ENDPOINTS_RE = re.compile(r"^edge\s+(\w+)\s*:\s*(\w+)\s*->\s*(\w+)", re.MULTILINE)
+#: The head of a type declaration: `node NAME` or `edge NAME`, anywhere in
+#: the source — not only at the start of a line. A hand-written schema may
+#: indent its blocks or put two declarations on one line, and `schema show`
+#: preserves both, so a merger that only recognised `node X {` at a line
+#: start appended a second block and the engine refused the result
+#: ("duplicate node name"). The KIND is captured, not just the name: a `.pg`
+#: may legally hold `node Link` and `edge Link` side by side (the engine
+#: accepts it), and matching on the name alone made an edge's fragment
+#: overwrite the node's block.
+_TYPE_HEAD_RE = re.compile(r"\b(node|edge)\s+(\w+)\b")
+
+#: The rest of an edge head, right after `edge NAME`: `: FROM -> TO`.
+_EDGE_ENDPOINTS_RE = re.compile(r"\s*:\s*(\w+)\s*->\s*(\w+)")
+
+#: Optional whitespace and then the opening brace of a block body.
+_BODY_OPEN_RE = re.compile(r"\s*\{")
+
+
+class _TypeBlock(NamedTuple):
+    kind: str
+    name: str
+    #: Span into the ORIGINAL source, comments and formatting included.
+    start: int
+    end: int
+    #: Edge endpoints; `None` for a node.
+    from_type: str | None
+    to_type: str | None
+
+
+def _scan_type_blocks(existing_pg: str) -> list[_TypeBlock]:
+    """Every top-level type block in `existing_pg`, in source order.
+
+    Scans a comment-blanked copy of the same length, so spans line up with
+    the original. A block starts at `node NAME` / `edge NAME` and ends at
+    the matching `}` of its braced body, or — for the brace-less `edge
+    NAME: FROM -> TO` form, a property-less edge the engine both accepts
+    and reproduces via `schema show` — right after the `TO` endpoint. This
+    connector's own builders always add `coco_key`, so they never emit the
+    brace-less form, but the schema being searched can legitimately contain
+    it, from another tool or a `managed_by=user` type. Scanning resumes
+    after each block's end, so a property named `node` or `edge` inside a
+    body is never mistaken for a declaration.
+
+    Raises rather than guessing on a schema it can't edit safely — a node
+    head with no body, an edge head with no endpoints, or braces that never
+    balance: either way the splice point would land mid-declaration and
+    produce corrupt `.pg` that goes straight to `schema apply`.
+    """
+    text = _COMMENT_RE.sub(lambda m: " " * len(m.group(0)), existing_pg)
+    blocks: list[_TypeBlock] = []
+    pos = 0
+    while (head := _TYPE_HEAD_RE.search(text, pos)) is not None:
+        kind, name = head.group(1), head.group(2)
+        body_start = head.end()
+        from_type = to_type = None
+        if kind == "edge":
+            endpoints = _EDGE_ENDPOINTS_RE.match(text, body_start)
+            if endpoints is None:
+                raise ValueError(
+                    f"Omnigraph schema declares edge {name!r} without "
+                    f"`: FROM -> TO` endpoints; refusing to edit it"
+                )
+            from_type, to_type = endpoints.group(1), endpoints.group(2)
+            body_start = endpoints.end()
+        body = _BODY_OPEN_RE.match(text, body_start)
+        if body is None:
+            if kind == "node":
+                raise ValueError(
+                    f"Omnigraph schema declares node {name!r} without a "
+                    f"`{{ ... }}` body; refusing to edit it"
+                )
+            end = body_start
+        else:
+            depth = 0
+            end = -1
+            for i in range(body.end() - 1, len(text)):
+                if text[i] == "{":
+                    depth += 1
+                elif text[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+            if end == -1:
+                raise ValueError(
+                    f"Omnigraph schema has an unterminated {kind} {name!r} block "
+                    f"(unbalanced braces); refusing to edit it"
+                )
+        blocks.append(_TypeBlock(kind, name, head.start(), end, from_type, to_type))
+        pos = end
+    return blocks
 
 
 def edge_types_referencing(existing_pg: str, node_type_name: str) -> list[str]:
     """Names of edge types in `existing_pg` that use `node_type_name` as an
     endpoint. Used to refuse removing a node type out from under one."""
     return [
-        m.group(1)
-        for m in _EDGE_ENDPOINTS_RE.finditer(existing_pg)
-        if node_type_name in (m.group(2), m.group(3))
+        block.name
+        for block in _scan_type_blocks(existing_pg)
+        if block.kind == "edge" and node_type_name in (block.from_type, block.to_type)
     ]
 
 
@@ -195,29 +282,19 @@ def _find_type_block(
 
     `kind` is `"node"` or `"edge"` and is part of the match, not a hint: a
     node and an edge may share a name in a valid `.pg`, and editing the
-    wrong one silently destroys a type.
+    wrong one silently destroys a type. See `_scan_type_blocks` for what a
+    block's extent is.
 
-    Block boundaries: a block starts at `node NAME {` or `edge NAME:` at
-    the beginning of a line, and ends at the matching `}` for a braced
-    block, or at the end of that line for the brace-less `edge NAME: FROM
-    -> TO` form — a property-less edge, which the engine both accepts and
-    reproduces via `schema show` in exactly that form (verified against
-    the binary; a node, by contrast, can never be brace-less — `node NAME`
-    alone is a parse error). This connector's own builders always add
-    `coco_key`, so they never emit the brace-less form themselves, but the
-    *existing* schema being searched can legitimately contain it, from
-    another tool or a `managed_by=user` type.
-
-    Raises rather than guessing on a schema it can't edit safely: two
-    blocks with the same kind and name (only the first would ever be
-    rewritten, leaving the second as a stale duplicate), or unbalanced
-    braces (where the splice point would land ON the opening brace and
-    produce corrupt `.pg` that goes straight to `schema apply`).
+    Raises on two blocks with the same kind and name: only the first would
+    ever be rewritten, leaving the second as a stale duplicate.
     """
     if kind not in ("node", "edge"):
         raise ValueError(f"type kind must be 'node' or 'edge', got {kind!r}")
-    starts = list(_TYPE_BLOCK_START_RE.finditer(existing_pg))
-    matching = [m for m in starts if (m.group(1), m.group(2)) == (kind, type_name)]
+    matching = [
+        block
+        for block in _scan_type_blocks(existing_pg)
+        if (block.kind, block.name) == (kind, type_name)
+    ]
     if not matching:
         return None
     if len(matching) > 1:
@@ -225,28 +302,7 @@ def _find_type_block(
             f"Omnigraph schema declares {kind} {type_name!r} "
             f"{len(matching)} times; refusing to edit an ambiguous schema"
         )
-    m = matching[0]
-    start = m.start()
-    next_start = next(
-        (later.start() for later in starts if later.start() > m.start()), None
-    )
-    brace_pos = existing_pg.find("{", m.end())
-    if brace_pos == -1 or (next_start is not None and brace_pos > next_start):
-        # Brace-less: this block is just the one line.
-        newline = existing_pg.find("\n", m.end())
-        return start, (newline if newline != -1 else len(existing_pg))
-    depth = 0
-    for i in range(brace_pos, len(existing_pg)):
-        if existing_pg[i] == "{":
-            depth += 1
-        elif existing_pg[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return start, i + 1
-    raise ValueError(
-        f"Omnigraph schema has an unterminated {kind} {type_name!r} block "
-        f"(unbalanced braces); refusing to edit it"
-    )
+    return matching[0].start, matching[0].end
 
 
 def merge_type_into_schema(

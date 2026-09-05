@@ -174,7 +174,7 @@ Omnigraph assigns every edge its own internal id (a ULID) that isn't addressable
 
 ### The synthetic `coco_key` property
 
-Every type this connector manages — node or edge — gets one extra, non-nullable property: `coco_key: String`. You never set it yourself; it isn't a field on your dataclass, and declaring a property literally named `coco_key` raises `ValueError`. Every type the connector created also declares a second synthetic property, `coco_managed: Bool?`, which is never written and stays `null` on every row: it is how the connector tells the types it currently owns from ones you declared. Don't declare it on a `managed_by="user"` block, and don't name a field `coco_managed` (that raises `ValueError` too).
+Every type this connector manages — node or edge — gets one extra, non-nullable property: `coco_key: String`. You never set it yourself; it isn't a field on your dataclass, and declaring a property literally named `coco_key` raises `ValueError`. Every type the connector created also declares a second synthetic property, `coco_managed_by_<app>: Bool?` — the app being your `AppConfig.name`, made an identifier if it isn't one — which is never written and stays `null` on every row: it is how the connector tells the types this app currently owns from ones you declared and from another app's. Don't declare it on a `managed_by="user"` block. Every property name starting with `coco_` is reserved for these; a dataclass field named that way raises `ValueError`.
 
 It exists because Omnigraph gives the connector no other way to address one specific entity for an update or delete:
 
@@ -298,7 +298,7 @@ For each managed type, the connector maintains a `.pg` fragment and reconciles i
 
 When `managed_by="user"` is set, the connector never mutates `.pg` for that type. Node/edge-level upserts and deletes still work normally — **provided your own `.pg` declares `coco_key: String` on that type.**
 
-The one exception is the handoff itself. When a type the connector created is re-declared with `managed_by="user"`, the next update writes once to drop the `coco_managed` property from its block and touches nothing else; from then on the block is yours, and a later drop of a node type it references refuses rather than removing it. Declaring it `managed_by="system"` again re-renders the block from your dataclass, `coco_managed` included, and the connector owns it once more.
+The one exception is the handoff itself. When a type the connector created is re-declared with `managed_by="user"`, the next update writes once to drop the `coco_managed_by_<app>` property from its block and touches nothing else; from then on the block is yours, and a later drop of a node type it references refuses rather than removing it. Declaring it `managed_by="system"` again re-renders the block from your dataclass, `coco_managed_by_<app>` included, and the connector owns it once more.
 
 :::caution[`managed_by="user"` types must declare `coco_key` yourself]
 The connector addresses every entity through the synthetic `coco_key` property, and under `managed_by="user"` it never writes the schema — so it cannot add that column for you. Every insert names `coco_key`, and every delete filters on it. Against a type whose `.pg` lacks it, *all* row writes fail with `type 'X' has no property 'coco_key'`.
@@ -318,7 +318,7 @@ The connector does not compare your declaration against the graph, on the first 
 
 Removing a `managed_by="user"` type from your app is also never destructive: the connector didn't create the type and won't drop it.
 
-**Dropping a node type that an edge type still references.** Omnigraph rejects a schema with an unresolved endpoint, and each mounted type is torn down by its own component — so when you drop an app, or stop declaring a node type and its edge types together, the node type's removal may reach the graph before the edge type's. The connector removes its own referencing edge types (those whose block declares `coco_managed`) in the same schema write; the edge type's own removal then finds nothing left to do. An edge type without that property — one you declared with `managed_by="user"`, or another tool's — is never removed on your behalf: the drop fails naming it, and you either remove it from the schema yourself or keep the node type. A `@key` change on a referenced node type fails the same way, since the edge stays declared.
+**Dropping a node type that an edge type still references.** Omnigraph rejects a schema with an unresolved endpoint, and each mounted type is torn down by its own component — so when you drop an app, or stop declaring a node type and its edge types together, the node type's removal may reach the graph before the edge type's. The connector removes the referencing edge types *this app* owns (those whose block declares its `coco_managed_by_<app>` property) in the same schema write; the edge type's own removal then finds nothing left to do. Any other edge type is never removed on your behalf — one another app of this connector owns (its block names that app), one you declared with `managed_by="user"`, or another tool's: the drop fails naming it and, where there is one, the app it belongs to, and you either have that app stop declaring it, remove it from the schema yourself, or keep the node type. A `@key` change on a referenced node type fails the same way, since the edge stays declared.
 
 ### Cross-component ordering
 
@@ -399,19 +399,19 @@ node Source {
   slug: String @key
   title: String?
   coco_key: String
-  coco_managed: Bool?
+  coco_managed_by_demo_to_omnigraph: Bool?
 }
 
 node Claim {
   slug: String @key
   statement: String?
   coco_key: String
-  coco_managed: Bool?
+  coco_managed_by_demo_to_omnigraph: Bool?
 }
 
 edge Supports: Source -> Claim {
   coco_key: String
-  coco_managed: Bool?
+  coco_managed_by_demo_to_omnigraph: Bool?
 }
 ```
 

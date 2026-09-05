@@ -7,6 +7,7 @@ Omnigraph. Mirrors the role `neo4j/_cypher.py` plays for the Neo4j connector.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Sequence
 from typing import NamedTuple
@@ -18,17 +19,45 @@ from typing import NamedTuple
 #: entity for deletion. Non-nullable, which is legal at init time.
 COCO_KEY = "coco_key"
 
-#: Synthetic, nullable, never-written property declared on every block this
-#: connector renders, and on nothing else. It is how the schema sink tells the
-#: connector's own types from ones a user declared: a `managed_by=user` type
-#: must declare `coco_key` as well, so that property alone cannot. It is a
-#: property rather than a comment because the engine stores an applied
+#: Prefix of every synthetic property this connector declares — `coco_key`
+#: and the ownership property below. A user's own property may not start
+#: with it.
+COCO_PREFIX = "coco_"
+
+#: Prefix of the synthetic, nullable, never-written property declared on
+#: every block this connector renders, and on nothing else; the rest of the
+#: name is the app that owns the block (see `ownership_property`). It is how
+#: the schema sink tells this app's types from a user's and from another
+#: app's: a `managed_by=user` type must declare `coco_key` as well, so that
+#: property alone cannot, and a marker that only said "some app of this
+#: connector" let one app's drop take another app's edge types along. It is
+#: a property rather than a comment because the engine stores an applied
 #: schema's source only when the apply changes something structural — a
 #: comment-only change reports `applied: false` and keeps the old source
-#: (verified against the binary), so a comment could never be released.
-COCO_MANAGED = "coco_managed"
+#: (verified against the binary), so a comment could never be released. And
+#: the app is in the property's *name* because the engine refuses to retype
+#: a property (`enum(a)` to `enum(b)` fails with "changing property type ...
+#: not supported"), while adding one nullable property and dropping another
+#: in a single apply is a migration it performs without flags — both
+#: verified against the binary.
+COCO_MANAGED_PREFIX = "coco_managed_by_"
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def ownership_property(app_name: str) -> str:
+    """The property marking a block as owned by the app named `app_name`.
+
+    An app name that is an identifier is used as is. Any other name is made
+    one, with a digest of the original appended so that two names which
+    sanitize alike (`my-app`, `my_app`) still get distinct properties.
+    """
+    if _IDENTIFIER_RE.fullmatch(app_name):
+        return f"{COCO_MANAGED_PREFIX}{app_name}"
+    sanitized = re.sub(r"[^A-Za-z0-9_]", "_", app_name)
+    digest = hashlib.sha256(app_name.encode()).hexdigest()[:8]
+    return f"{COCO_MANAGED_PREFIX}{sanitized}_{digest}"
+
 
 #: Scalar type keywords `.pg`/`.gq` accept. `DateTime` must precede `Date` in
 #: the alternation below so a caller can't rely on `Date` matching first and
@@ -112,12 +141,13 @@ _RESERVED_EDGE_PROPERTIES = ("id", "src", "dst", "from", "to")
 def _check_not_reserved(
     properties: Sequence[tuple[str, str]], type_name: str, reserved: Sequence[str]
 ) -> None:
-    for synthetic in (COCO_KEY, COCO_MANAGED):
-        if any(name == synthetic for name, _ in properties):
-            raise ValueError(
-                f"{synthetic!r} is reserved by the CocoIndex connector and cannot be "
-                f"declared on {type_name!r}"
-            )
+    synthetic = sorted(name for name, _ in properties if name.startswith(COCO_PREFIX))
+    if synthetic:
+        raise ValueError(
+            f"{synthetic!r} {'is' if len(synthetic) == 1 else 'are'} reserved by "
+            f"the CocoIndex connector (every name starting with {COCO_PREFIX!r} "
+            f"is) and cannot be declared on {type_name!r}"
+        )
     clashes = sorted({name for name, _ in properties} & set(reserved))
     if clashes:
         raise ValueError(
@@ -128,8 +158,13 @@ def _check_not_reserved(
 
 
 def render_node_type(
-    type_name: str, properties: Sequence[tuple[str, str]], key: tuple[str, ...]
+    type_name: str,
+    properties: Sequence[tuple[str, str]],
+    key: tuple[str, ...],
+    *,
+    owner: str,
 ) -> str:
+    """Render a node type's block, marked as owned by the app `owner`."""
     validate_identifier(type_name, "node type")
     _check_not_reserved(properties, type_name, _RESERVED_NODE_PROPERTIES)
     if len(key) > 1:
@@ -150,15 +185,15 @@ def render_node_type(
         f"  {render_property(name, pg_type, is_key=name in key)}"
         for name, pg_type in properties
     ]
-    lines.extend(_render_synthetic_properties())
+    lines.extend(_render_synthetic_properties(owner))
     body = "\n".join(lines)
     return f"node {type_name} {{\n{body}\n}}"
 
 
-def _render_synthetic_properties() -> list[str]:
+def _render_synthetic_properties(owner: str) -> list[str]:
     return [
         f"  {render_property(COCO_KEY, 'String', is_key=False)}",
-        f"  {render_property(COCO_MANAGED, 'Bool?', is_key=False)}",
+        f"  {render_property(ownership_property(owner), 'Bool?', is_key=False)}",
     ]
 
 
@@ -167,7 +202,10 @@ def render_edge_type(
     from_type: str,
     to_type: str,
     properties: Sequence[tuple[str, str]],
+    *,
+    owner: str,
 ) -> str:
+    """Render an edge type's block, marked as owned by the app `owner`."""
     validate_identifier(type_name, "edge type")
     validate_identifier(from_type, "node type")
     validate_identifier(to_type, "node type")
@@ -176,7 +214,7 @@ def render_edge_type(
         f"  {render_property(name, pg_type, is_key=False)}"
         for name, pg_type in properties
     ]
-    lines.extend(_render_synthetic_properties())
+    lines.extend(_render_synthetic_properties(owner))
     body = "\n".join(lines)
     return f"edge {type_name}: {from_type} -> {to_type} {{\n{body}\n}}"
 
@@ -351,19 +389,20 @@ def _find_type_block(
     return matching[0].start, matching[0].end
 
 
-#: A `coco_managed` declaration together with the whitespace that is its
-#: own: the line break and indentation before it, or the run of spaces
-#: before it in a one-line block — never more, or a release would eat the
-#: (blanked) comment ending the previous line.
+#: An ownership declaration together with the whitespace that is its own:
+#: the line break and indentation before it, or the run of spaces before it
+#: in a one-line block — never more, or a release would eat the (blanked)
+#: comment ending the previous line. Group 1 is the property's name.
 _COCO_MANAGED_DECL_RE = re.compile(
-    rf"(?:\n[ \t]*|[ \t]+)?\b{COCO_MANAGED}\s*:\s*Bool\??"
+    rf"(?:\n[ \t]*|[ \t]+)?\b({COCO_MANAGED_PREFIX}\w+)\s*:\s*Bool\??"
 )
 
 
-def is_connector_managed(existing_pg: str, kind: str, type_name: str) -> bool:
-    """Whether the block for `kind` `type_name` declares `COCO_MANAGED` —
-    present on every block this connector renders and currently owns, and
-    on nothing a user or another tool wrote.
+def ownership_marker(existing_pg: str, kind: str, type_name: str) -> str | None:
+    """The ownership property the block for `kind` `type_name` declares
+    (`coco_managed_by_<app>`, see `ownership_property`), or `None` for a
+    block no app of this connector currently owns — a user's, or another
+    tool's.
 
     Declarations only: the block is searched with its comments blanked, so
     a user-owned block whose comment merely mentions the property is not
@@ -371,19 +410,18 @@ def is_connector_managed(existing_pg: str, kind: str, type_name: str) -> bool:
     """
     span = _find_type_block(existing_pg, kind, type_name)
     if span is None:
-        return False
+        return None
     start, end = span
-    return (
-        _COCO_MANAGED_DECL_RE.search(_blank_comments(existing_pg)[start:end])
-        is not None
-    )
+    m = _COCO_MANAGED_DECL_RE.search(_blank_comments(existing_pg)[start:end])
+    return m.group(1) if m is not None else None
 
 
-def release_ownership(existing_pg: str, kind: str, type_name: str) -> str:
-    """Remove the `COCO_MANAGED` declaration from the block for `kind`
-    `type_name`, leaving everything else in it — comments included — and
-    the rest of the schema untouched. A no-op if the block is absent or
-    already released.
+def release_ownership(existing_pg: str, kind: str, type_name: str, marker: str) -> str:
+    """Remove the declaration of the ownership property `marker` from the
+    block for `kind` `type_name`, leaving everything else in it — comments
+    included — and the rest of the schema untouched. A no-op if the block
+    is absent or does not declare `marker`; another app's marker on the
+    block is that app's to release.
 
     This is the one schema write a `managed_by=user` declaration causes: a
     type the connector created and the app then handed to the user still
@@ -401,7 +439,8 @@ def release_ownership(existing_pg: str, kind: str, type_name: str) -> str:
     # Cut the declarations found on the comment-blanked view out of the
     # original text; offsets line up because blanking preserves length.
     for m in reversed(list(_COCO_MANAGED_DECL_RE.finditer(blanked))):
-        block = block[: m.start()] + block[m.end() :]
+        if m.group(1) == marker:
+            block = block[: m.start()] + block[m.end() :]
     return existing_pg[:start] + block + existing_pg[end:]
 
 
@@ -571,7 +610,7 @@ def _bind(props: Sequence[PropertyValue], prefix: str) -> tuple[list[Bind], list
     for prop in props:
         validate_identifier(prop.name, "property name")
         validate_pg_type(prop.pg_type)
-        if prop.name in (COCO_KEY, COCO_MANAGED):
+        if prop.name.startswith(COCO_PREFIX):
             raise ValueError(
                 f"{prop.name!r} is reserved by the CocoIndex connector and cannot be "
                 f"supplied as a property value"

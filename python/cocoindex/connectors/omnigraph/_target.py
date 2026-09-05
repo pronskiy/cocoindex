@@ -16,6 +16,7 @@ from typing import Any, Generic, Literal, NamedTuple
 
 import cocoindex as coco
 import msgspec
+from cocoindex._internal.component_ctx import current_app_name
 from cocoindex._internal.context_keys import ContextProvider
 from cocoindex._internal.datatype import TypeChecker
 from cocoindex._internal.memo_fingerprint import canonical_module_name
@@ -28,7 +29,6 @@ from cocoindex.connectors.omnigraph._client import (
     _CliClient,
 )
 from cocoindex.connectors.omnigraph._gq import (
-    COCO_MANAGED,
     PropertyValue,
     Query,
     Statement,
@@ -41,8 +41,9 @@ from cocoindex.connectors.omnigraph._gq import (
     build_node_upsert,
     edge_types_referencing,
     incident_edge_patterns,
-    is_connector_managed,
     merge_type_into_schema,
+    ownership_marker,
+    ownership_property,
     release_ownership,
     remove_type_from_schema,
     render_edge_type,
@@ -273,11 +274,12 @@ class NodeSchema:
                 )
         return cls(properties=properties, key=key_tuple)
 
-    def render(self, type_name: str) -> str:
+    def render(self, type_name: str, *, owner: str) -> str:
         return render_node_type(
             type_name,
             [(p.name, p.pg_type) for p in self.properties.values()],
             key=self.key,
+            owner=owner,
         )
 
 
@@ -332,6 +334,11 @@ class _TypeSpec:
     from_type: str | None
     to_type: str | None
     managed_by: ManagedBy
+    #: The app declaring the type (`AppConfig.name`). Rendered into the
+    #: block as its ownership property, and persisted in the tracking
+    #: record so a removal — which runs from tracking alone — knows whose
+    #: blocks it may take along.
+    owner: str
     # Populated only for edge specs: the *endpoint* node types' own key
     # definitions. Needed by the sink to build endpoint stubs and the edge's
     # `from`/`to` refs — `from_type`/`to_type` name the endpoint types, but
@@ -354,6 +361,11 @@ class _TypeMainRecord(msgspec.Struct, frozen=True, array_like=True):
     key: tuple[str, ...]
     from_type: str | None
     to_type: str | None
+    #: Constant for every record in one app's store — the store is the
+    #: app's — so it never differs between records and never forces a
+    #: rebuild; it is here because a removal has nothing else to read it
+    #: from.
+    owner: str
 
 
 class _PropertyRecord(msgspec.Struct, frozen=True, array_like=True):
@@ -448,7 +460,10 @@ def _type_tracking_record_from_spec(spec: _TypeSpec) -> _TypeTrackingRecord:
     return statediff.MutualTrackingRecord(
         tracking_record=statediff.CompositeTrackingRecord(
             main=_TypeMainRecord(
-                key=spec.key, from_type=spec.from_type, to_type=spec.to_type
+                key=spec.key,
+                from_type=spec.from_type,
+                to_type=spec.to_type,
+                owner=spec.owner,
             ),
             sub=sub,
         ),
@@ -467,6 +482,9 @@ class _TypeAction(NamedTuple):
     pg_fragment: str | None
     main_action: statediff.DiffAction | None
     property_actions: dict[str, statediff.DiffAction]
+    #: The app the action belongs to: whose ownership property the block
+    #: carries, and the only app whose edge types a node drop takes along.
+    owner: str
     # A `managed_by=user` declaration of a type the connector created: the
     # block's ownership property is stale and has to be removed, or a later
     # drop of a node type it references takes the user's type along.
@@ -517,6 +535,8 @@ def _reconcile_removal(
         # the schema write for an unchanged type but still builds and returns
         # its child handler.
         return None
+    # Every record in the store is this app's, so any of them names it.
+    owner = next(iter(prev_possible_records)).tracking_record.main.owner
     return coco.TargetReconcileOutput(
         action=_TypeAction(
             key=key,
@@ -524,6 +544,7 @@ def _reconcile_removal(
             pg_fragment=None,
             main_action=main_action,
             property_actions={},
+            owner=owner,
         ),
         sink=_type_sink,
         tracking_record=coco.NON_EXISTENCE,
@@ -582,7 +603,7 @@ class _TypeHandlerBase(coco.TargetHandler[_TypeSpec, _TypeTrackingRecord, Any]):
 
         # The reverse handoff. A SYSTEM declaration after a USER-managed
         # record has to re-render the block even when the schema is otherwise
-        # unchanged: the release dropped `coco_managed`, and until it is back
+        # unchanged: the release dropped `coco_managed_by_<app>`, and until it is back
         # a drop of a node type this type references treats it as the user's
         # and refuses.
         if (
@@ -692,6 +713,7 @@ class _TypeHandlerBase(coco.TargetHandler[_TypeSpec, _TypeTrackingRecord, Any]):
                 pg_fragment=self._render(key, spec),
                 main_action=main_action,
                 property_actions=property_actions,
+                owner=spec.owner,
                 release_ownership=release_ownership,
             ),
             sink=_type_sink,
@@ -703,7 +725,7 @@ class _TypeHandlerBase(coco.TargetHandler[_TypeSpec, _TypeTrackingRecord, Any]):
 class _NodeTypeHandler(_TypeHandlerBase):
     def _render(self, key: _TypeKey, spec: _TypeSpec) -> str:
         assert isinstance(spec.schema, NodeSchema)
-        return spec.schema.render(key.type_name)
+        return spec.schema.render(key.type_name, owner=spec.owner)
 
 
 class _EdgeTypeHandler(_TypeHandlerBase):
@@ -714,7 +736,9 @@ class _EdgeTypeHandler(_TypeHandlerBase):
             if spec.schema is not None
             else []
         )
-        return render_edge_type(key.type_name, spec.from_type, spec.to_type, props)
+        return render_edge_type(
+            key.type_name, spec.from_type, spec.to_type, props, owner=spec.owner
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1726,17 +1750,25 @@ def _blocked_node_removals(
 
 
 def _orphaned_endpoint_error(
-    blocked: _BlockedRemoval, *, foreign: Sequence[str]
+    blocked: _BlockedRemoval, *, foreign: dict[str, str | None], marker: str
 ) -> ValueError:
+    """`foreign` maps each referencing edge type this app does not own to
+    the ownership property its block does declare, if any — another app's
+    — so the message can say whose it is."""
     plural = len(blocked.edge_names) > 1
     if foreign:
         many = len(foreign) > 1
+        owned_by_others = "; ".join(
+            f"{name!r} is marked `{other}`" for name, other in foreign.items() if other
+        )
         advice = (
-            f"{list(foreign)!r} {'are' if many else 'is'} not managed by this "
-            f"connector (its block declares no `{COCO_MANAGED}` property), so "
-            f"{'they' if many else 'it'} will not be removed for you: remove "
-            f"{'them' if many else 'it'} from the schema yourself, or keep the "
-            f"node type."
+            f"{list(foreign)!r} {'are' if many else 'is'} not managed by this app "
+            f"({'their blocks declare' if many else 'its block declares'} no "
+            f"`{marker}` property{'; ' + owned_by_others if owned_by_others else ''}), "
+            f"so {'they' if many else 'it'} will not be removed for you: have the "
+            f"app that owns {'them' if many else 'it'} stop declaring "
+            f"{'them' if many else 'it'} first, remove {'them' if many else 'it'} "
+            f"from the schema yourself, or keep the node type."
         )
     else:
         advice = (
@@ -1837,25 +1869,33 @@ async def _apply_type_schema_locked(
 
     _check_no_kind_clash(existing, pending)
 
-    # A node type's drop may find a connector-managed edge type still
-    # pointing at it. Every mounted type is its own component and all of
-    # them share one sink batcher, so when an app is dropped the edge type's
-    # own removal is queued behind this very batch — waiting for it here
+    # A batch is one app's, and that app's ownership property is what marks
+    # the blocks it may take along or release.
+    owners = {a.owner for a in pending}
+    assert len(owners) == 1, owners
+    marker = ownership_property(owners.pop())
+
+    # A node type's drop may find an edge type of this app still pointing
+    # at it. Every mounted type is its own component and all of them share
+    # one sink batcher, so when an app is dropped the edge type's own
+    # removal is queued behind this very batch — waiting for it here
     # deadlocks until a timeout (verified live). Its removal is coming
-    # regardless, so take the connector's own edge types along now; the
-    # edge's batch then finds nothing left to remove. An edge type without
-    # the ownership property is a user's or another tool's and is never
-    # removed on their behalf, and a `@key` change keeps the edge declared,
-    # so both still fail here.
+    # regardless, so take this app's own edge types along now; the edge's
+    # batch then finds nothing left to remove. An edge type marked as
+    # another app's is that app's to remove — its removal is not coming,
+    # and a marker that only said "some app of this connector" let one
+    # app's drop delete another's edges — and one without any marker is a
+    # user's or another tool's; neither is removed on their behalf, and a
+    # `@key` change keeps the edge declared, so all three still fail here.
     taken_along: list[str] = []
     for removal in _blocked_node_removals(existing, pending):
-        foreign = [
-            name
+        foreign = {
+            name: found
             for name in removal.edge_names
-            if not is_connector_managed(existing, "edge", name)
-        ]
+            if (found := ownership_marker(existing, "edge", name)) != marker
+        }
         if not removal.is_drop or foreign:
-            raise _orphaned_endpoint_error(removal, foreign=foreign)
+            raise _orphaned_endpoint_error(removal, foreign=foreign, marker=marker)
         taken_along.extend(removal.edge_names)
 
     replaced = [
@@ -1878,7 +1918,7 @@ async def _apply_type_schema_locked(
             )
         elif action.release_ownership:
             desired = release_ownership(
-                desired, action.key.type_kind, action.key.type_name
+                desired, action.key.type_kind, action.key.type_name, marker
             )
         else:
             assert action.pg_fragment is not None
@@ -2260,6 +2300,7 @@ def _build_edge_spec(
     from_target: NodeTarget[Any],
     to_target: NodeTarget[Any],
     managed_by: ManagedBy,
+    owner: str,
 ) -> _TypeSpec:
     """Pure seam between `edge_target()` and `_TypeSpec` construction — kept
     separate so the endpoint key-field wiring (Task 10 step 4) is directly
@@ -2281,6 +2322,7 @@ def _build_edge_spec(
         from_type=from_target.type_name,
         to_type=to_target.type_name,
         managed_by=managed_by,
+        owner=owner,
         from_key_property=from_target.schema.properties[from_key_field],
         to_key_property=to_target.schema.properties[to_key_field],
     )
@@ -2298,7 +2340,11 @@ def node_target(
     *,
     managed_by: ManagedBy = ManagedBy.SYSTEM,
 ) -> coco.TargetState[_NodeHandler]:
-    """Create a `TargetState` for an Omnigraph node type."""
+    """Create a `TargetState` for an Omnigraph node type.
+
+    Must run inside a component: the type's block is marked as owned by
+    the app declaring it, which is only known there.
+    """
     validate_identifier(type_name, "node type")
     if not schema.key:
         # `NodeSchema.from_class` guarantees a key, but `NodeSchema` is public
@@ -2344,6 +2390,7 @@ def node_target(
         from_type=None,
         to_type=None,
         managed_by=managed_by,
+        owner=current_app_name(),
     )
     return _node_type_provider.target_state(type_key, spec)
 
@@ -2389,9 +2436,14 @@ def edge_target(
     *,
     managed_by: ManagedBy = ManagedBy.SYSTEM,
 ) -> coco.TargetState[_EdgeHandler]:
-    """Create a `TargetState` for an Omnigraph edge type."""
+    """Create a `TargetState` for an Omnigraph edge type.
+
+    Must run inside a component, like `node_target`.
+    """
     validate_identifier(type_name, "edge type")
-    spec = _build_edge_spec(schema, from_target, to_target, managed_by)
+    spec = _build_edge_spec(
+        schema, from_target, to_target, managed_by, current_app_name()
+    )
     key = _TypeKey(db_key=db.key, type_kind="edge", type_name=type_name)
     return _edge_type_provider.target_state(key, spec)
 

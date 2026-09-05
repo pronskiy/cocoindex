@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import tempfile
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, cast
@@ -46,8 +47,9 @@ from cocoindex.connectors.omnigraph._gq import (
     build_endpoint_stub,
     build_node_delete,
     build_node_upsert,
-    is_connector_managed,
     merge_type_into_schema,
+    ownership_marker,
+    ownership_property,
     release_ownership,
     remove_type_from_schema,
     render_edge_type,
@@ -141,22 +143,26 @@ class TestRenderProperty:
 class TestRenderNodeType:
     def test_injects_coco_key_and_the_ownership_marker(self) -> None:
         """Every block this connector renders carries `coco_key` and a
-        nullable, never-written `coco_managed`. The latter is what lets the
-        schema sink tell its own types from ones a user declared — a
-        user-managed type must declare `coco_key` too, so that property
-        alone cannot — and it is a property rather than a comment because
-        the engine only stores an applied source when something structural
-        changed, so a comment could never be released on handoff."""
+        nullable, never-written `coco_managed_by_<app>`. The latter is what
+        lets the schema sink tell this app's types from a user's and from
+        another app's — a user-managed type must declare `coco_key` too, so
+        that property alone cannot — and it is a property rather than a
+        comment because the engine only stores an applied source when
+        something structural changed, so a comment could never be released
+        on handoff."""
         assert render_node_type(
-            "Source", [("slug", "String"), ("title", "String")], key=("slug",)
+            "Source",
+            [("slug", "String"), ("title", "String")],
+            key=("slug",),
+            owner="og",
         ) == (
             "node Source {\n  slug: String @key\n  title: String\n"
-            "  coco_key: String\n  coco_managed: Bool?\n}"
+            "  coco_key: String\n  coco_managed_by_og: Bool?\n}"
         )
 
     def test_zero_properties_still_gets_coco_key(self) -> None:
-        assert render_node_type("Empty", [], key=()) == (
-            "node Empty {\n  coco_key: String\n  coco_managed: Bool?\n}"
+        assert render_node_type("Empty", [], key=(), owner="og") == (
+            "node Empty {\n  coco_key: String\n  coco_managed_by_og: Bool?\n}"
         )
 
     def test_composite_key_raises(self) -> None:
@@ -170,6 +176,7 @@ class TestRenderNodeType:
                 "Reading",
                 [("sensor", "String"), ("at", "DateTime"), ("v", "F64")],
                 key=("sensor", "at"),
+                owner="og",
             )
 
     def test_reserved_property_id_raises(self) -> None:
@@ -179,35 +186,50 @@ class TestRenderNodeType:
         and keying on it fails with the far more confusing "@key must
         reference declared properties" — both verified against the binary."""
         with pytest.raises(ValueError, match=r"\['id'\] is reserved by Omnigraph"):
-            render_node_type("X", [("slug", "String"), ("id", "I64")], key=("slug",))
+            render_node_type(
+                "X", [("slug", "String"), ("id", "I64")], key=("slug",), owner="og"
+            )
 
     def test_key_property_must_exist(self) -> None:
         with pytest.raises(ValueError, match="key property 'missing' is not declared"):
-            render_node_type("X", [("a", "String")], key=("missing",))
+            render_node_type("X", [("a", "String")], key=("missing",), owner="og")
 
     def test_key_must_not_be_nullable(self) -> None:
         with pytest.raises(ValueError, match="key property 'a' must not be nullable"):
-            render_node_type("X", [("a", "String?")], key=("a",))
+            render_node_type("X", [("a", "String?")], key=("a",), owner="og")
 
     def test_caller_may_not_shadow_coco_key(self) -> None:
         with pytest.raises(ValueError, match="reserved"):
-            render_node_type("X", [("a", "String"), (COCO_KEY, "String")], key=("a",))
+            render_node_type(
+                "X", [("a", "String"), (COCO_KEY, "String")], key=("a",), owner="og"
+            )
 
 
 class TestRenderEdgeType:
     def test_no_properties_still_gets_coco_key(self) -> None:
-        assert render_edge_type("Supports", "Source", "Claim", []) == (
+        assert render_edge_type("Supports", "Source", "Claim", [], owner="og") == (
             "edge Supports: Source -> Claim {\n"
-            "  coco_key: String\n  coco_managed: Bool?\n}"
+            "  coco_key: String\n  coco_managed_by_og: Bool?\n}"
         )
 
     def test_with_properties(self) -> None:
         assert render_edge_type(
-            "WorksAt", "Person", "Company", [("role", "String")]
+            "WorksAt", "Person", "Company", [("role", "String")], owner="og"
         ) == (
             "edge WorksAt: Person -> Company {\n  role: String\n"
-            "  coco_key: String\n  coco_managed: Bool?\n}"
+            "  coco_key: String\n  coco_managed_by_og: Bool?\n}"
         )
+
+
+class TestOwnershipProperty:
+    def test_an_identifier_app_name_is_used_as_is(self) -> None:
+        assert ownership_property("meeting_notes") == "coco_managed_by_meeting_notes"
+
+    def test_other_names_are_made_identifiers_without_colliding(self) -> None:
+        dashed, underscored = ownership_property("my-app"), ownership_property("my_app")
+        assert dashed != underscored
+        assert dashed.startswith("coco_managed_by_my_app_")
+        validate_identifier(dashed, "property name")
 
 
 class TestMergeTypeIntoSchema:
@@ -218,28 +240,31 @@ class TestMergeTypeIntoSchema:
     tests rather than only a live end-to-end check."""
 
     def test_appends_a_new_type(self) -> None:
-        existing = render_node_type("A", [("slug", "String")], key=("slug",)) + "\n"
-        b = render_node_type("B", [("slug", "String")], key=("slug",))
+        existing = (
+            render_node_type("A", [("slug", "String")], key=("slug",), owner="og")
+            + "\n"
+        )
+        b = render_node_type("B", [("slug", "String")], key=("slug",), owner="og")
         merged = merge_type_into_schema(existing, "node", "B", b)
         assert "node A {" in merged
         assert "node B {" in merged
         assert merged.index("node A {") < merged.index("node B {")
 
     def test_replaces_an_existing_type(self) -> None:
-        a1 = render_node_type("A", [("slug", "String")], key=("slug",))
+        a1 = render_node_type("A", [("slug", "String")], key=("slug",), owner="og")
         a2 = render_node_type(
-            "A", [("slug", "String"), ("title", "String")], key=("slug",)
+            "A", [("slug", "String"), ("title", "String")], key=("slug",), owner="og"
         )
         merged = merge_type_into_schema(a1 + "\n", "node", "A", a2)
         assert merged == a2 + "\n"
         assert "title" in merged
 
     def test_leaves_unrelated_types_untouched(self) -> None:
-        a = render_node_type("A", [("slug", "String")], key=("slug",))
-        b = render_node_type("B", [("slug", "String")], key=("slug",))
+        a = render_node_type("A", [("slug", "String")], key=("slug",), owner="og")
+        b = render_node_type("B", [("slug", "String")], key=("slug",), owner="og")
         existing = f"{a}\n\n{b}\n"
         b2 = render_node_type(
-            "B", [("slug", "String"), ("title", "String")], key=("slug",)
+            "B", [("slug", "String"), ("title", "String")], key=("slug",), owner="og"
         )
         merged = merge_type_into_schema(existing, "node", "B", b2)
         assert a in merged
@@ -260,7 +285,7 @@ class TestMergeTypeIntoSchema:
             "node B {\n  slug: String @key\n  coco_key: String\n}\n\n"
             "edge E: A -> B\n"
         )
-        e2 = render_edge_type("E", "A", "B", [("weight", "I64")])
+        e2 = render_edge_type("E", "A", "B", [("weight", "I64")], owner="og")
         merged = merge_type_into_schema(existing, "edge", "E", e2)
         assert "node A {\n  slug: String @key\n  coco_key: String\n}" in merged
         assert "node B {\n  slug: String @key\n  coco_key: String\n}" in merged
@@ -281,7 +306,7 @@ class TestMergeTypeIntoSchema:
             "node Link {\n  slug: String @key\n  coco_key: String\n}\n\n"
             "edge Link: A -> B {\n  coco_key: String\n}\n"
         )
-        frag = render_edge_type("Link", "A", "B", [("weight", "I64?")])
+        frag = render_edge_type("Link", "A", "B", [("weight", "I64?")], owner="og")
         merged = merge_type_into_schema(existing, "edge", "Link", frag)
         assert "node Link {\n  slug: String @key\n  coco_key: String\n}" in merged
         assert merged.count("edge Link") == 1
@@ -293,7 +318,10 @@ class TestMergeTypeIntoSchema:
             "edge Link: A -> B {\n  coco_key: String\n}\n"
         )
         frag = render_node_type(
-            "Link", [("slug", "String"), ("title", "String?")], key=("slug",)
+            "Link",
+            [("slug", "String"), ("title", "String?")],
+            key=("slug",),
+            owner="og",
         )
         merged = merge_type_into_schema(existing, "node", "Link", frag)
         assert "edge Link: A -> B {\n  coco_key: String\n}" in merged
@@ -315,7 +343,7 @@ class TestMergeTypeIntoSchema:
         left the other as a stale duplicate, and a removal deleted one and
         left the other behind — exactly the state the kind-blind match used
         to create."""
-        a = render_node_type("A", [("slug", "String")], key=("slug",))
+        a = render_node_type("A", [("slug", "String")], key=("slug",), owner="og")
         with pytest.raises(ValueError, match="declares node 'A' 2 times"):
             merge_type_into_schema(a + "\n\n" + a + "\n", "node", "A", a)
 
@@ -333,7 +361,7 @@ class TestMergeTypeIntoSchema:
     def test_finds_an_indented_block(self) -> None:
         existing = "  node Person {\n    slug: String @key\n    coco_key: String\n  }\n"
         frag = render_node_type(
-            "Person", [("slug", "String"), ("age", "I64?")], key=("slug",)
+            "Person", [("slug", "String"), ("age", "I64?")], key=("slug",), owner="og"
         )
         merged = merge_type_into_schema(existing, "node", "Person", frag)
         assert merged.count("node Person") == 1
@@ -345,7 +373,10 @@ class TestMergeTypeIntoSchema:
         company = "node Company { slug: String @key coco_key: String }"
         existing = f"{person} {company}\n"
         frag = render_node_type(
-            "Company", [("slug", "String"), ("name", "String?")], key=("slug",)
+            "Company",
+            [("slug", "String"), ("name", "String?")],
+            key=("slug",),
+            owner="og",
         )
         merged = merge_type_into_schema(existing, "node", "Company", frag)
         assert merged.count("node Company") == 1
@@ -358,7 +389,7 @@ class TestMergeTypeIntoSchema:
             "node Company {\n  slug: String @key\n  coco_key: String\n}\n"
         )
         frag = render_node_type(
-            "Person", [("slug", "String"), ("age", "I64?")], key=("slug",)
+            "Person", [("slug", "String"), ("age", "I64?")], key=("slug",), owner="og"
         )
         merged = merge_type_into_schema(existing, "node", "Person", frag)
         assert merged.count("node Person") == 1
@@ -372,7 +403,7 @@ class TestMergeTypeIntoSchema:
         )
         assert remove_type_from_schema(existing, "node", "Ghost") == existing
         frag = render_node_type(
-            "A", [("slug", "String"), ("t", "String?")], key=("slug",)
+            "A", [("slug", "String"), ("t", "String?")], key=("slug",), owner="og"
         )
         merged = merge_type_into_schema(existing, "node", "A", frag)
         assert merged.startswith("// node Ghost { slug: String @key }\n")
@@ -384,7 +415,7 @@ class TestMergeTypeIntoSchema:
             "  coco_key: String\n}\n"
         )
         assert remove_type_from_schema(existing, "edge", "String") == existing
-        frag = render_node_type("A", [("slug", "String")], key=("slug",))
+        frag = render_node_type("A", [("slug", "String")], key=("slug",), owner="og")
         assert merge_type_into_schema(existing, "node", "A", frag) == frag + "\n"
 
     def test_edge_endpoints_are_read_from_an_indented_declaration(self) -> None:
@@ -404,9 +435,9 @@ class TestRemoveTypeFromSchema:
     separate `schema apply` calls (verified against the engine)."""
 
     def test_removes_the_middle_block_without_doubling_the_separator(self) -> None:
-        a = render_node_type("A", [("slug", "String")], key=("slug",))
-        b = render_node_type("B", [("slug", "String")], key=("slug",))
-        c = render_node_type("C", [("slug", "String")], key=("slug",))
+        a = render_node_type("A", [("slug", "String")], key=("slug",), owner="og")
+        b = render_node_type("B", [("slug", "String")], key=("slug",), owner="og")
+        c = render_node_type("C", [("slug", "String")], key=("slug",), owner="og")
         existing = f"{a}\n\n{b}\n\n{c}\n"
         removed = remove_type_from_schema(existing, "node", "B")
         assert a in removed
@@ -415,12 +446,12 @@ class TestRemoveTypeFromSchema:
         assert "\n\n\n" not in removed
 
     def test_removes_the_only_block(self) -> None:
-        a = render_node_type("A", [("slug", "String")], key=("slug",))
+        a = render_node_type("A", [("slug", "String")], key=("slug",), owner="og")
         removed = remove_type_from_schema(a + "\n", "node", "A")
         assert "node A" not in removed
 
     def test_absent_type_is_a_no_op(self) -> None:
-        a = render_node_type("A", [("slug", "String")], key=("slug",))
+        a = render_node_type("A", [("slug", "String")], key=("slug",), owner="og")
         existing = a + "\n"
         assert remove_type_from_schema(existing, "node", "Z") == existing
 
@@ -429,12 +460,12 @@ class TestRemoveTypeFromSchema:
         old block, then merge the new definition back in — proving the two
         functions compose into a schema with the type's key actually
         changed and every other type still present."""
-        a1 = render_node_type("A", [("slug", "String")], key=("slug",))
-        b = render_node_type("B", [("slug", "String")], key=("slug",))
+        a1 = render_node_type("A", [("slug", "String")], key=("slug",), owner="og")
+        b = render_node_type("B", [("slug", "String")], key=("slug",), owner="og")
         existing = f"{a1}\n\n{b}\n"
         without_a = remove_type_from_schema(existing, "node", "A")
         a2 = render_node_type(
-            "A", [("slug", "String"), ("title", "String")], key=("title",)
+            "A", [("slug", "String"), ("title", "String")], key=("title",), owner="og"
         )
         rebuilt = merge_type_into_schema(without_a, "node", "A", a2)
         assert a2 in rebuilt
@@ -490,34 +521,55 @@ class TestIncidentEdges:
 
 
 class TestOwnershipDetection:
-    """`coco_managed` is a declared property. Ownership detection searched the
-    block's raw text, comments included, so a user-owned block whose comment
-    merely mentioned the property counted as the connector's — and an app
-    drop deleted it. Detection and release must look at declarations only."""
+    """`coco_managed_by_<app>` is a declared property. Ownership detection
+    searched the block's raw text, comments included, so a user-owned block
+    whose comment merely mentioned the property counted as the connector's
+    — and an app drop deleted it. Detection and release must look at
+    declarations only."""
 
     USER_EDGE = (
         "edge E: A -> B {\n"
-        "  // coco_managed: Bool? was deliberately omitted\n"
+        "  // coco_managed_by_og: Bool? was deliberately omitted\n"
         "  coco_key: String\n"
         "}\n"
     )
     OWNED_EDGE = (
         "edge E: A -> B {\n"
-        "  coco_key: String // no coco_managed here, only below\n"
-        "  coco_managed: Bool?\n"
+        "  coco_key: String // no coco_managed_by_og here, only below\n"
+        "  coco_managed_by_og: Bool?\n"
         "}\n"
+    )
+    ANOTHER_APPS_EDGE = OWNED_EDGE.replace(
+        "coco_managed_by_og: Bool?", "coco_managed_by_other: Bool?"
     )
 
     def test_a_comment_does_not_confer_ownership(self) -> None:
-        assert not is_connector_managed(self.USER_EDGE, "edge", "E")
-        assert release_ownership(self.USER_EDGE, "edge", "E") == self.USER_EDGE
+        assert ownership_marker(self.USER_EDGE, "edge", "E") is None
+        assert (
+            release_ownership(self.USER_EDGE, "edge", "E", "coco_managed_by_og")
+            == self.USER_EDGE
+        )
 
     def test_a_declaration_confers_ownership_whatever_the_comments_say(self) -> None:
-        assert is_connector_managed(self.OWNED_EDGE, "edge", "E")
-        assert release_ownership(self.OWNED_EDGE, "edge", "E") == (
+        assert ownership_marker(self.OWNED_EDGE, "edge", "E") == "coco_managed_by_og"
+        assert release_ownership(
+            self.OWNED_EDGE, "edge", "E", "coco_managed_by_og"
+        ) == (
             "edge E: A -> B {\n"
-            "  coco_key: String // no coco_managed here, only below\n"
+            "  coco_key: String // no coco_managed_by_og here, only below\n"
             "}\n"
+        )
+
+    def test_the_marker_names_its_app(self) -> None:
+        """A release only ever drops this app's own marker: another app's
+        stays, so its drop still finds its type marked as its own."""
+        assert (
+            ownership_marker(self.ANOTHER_APPS_EDGE, "edge", "E")
+            == "coco_managed_by_other"
+        )
+        assert (
+            release_ownership(self.ANOTHER_APPS_EDGE, "edge", "E", "coco_managed_by_og")
+            == self.ANOTHER_APPS_EDGE
         )
 
 
@@ -908,9 +960,11 @@ class TestTypeMapping:
             schema = NodeSchema(
                 properties={"k": PropertyDef("k", pg_type, encoder)}, key=("k",)
             )
-            omnigraph.node_target(
-                ContextKey[ConnectionFactory](f"db_{uuid.uuid4().hex}"), "T", schema
-            )
+
+            def mount(schema: NodeSchema = schema) -> None:
+                omnigraph.node_target(_fresh_db("iso"), "T", schema)
+
+            _in_component(mount)
 
     @pytest.mark.asyncio
     async def test_list_of_dates_encodes_every_element(self) -> None:
@@ -1074,9 +1128,9 @@ class TestTypeMapping:
             title: str
 
         schema = await NodeSchema.from_class(_Src, key="slug")
-        assert schema.render("Source") == (
+        assert schema.render("Source", owner="og") == (
             "node Source {\n  slug: String @key\n  title: String\n"
-            "  coco_key: String\n  coco_managed: Bool?\n}"
+            "  coco_key: String\n  coco_managed_by_og: Bool?\n}"
         )
 
 
@@ -1087,6 +1141,7 @@ def _spec(schema: NodeSchema, managed_by: ManagedBy = ManagedBy.SYSTEM) -> _Type
         from_type=None,
         to_type=None,
         managed_by=managed_by,
+        owner="og",
     )
 
 
@@ -1112,19 +1167,24 @@ class TestEdgeSchema:
         with pytest.raises(ValueError, match="'id' is reserved"):
             await EdgeSchema.from_class(_WithId)
 
-    @pytest.mark.asyncio
-    async def test_a_node_schema_is_not_an_edge_schema(self) -> None:
+    def test_a_node_schema_is_not_an_edge_schema(self) -> None:
         """Keyed schemas describe node types only; handing one to an edge
         type is refused at mount, where the mistake is."""
-        node_schema = await NodeSchema.from_class(_ScClaim, key="slug")
-        with pytest.raises(TypeError, match="EdgeSchema"):
+        node_schema = NodeSchema(
+            properties={"slug": PropertyDef("slug", "String")}, key=("slug",)
+        )
+
+        def mount_with_a_node_schema() -> None:
             omnigraph.edge_target(
-                ContextKey[ConnectionFactory](f"db_{uuid.uuid4().hex}"),
+                _fresh_db("node_schema"),
                 "E",
                 _bare_node_target(node_schema, "A"),
                 _bare_node_target(node_schema, "B"),
                 node_schema,  # type: ignore[arg-type]
             )
+
+        with pytest.raises(TypeError, match="EdgeSchema"):
+            _in_component(mount_with_a_node_schema)
 
 
 class TestNodeTypeReconcile:
@@ -1347,7 +1407,7 @@ class TestNodeTypeReconcile:
     async def test_handing_a_type_to_the_user_releases_ownership(
         self,
     ) -> None:
-        """A block the connector rendered declares `coco_managed`. Once the
+        """A block the connector rendered declares `coco_managed_by_<app>`. Once the
         app declares the type `managed_by=user` that is stale — and a later
         drop of a node type read it as current ownership, taking the user's
         edge type (and its edges) along. The handoff has to write once to
@@ -1365,7 +1425,7 @@ class TestNodeTypeReconcile:
     async def test_taking_a_type_back_from_the_user_rewrites_its_block(self) -> None:
         """The reverse handoff. A system-managed declaration after a
         user-managed record wrote nothing when the schema was otherwise
-        unchanged, so `coco_managed` stayed absent and the next drop of a
+        unchanged, so the ownership property stayed absent and the next drop of a
         node type it referenced treated it as the user's. Reclaiming must
         re-render the block even with nothing else to change."""
         schema = await NodeSchema.from_class(_Doc, key="slug")
@@ -1511,6 +1571,7 @@ def _edge_spec(
         from_type=from_type,
         to_type=to_type,
         managed_by=managed_by,
+        owner="og",
     )
 
 
@@ -1694,7 +1755,7 @@ class TestTypeOwnershipMatrix:
         """A system-managed declaration writes DDL when the graph might not
         already match it: on a first run, where nothing is tracked and the
         engine reports `prev_may_be_missing`, and whenever any tracked record
-        was user-managed — the block then lacks `coco_managed`, and only a
+        was user-managed — the block then lacks its ownership property, and only a
         re-render puts it back. A system-managed record already carrying this
         exact schema means there is nothing to apply."""
         schema = await NodeSchema.from_class(_Doc, key="slug")
@@ -2154,7 +2215,12 @@ def _client() -> _CliClient:
 
 #: Stands in wherever `_apply_type_schema` needs a spec that merely exists.
 _PLACEHOLDER_SPEC = _TypeSpec(
-    schema=None, key=(), from_type=None, to_type=None, managed_by=ManagedBy.SYSTEM
+    schema=None,
+    key=(),
+    from_type=None,
+    to_type=None,
+    managed_by=ManagedBy.SYSTEM,
+    owner="og",
 )
 
 
@@ -2166,6 +2232,7 @@ def _type_action(
     type_kind: str = "node",
     property_actions: dict[str, statediff.DiffAction] | None = None,
     release_ownership: bool = False,
+    owner: str = "og",
 ) -> ogt._TypeAction:
     """A `_TypeAction` carrying only what `_apply_type_schema` reads — whether
     anything has to be written at all (`main_action`/`property_actions`),
@@ -2185,6 +2252,7 @@ def _type_action(
         main_action=main_action,
         property_actions=property_actions or {},
         release_ownership=release_ownership,
+        owner=owner,
     )
 
 
@@ -3318,7 +3386,7 @@ class TestApplyTypeSchema:
     async def test_releasing_ownership_drops_only_the_ownership_property(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        marked = "  coco_key: String\n  coco_managed: Bool?\n"
+        marked = "  coco_key: String\n  coco_managed_by_og: Bool?\n"
         existing = (
             f"node Person {{\n  slug: String @key\n{marked}}}\n\n"
             f"node Company {{\n  slug: String @key\n{marked}}}\n"
@@ -3517,7 +3585,7 @@ class TestApplyTypeSchema:
         monkeypatch.setattr(_CliClient, "read_schema", fake_read_schema)
         monkeypatch.setattr(_CliClient, "apply_schema", fail_apply)
 
-        frag = render_edge_type("Link", "A", "B", [])
+        frag = render_edge_type("Link", "A", "B", [], owner="og")
         with pytest.raises(ValueError, match="already used by a node type"):
             await ogt._apply_type_schema(
                 _client(), [_type_action("insert", "Link", frag, type_kind="edge")]
@@ -3552,7 +3620,7 @@ class TestApplyTypeSchema:
                     _type_action(
                         "insert",
                         "Link",
-                        render_edge_type("Link", "A", "B", []),
+                        render_edge_type("Link", "A", "B", [], owner="og"),
                         type_kind="edge",
                     ),
                 ],
@@ -3585,7 +3653,7 @@ class TestApplyTypeSchema:
                     _type_action(
                         "insert",
                         "Link",
-                        render_edge_type("Link", "A", "B", []),
+                        render_edge_type("Link", "A", "B", [], owner="og"),
                         type_kind="edge",
                     ),
                 ],
@@ -3738,7 +3806,7 @@ class TestOrphanedEdgeEndpoints:
     types along, and leave everyone else's in place.
     """
 
-    _MARKED = "  coco_key: String\n  coco_managed: Bool?\n"
+    _MARKED = "  coco_key: String\n  coco_managed_by_og: Bool?\n"
     SCHEMA = (
         f"node Person {{\n  slug: String @key\n{_MARKED}}}\n"
         f"node Company {{\n  slug: String @key\n{_MARKED}}}\n"
@@ -3750,6 +3818,12 @@ class TestOrphanedEdgeEndpoints:
     SCHEMA_WITH_FOREIGN_EDGE = SCHEMA.replace(
         f"edge WorksAt: Person -> Company {{\n{_MARKED}}}\n",
         "edge WorksAt: Person -> Company {\n  coco_key: String\n}\n",
+    )
+    #: And with an edge type another app of this connector owns.
+    SCHEMA_WITH_ANOTHER_APPS_EDGE = SCHEMA.replace(
+        f"edge WorksAt: Person -> Company {{\n{_MARKED}}}\n",
+        "edge WorksAt: Person -> Company {\n  coco_key: String\n"
+        "  coco_managed_by_other: Bool?\n}\n",
     )
 
     @staticmethod
@@ -3792,7 +3866,23 @@ class TestOrphanedEdgeEndpoints:
         tool's. The connector
         never removes those, so the drop fails naming it and writes nothing."""
         applied = self._mock(monkeypatch, self.SCHEMA_WITH_FOREIGN_EDGE)
-        with pytest.raises(ValueError, match=r"WorksAt.*not managed by this connector"):
+        with pytest.raises(ValueError, match=r"WorksAt.*not managed by this app"):
+            await ogt._apply_type_schema(
+                _client(), [_type_action("delete", "Person", None)]
+            )
+        assert applied == []
+
+    @pytest.mark.asyncio
+    async def test_dropping_a_node_type_referenced_by_another_apps_edge_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The ownership property used to say only that some app of this
+        connector wrote the block, and a drop took every such edge type
+        along — including one another app was still declaring, whose
+        removal was never coming. It names the app now: only this app's
+        edge types go, and the refusal names the app that owns the other."""
+        applied = self._mock(monkeypatch, self.SCHEMA_WITH_ANOTHER_APPS_EDGE)
+        with pytest.raises(ValueError, match=r"WorksAt.*coco_managed_by_other"):
             await ogt._apply_type_schema(
                 _client(), [_type_action("delete", "Person", None)]
             )
@@ -3913,6 +4003,29 @@ class TestPublicSurface:
 # ---------------------------------------------------------------------------
 
 
+def _in_component(fn: Callable[[], object]) -> None:
+    """Run `fn` inside a component of a throwaway app: `node_target` and
+    `edge_target` read the owning app from the component they run in."""
+
+    async def main() -> None:
+        fn()
+
+    coco.App(
+        coco.AppConfig(name=f"in_component_{uuid.uuid4().hex}", environment=coco_env),
+        main,
+    ).update_blocking()
+
+
+def test_node_target_needs_a_component() -> None:
+    """The block a type renders names the app that owns it, and the app is
+    only known inside a component."""
+    schema = NodeSchema(
+        properties={"slug": PropertyDef("slug", "String")}, key=("slug",)
+    )
+    with pytest.raises(RuntimeError, match="component context"):
+        omnigraph.node_target(_fresh_db("outside"), "Node", schema)
+
+
 def _bare_node_target(schema: NodeSchema, type_name: str) -> omnigraph.NodeTarget[Any]:
     """A NodeTarget with no real provider — valid for tests that only read
     `.schema`/`.type_name` (spec construction, validation) and never declare
@@ -3935,10 +4048,8 @@ class TestNodeTargetKeyValidation:
         with pytest.raises(
             ValueError, match=r"key property 'slug' has a custom encoder"
         ):
-            omnigraph.node_target(
-                ContextKey[ConnectionFactory](f"db_{uuid.uuid4().hex}"),
-                "Person",
-                schema,
+            _in_component(
+                lambda: omnigraph.node_target(_fresh_db("custom"), "Person", schema)
             )
 
     def test_a_built_in_encoder_of_another_type_is_refused_on_a_key(self) -> None:
@@ -3955,23 +4066,22 @@ class TestNodeTargetKeyValidation:
             schema = NodeSchema(
                 properties={"k": PropertyDef("k", pg_type, encoder)}, key=("k",)
             )
-            with pytest.raises(ValueError, match=r"key property 'k'"):
-                omnigraph.node_target(
-                    ContextKey[ConnectionFactory](f"db_{uuid.uuid4().hex}"),
-                    "T",
-                    schema,
-                )
 
-    @pytest.mark.asyncio
-    async def test_the_built_in_date_encoder_on_a_key_is_allowed(self) -> None:
+            def mount(schema: NodeSchema = schema) -> None:
+                omnigraph.node_target(_fresh_db("other"), "T", schema)
+
+            with pytest.raises(ValueError, match=r"key property 'k'"):
+                _in_component(mount)
+
+    def test_the_built_in_date_encoder_on_a_key_is_allowed(self) -> None:
         """Only the fixed `Date`/`DateTime` encoders may sit on a key: they
         are a pure function of the value and never change, so raw and
         encoded identity cannot drift apart."""
-        schema = await NodeSchema.from_class(_Doc, key="on")
-        assert schema.properties["on"].encoder is not None
-        omnigraph.node_target(
-            ContextKey[ConnectionFactory](f"db_{uuid.uuid4().hex}"), "Doc", schema
+        schema = NodeSchema(
+            properties={"on": PropertyDef("on", "Date", ogt._ENCODERS["Date"])},
+            key=("on",),
         )
+        _in_component(lambda: omnigraph.node_target(_fresh_db("date"), "Doc", schema))
 
     def test_keyless_schema_is_refused(self) -> None:
         """A hand-built `NodeSchema` with an empty key must be refused at
@@ -3986,10 +4096,11 @@ class TestNodeTargetKeyValidation:
         re-run. `_validate_edge_endpoint` already has this guard — but only
         for types used as endpoints.
         """
-        db = ContextKey[ConnectionFactory]("og_keyless")
         schema = NodeSchema(properties={"slug": PropertyDef("slug", "String")}, key=())
         with pytest.raises(ValueError, match="must declare a key"):
-            omnigraph.node_target(db, "Node", schema)
+            _in_component(
+                lambda: omnigraph.node_target(_fresh_db("keyless"), "Node", schema)
+            )
 
 
 class TestRecordToDict:
@@ -4057,6 +4168,7 @@ class TestEdgeTargetKeyPropertyWiring:
             source,
             claim,
             ManagedBy.SYSTEM,
+            "og",
         )
         assert spec.from_key_property == PropertyDef("slug", "String")
         assert spec.to_key_property == PropertyDef("slug", "String")
@@ -5114,11 +5226,14 @@ class TestApplyTypeActionsLive:
             from_type=None,
             to_type=None,
             managed_by=ManagedBy.SYSTEM,
+            owner="og",
         )
         key = _TypeKey(db.key, "node", "Simple")
-        pg_fragment = schema.render("Simple")
+        pg_fragment = schema.render("Simple", owner="og")
 
-        create_action = ogt._TypeAction(key, spec, pg_fragment, "insert", {})
+        create_action = ogt._TypeAction(
+            key, spec, pg_fragment, "insert", {}, owner="og"
+        )
         out = await ogt._apply_type_actions(cp, [create_action])
         assert out[0] is not None
         assert store_dir.exists()
@@ -5128,7 +5243,9 @@ class TestApplyTypeActionsLive:
 
         # What the engine really emits after an interrupted run: the record
         # still matches, but `prev_may_be_missing` forces a write anyway.
-        upsert_action = ogt._TypeAction(key, spec, pg_fragment, "upsert", {})
+        upsert_action = ogt._TypeAction(
+            key, spec, pg_fragment, "upsert", {}, owner="og"
+        )
         out2 = await ogt._apply_type_actions(cp, [upsert_action])
         assert out2[0] is not None
         assert store_dir.exists()
@@ -5162,6 +5279,7 @@ class TestApplyTypeActionsLive:
             from_type=None,
             to_type=None,
             managed_by=ManagedBy.SYSTEM,
+            owner="og",
         )
         await ogt._apply_type_actions(
             cp,
@@ -5169,9 +5287,10 @@ class TestApplyTypeActionsLive:
                 ogt._TypeAction(
                     _TypeKey(db.key, "node", "A"),
                     a_spec,
-                    a_schema.render("A"),
+                    a_schema.render("A", owner="og"),
                     "insert",
                     {},
+                    owner="og",
                 ),
             ],
         )
@@ -5183,6 +5302,7 @@ class TestApplyTypeActionsLive:
             from_type=None,
             to_type=None,
             managed_by=ManagedBy.SYSTEM,
+            owner="og",
         )
         out = await ogt._apply_type_actions(
             cp,
@@ -5190,9 +5310,10 @@ class TestApplyTypeActionsLive:
                 ogt._TypeAction(
                     _TypeKey(db.key, "node", "B"),
                     b_spec,
-                    b_schema.render("B"),
+                    b_schema.render("B", owner="og"),
                     "insert",
                     {},
+                    owner="og",
                 ),
             ],
         )
@@ -6649,9 +6770,7 @@ class TestEndToEnd:
             in source
         )
 
-        with pytest.raises(
-            ValueError, match=r"Supports.*not managed by this connector"
-        ):
+        with pytest.raises(ValueError, match=r"Supports.*not managed by this app"):
             app.drop_blocking()
         assert _read_schema_source(store) == source
         rows = _export_rows(store)
@@ -6665,12 +6784,12 @@ class TestEndToEnd:
         Ownership detection read the raw block text, so an app drop took
         the edge type along with the nodes and deleted the user's edges."""
         store_dir = Path(store[len("file://") :])
-        owned = "  coco_key: String\n  coco_managed: Bool?\n"
+        owned = "  coco_key: String\n  coco_managed_by_e2e_comment_ownership: Bool?\n"
         hand_written = (
             f"node Source {{\n  slug: String @key\n  title: String?\n{owned}}}\n\n"
             f"node Claim {{\n  slug: String @key\n{owned}}}\n\n"
             "edge Supports: Source -> Claim {\n"
-            "  // coco_managed: Bool? was deliberately omitted\n"
+            "  // coco_managed_by_e2e_comment_ownership: Bool? was deliberately omitted\n"
             "  coco_key: String\n"
             "}\n"
         )
@@ -6697,12 +6816,76 @@ class TestEndToEnd:
         app.update_blocking()
         assert len([r for r in _export_rows(store) if r.get("edge") == "Supports"]) == 1
 
-        with pytest.raises(
-            ValueError, match=r"Supports.*not managed by this connector"
-        ):
+        with pytest.raises(ValueError, match=r"Supports.*not managed by this app"):
             app.drop_blocking()
         assert "was deliberately omitted" in _read_schema_source(store)
         assert len([r for r in _export_rows(store) if r.get("edge") == "Supports"]) == 1
+
+    def test_dropping_an_app_leaves_another_apps_edge_type_alone(
+        self, store: str
+    ) -> None:
+        """App A creates Source. App B adopts Source as user-managed and
+        creates Claim and Supports: Source -> Claim. Dropping A removed B's
+        Supports with every edge in it: the drop took every referencing
+        edge type carrying the ownership property along, and that property
+        only said some app of this connector wrote the block. It names the
+        owning app now, and a drop refuses to remove a node type another
+        app's edge type still points at, naming that app."""
+        db_a = _e2e_db(store, "two_apps_a")
+        db_b = _e2e_db(store, "two_apps_b")
+
+        async def main_a() -> None:
+            sources = await omnigraph.mount_node_target(
+                db_a, "Source", await NodeSchema.from_class(_ScSourceNarrow, key="slug")
+            )
+            sources.declare_node(node=_ScSourceNarrow(slug="a", title="A"))
+
+        async def main_b() -> None:
+            sources = await omnigraph.mount_node_target(
+                db_b,
+                "Source",
+                await NodeSchema.from_class(_ScSourceNarrow, key="slug"),
+                managed_by=ManagedBy.USER,
+            )
+            claims = await omnigraph.mount_node_target(
+                db_b, "Claim", await NodeSchema.from_class(_ScClaim, key="slug")
+            )
+            supports = await omnigraph.mount_edge_target(
+                db_b,
+                "Supports",
+                sources,
+                claims,
+                await EdgeSchema.from_class(_ScEdgeProps),
+            )
+            claims.declare_node(node=_ScClaim(slug="c1"))
+            supports.declare_edge(
+                from_id="a", to_id="c1", record=_ScEdgeProps(weight=1)
+            )
+
+        app_a = coco.App(
+            coco.AppConfig(name="e2e_two_apps_a", environment=coco_env), main_a
+        )
+        app_b = coco.App(
+            coco.AppConfig(name="e2e_two_apps_b", environment=coco_env), main_b
+        )
+        app_a.update_blocking()
+        app_b.update_blocking()
+        source = _read_schema_source(store)
+        assert "coco_managed_by_e2e_two_apps_a" in source
+        assert "coco_managed_by_e2e_two_apps_b" in source
+
+        def supports_edges() -> int:
+            return len([r for r in _export_rows(store) if r.get("edge") == "Supports"])
+
+        assert supports_edges() == 1
+        with pytest.raises(
+            ValueError, match=r"Supports.*coco_managed_by_e2e_two_apps_b"
+        ):
+            app_a.drop_blocking()
+        assert _read_schema_source(store) == source
+        assert supports_edges() == 1
+        app_b.update_blocking()
+        assert supports_edges() == 1
 
     def test_reclaiming_an_edge_type_restores_its_ownership(self, store: str) -> None:
         """system -> user -> system with the schema unchanged throughout.

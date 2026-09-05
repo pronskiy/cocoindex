@@ -3,8 +3,9 @@
 Run with:
     uv run pytest python/tests/connectors/test_omnigraph_target.py -v
 
-Builder unit tests run without a server. Integration tests require the
-omnigraph CLI and are gated on OMNIGRAPH_TEST_STORE=1.
+Builder unit tests run without a server. Live tests require the omnigraph
+CLI at test/bin/omnigraph and are gated on OMNIGRAPH_TEST_STORE=1; CI installs
+the pinned release there (see .github/workflows/_test.yml).
 """
 
 from __future__ import annotations
@@ -4140,9 +4141,10 @@ def test_mount_node_has_no_key_kwarg(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Live-engine tests: require the omnigraph CLI binary. Gated on
-# OMNIGRAPH_TEST_STORE=1 since the binary is a local, git-ignored install
-# (`test/bin/omnigraph`), not something CI has on PATH.
+# Live-engine tests: require the omnigraph CLI binary at `test/bin/omnigraph`
+# (git-ignored). Gated on OMNIGRAPH_TEST_STORE=1 so a checkout without the
+# binary still runs the rest; CI installs the pinned release and sets the flag
+# (see .github/workflows/_test.yml).
 # ---------------------------------------------------------------------------
 
 _OMNIGRAPH_BIN = str(Path(__file__).resolve().parents[3] / "test" / "bin" / "omnigraph")

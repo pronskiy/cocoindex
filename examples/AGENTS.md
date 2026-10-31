@@ -133,7 +133,7 @@ A walkthrough URL means there's a step-by-step guide at
 - `product_recommendation` — product catalog → LLM taxonomy extraction → Neo4j recommendation graph. *(walkthrough: product-recommendation)*
 - `meeting_notes_graph_neo4j` / `meeting_notes_graph_falkordb` — Google Drive meeting notes → Neo4j / FalkorDB graph.
 - `meeting_notes_graph_omnigraph` — Google Drive meeting notes → Omnigraph graph.
-- `gdrive_wiki_graph_omnigraph` — Google Docs `[[wiki links]]` → Omnigraph note graph; no LLM.
+- `gdrive_doc_links_omnigraph` — Google Docs and the links between them → Omnigraph graph; no LLM.
 - `meeting_notes_graph_surrealdb` — local Markdown meeting notes → SurrealDB graph.
 
 ### Custom sources / targets / streaming

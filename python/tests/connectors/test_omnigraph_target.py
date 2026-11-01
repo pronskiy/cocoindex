@@ -2159,11 +2159,11 @@ class TestNodeReconcile:
 
 
 class TestEdgeReconcile:
-    def test_new_edge_inserts(self) -> None:
+    def test_new_edge_upserts(self) -> None:
         out = _edge_handler().reconcile(("a", "b"), _EdgeValue("a", "b", {}), [], False)
-        assert out is not None and out.action.op == "insert"
+        assert out is not None and out.action.op == "upsert"
 
-    def test_encoder_change_forces_a_replace(self) -> None:
+    def test_encoder_change_forces_a_write(self) -> None:
         """Edge counterpart of the node case: the fingerprint must cover the
         encoded value, or an encoder change never reaches the graph."""
         v = _EdgeValue("a", "b", {"w": 2})
@@ -2173,7 +2173,7 @@ class TestEdgeReconcile:
         out = _edge_handler(lambda w: w * 100).reconcile(
             ("a", "b"), v, [first.tracking_record], False
         )
-        assert out is not None and out.action.op == "replace"
+        assert out is not None and out.action.op == "upsert"
         assert {p.name: p.value for p in out.action.properties}["w"] == 200
 
     def test_unchanged_is_noop(self) -> None:
@@ -2183,8 +2183,9 @@ class TestEdgeReconcile:
         assert not isinstance(first.tracking_record, coco.NonExistenceType)
         assert h.reconcile(("a", "b"), v, [first.tracking_record], False) is None
 
-    def test_changed_edge_is_replace_not_insert(self) -> None:
-        """A strict insert would duplicate; there is no edge update. Must be replace."""
+    def test_changed_edge_upserts(self) -> None:
+        """Edge types are keyed on their endpoints, so a changed edge is
+        written over the one in the graph (see TestEdgeIdempotenceLive)."""
         h = _edge_handler()
         first = h.reconcile(("a", "b"), _EdgeValue("a", "b", {"w": 1}), [], False)
         assert first is not None
@@ -2192,15 +2193,15 @@ class TestEdgeReconcile:
         out = h.reconcile(
             ("a", "b"), _EdgeValue("a", "b", {"w": 2}), [first.tracking_record], False
         )
-        assert out is not None and out.action.op == "replace"
+        assert out is not None and out.action.op == "upsert"
 
-    def test_prev_may_be_missing_forces_replace(self) -> None:
+    def test_prev_may_be_missing_forces_a_write(self) -> None:
         h, v = _edge_handler(), _EdgeValue("a", "b", {})
         first = h.reconcile(("a", "b"), v, [], False)
         assert first is not None
         assert not isinstance(first.tracking_record, coco.NonExistenceType)
         out = h.reconcile(("a", "b"), v, [first.tracking_record], True)
-        assert out is not None and out.action.op == "replace"
+        assert out is not None and out.action.op == "upsert"
 
     def test_undeclared_deletes(self) -> None:
         h = _edge_handler()
@@ -2214,13 +2215,7 @@ class TestEdgeReconcile:
 
     def test_undeclared_with_uncertain_prev_still_deletes(self) -> None:
         """Edge counterpart of the node case: an edge whose tracking was lost
-        must still be deleted, or it survives in the graph untracked forever.
-
-        `_EdgeHandler.reconcile` already refuses to trust `(prev=[],
-        prev_may_be_missing=True)` on the insert side — it forces "replace"
-        there precisely because the edge might still be live. The delete side
-        must read that same signal the same way.
-        """
+        must still be deleted, or it survives in the graph untracked forever."""
         out = _edge_handler().reconcile(("a", "b"), coco.NON_EXISTENCE, [], True)
         assert out is not None and out.action.op == "delete"
 
@@ -2238,17 +2233,18 @@ class TestEdgeReconcile:
         assert out.action.from_type == "Source" and out.action.to_type == "Claim"
         assert out.action.from_key_property == PropertyDef("slug", "String")
 
-    def test_empty_and_prev_may_be_missing_is_replace_not_insert(self) -> None:
-        """Empty `prev_possible_records` does not mean the edge is absent: the
-        engine reports (empty, prev_may_be_missing=True) both when a prior
-        delete's tracking record was dropped before the delete itself landed,
-        and when internal state was lost outright while the target persists
-        (e.g. db_path repointed). A bare insert in either case would silently
-        duplicate a still-live edge. Must fall through to replace — deleting
-        a nonexistent edge by coco_key is a no-op, so replace is safe even if
-        the edge turns out not to have existed."""
-        out = _edge_handler().reconcile(("a", "b"), _EdgeValue("a", "b", {}), [], True)
-        assert out is not None and out.action.op == "replace"
+
+async def _apply_entities(
+    cp: ContextProvider, actions: list[ogt._NodeAction | ogt._EdgeAction] | Any
+) -> None:
+    """Apply entity actions through the graph's entity sink, as the engine does."""
+    actions = list(actions)
+    await ogt._EntitySink(actions[0].key.db_key)(cp, actions)
+
+
+async def _apply_types(cp: ContextProvider, actions: list[ogt._TypeAction]) -> None:
+    """Apply type actions through the graph's type sink, as the engine does."""
+    await ogt._TypeSink(actions[0].key.db_key)(cp, actions)
 
 
 def _client() -> _GraphClient:
@@ -2395,19 +2391,6 @@ class TestPlanCommits:
         for c in commits:
             assert not ("insert" in c.expr and "delete" in c.expr)
 
-    def test_replace_deletes_before_it_inserts(self) -> None:
-        """Delete selects on coco_key and the replacement reuses it — insert-first
-        would delete the new edge too. Verified against the engine."""
-        commits = plan_commits([_edge("replace", "a", "b")])
-        exprs = [c.expr for c in commits]
-        del_i = next(i for i, e in enumerate(exprs) if "delete Supports" in e)
-        ins_i = next(i for i, e in enumerate(exprs) if "insert Supports" in e)
-        assert del_i < ins_i
-
-    def test_three_phases_when_replace_and_removal_coexist(self) -> None:
-        commits = plan_commits([_edge("replace", "a", "b"), _node("delete", "gone")])
-        assert len(commits) == 3
-
     def test_edge_insert_has_no_endpoint_stubs(self) -> None:
         """Endpoint stubs are no longer emitted unconditionally by
         plan_commits — a keyed insert is a full-record replace in Omnigraph
@@ -2416,7 +2399,7 @@ class TestPlanCommits:
         sink builds a stub reactively, only after an insert fails with a
         "not found" error for that specific endpoint — see
         TestEndpointRetryLive."""
-        (commit,) = plan_commits([_edge("insert", "a", "b")])
+        (commit,) = plan_commits([_edge("upsert", "a", "b")])
         assert "insert Source" not in commit.expr
         assert "insert Claim" not in commit.expr
         assert "insert Supports" in commit.expr
@@ -2431,7 +2414,7 @@ class TestPlanCommits:
         the same commit, and the engine would refuse it."""
         commits = plan_commits(
             [
-                _edge("insert", "a", "b"),
+                _edge("upsert", "a", "b"),
                 _node("upsert", "a"),
                 _node("upsert", "b", name="Claim"),
             ]
@@ -2479,83 +2462,35 @@ class TestPlanCommits:
         joined = " || ".join(c.expr for c in commits)
         assert joined.index("delete Supports") < joined.index("delete Source")
 
-    def test_chunks_when_over_the_cap(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(ogt, "_MAX_ENTITIES_PER_TYPE", 4)
+    def test_chunks_past_the_byte_budget(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        one = ogt._statement_bytes(
+            build_node_upsert(
+                "Source",
+                [PropertyValue("slug", "String", "s0")],
+                derive_coco_key(("s0",)),
+            )
+        )
+        monkeypatch.setattr(ogt, "_MAX_REQUEST_BYTES", 4 * one)
         assert len(plan_commits([_node("upsert", f"s{i}") for i in range(10)])) == 3
 
-    def test_cap_is_per_type_not_global(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(ogt, "_MAX_ENTITIES_PER_TYPE", 4)
-        actions = [_node("upsert", f"s{i}") for i in range(3)]
-        actions += [_node("upsert", f"c{i}", name="Claim") for i in range(3)]
-        assert len(plan_commits(actions)) == 1
-
-    def test_a_total_cap_bounds_the_commit_across_types(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The per-type cap is deliberate, but on its own it bounded nothing:
-        N types each at the cap produced ONE commit of N x cap entities
-        (10 types measured at ~9.5 MB of GQ), and
-        `_mutate_with_endpoint_retry` re-sends the whole commit on every
-        endpoint-stub retry.
-        """
-        monkeypatch.setattr(ogt, "_MAX_ENTITIES_PER_TYPE", 4)
-        monkeypatch.setattr(ogt, "_MAX_ENTITIES_PER_COMMIT", 5)
-        actions = [_node("upsert", f"s{i}") for i in range(3)]
-        actions += [_node("upsert", f"c{i}", name="Claim") for i in range(3)]
-        commits = plan_commits(actions)
-        assert len(commits) > 1
-        assert max(c.expr.count("insert ") for c in commits) <= 5
-
-    def test_mixed_workload_respects_all_phase_invariants(self) -> None:
-        """One call exercising all four action kinds together — a node
-        upsert, an edge replace, an edge removal, and a node removal — the
-        exact combination the three-phase design exists to keep safe. The
-        commit sequence must never delete something it just wrote, and
-        never write something it is about to delete; verified directly via
-        each mutation's own bound coco_key, not just by argument."""
-        replace_coco_key = derive_coco_key(("r1", "r2"))
-        removed_edge_coco_key = derive_coco_key(("d1", "d2"))
-        removed_node_coco_key = derive_coco_key(("gone",))
-
-        actions = [
-            _node("upsert", "keep"),
-            _edge("replace", "r1", "r2"),
+    def test_a_mixed_batch_writes_then_deletes(self) -> None:
+        """The engine refuses a mutation mixing writes and deletes, so a
+        batch with both is two commits: node then edge upserts, then edge
+        then node deletes. Nothing written is deleted in the same batch."""
+        actions: list[ogt._NodeAction | ogt._EdgeAction] = [
             _edge("delete", "d1", "d2"),
             _node("delete", "gone"),
+            _edge("upsert", "r1", "r2"),
+            _node("upsert", "keep"),
         ]
-        commits = plan_commits(actions)
-        assert len(commits) == 3
-        phase_a, phase_b, phase_c = commits
-
-        # Phase A: only the replace's own delete — nothing written yet.
-        assert "delete Supports" in phase_a.expr
-        assert "insert" not in phase_a.expr
-        assert replace_coco_key in phase_a.params.values()
-
-        # Phase B: the kept node's upsert and the replace's re-insert,
-        # under the SAME coco_key phase A just deleted — never landing
-        # without that delete having already applied ahead of it.
-        assert "insert Source" in phase_b.expr
-        assert "insert Supports" in phase_b.expr
-        assert "delete" not in phase_b.expr
-        assert replace_coco_key in phase_b.params.values()
-        # ...and the node comes FIRST. Statements in a combined query
-        # execute in the order written, so an edge insert ahead of its own
-        # endpoint's upsert would fail "not found" and force the sink's
-        # stub-and-retry recovery on every single run.
-        assert phase_b.expr.index("insert Source") < phase_b.expr.index(
-            "insert Supports"
-        )
-
-        # Phase C: the two removals, edge before node, under coco_keys that
-        # never appear in phase B — nothing here was just written.
-        assert phase_c.expr.index("delete Supports") < phase_c.expr.index(
+        writes, deletes = plan_commits(actions)
+        assert "delete" not in writes.expr
+        assert writes.expr.index("insert Source") < writes.expr.index("insert Supports")
+        assert "insert" not in deletes.expr
+        assert deletes.expr.index("delete Supports") < deletes.expr.index(
             "delete Source"
         )
-        assert removed_edge_coco_key in phase_c.params.values()
-        assert removed_node_coco_key in phase_c.params.values()
-        assert replace_coco_key not in phase_c.params.values()
-        assert not set(phase_c.params.values()) & set(phase_b.params.values())
+        assert not set(deletes.params.values()) & set(writes.params.values())
 
 
 class TestPlanCommitsByteBudget:
@@ -2585,7 +2520,14 @@ class TestPlanCommitsByteBudget:
                 derive_coco_key((i,)),
             ),
         ],
-        ids=["node-delete", "edge-delete", "node-int", "node-10-props", "unicode", "edge"],
+        ids=[
+            "node-delete",
+            "edge-delete",
+            "node-int",
+            "node-10-props",
+            "unicode",
+            "edge",
+        ],
     )
     def test_the_estimate_bounds_the_rendered_request(
         self, make: Callable[[int], Statement]
@@ -2616,7 +2558,7 @@ class TestPlanCommitsByteBudget:
                 ),
                 derive_coco_key((f"s{i:06d}",)),
             )
-            for i in range(ogt._MAX_ENTITIES_PER_TYPE)
+            for i in range(8192)
         ]
         commits = plan_commits(actions)
         assert len(commits) > 1
@@ -2774,7 +2716,7 @@ class TestApplyEntityActions:
             ),
         ]
         with pytest.raises(_og.OmnigraphError, match="branch create failed"):
-            await ogt._apply_entity_actions(cp, actions)
+            await _apply_entities(cp, actions)
 
     @pytest.mark.asyncio
     async def test_branch_cleanup_failure_is_reported(
@@ -2813,7 +2755,7 @@ class TestApplyEntityActions:
         ]
 
         with pytest.raises(RuntimeError, match="could not delete it") as info:
-            await ogt._apply_entity_actions(cp, actions)
+            await _apply_entities(cp, actions)
         # The cleanup attempt failed too; it is noted, not lost, and does not
         # replace the original error.
         assert any("failed to delete" in note for note in info.value.__notes__)
@@ -2849,7 +2791,7 @@ class TestApplyEntityActions:
                 derive_coco_key(("a",)),
             ),
         ]
-        await ogt._apply_entity_actions(cp, actions)
+        await _apply_entities(cp, actions)
         assert calls == ["mutate:main"]
 
     @pytest.mark.asyncio
@@ -2906,7 +2848,7 @@ class TestApplyEntityActions:
                 key_properties=(PropertyValue("slug", "String", slug),),
             )
 
-        await ogt._apply_entity_actions(
+        await _apply_entities(
             cp,
             [
                 delete("a"),
@@ -3004,7 +2946,7 @@ class TestApplyEntityActions:
                 PropertyDef("slug", "String"),
             ),
         ]
-        await ogt._apply_entity_actions(cp, actions)
+        await _apply_entities(cp, actions)
 
         # The failed live attempt, then the whole thing redone on scratch.
         assert calls[0] == "mutate:main"
@@ -3070,7 +3012,7 @@ class TestApplyEntityActions:
         db = ContextKey[ConnectionFactory](f"test_db_{uuid.uuid4().hex}")
         cp = ContextProvider()
         cp.provide(db, _fake_conn())
-        await ogt._apply_entity_actions(cp, self._two_edge_actions(db.key))
+        await _apply_entities(cp, self._two_edge_actions(db.key))
         assert present == {
             ("Source", "s1"),
             ("Claim", "c1"),
@@ -3104,7 +3046,7 @@ class TestApplyEntityActions:
         cp = ContextProvider()
         cp.provide(db, _fake_conn())
         with pytest.raises(_og.OmnigraphError, match="not found"):
-            await ogt._apply_entity_actions(cp, self._two_edge_actions(db.key))
+            await _apply_entities(cp, self._two_edge_actions(db.key))
         # The live attempt, the first scratch attempt, and exactly one retry
         # after the stub — never a second retry for the same endpoint.
         assert attempts == 3
@@ -3152,19 +3094,23 @@ class TestApplyEntityActions:
         db = ContextKey[ConnectionFactory](f"test_db_{uuid.uuid4().hex}")
         cp = ContextProvider()
         cp.provide(db, conn)
-        edge_action = ogt._EdgeAction(
-            "replace",
-            _TypeKey(db.key, "edge", "Supports"),
-            "Supports",
-            derive_coco_key(("s1", "c1")),
-            "s1",
-            "c1",
-            (),
-            "Source",
-            "Claim",
-            PropertyDef("slug", "String"),
-            PropertyDef("slug", "String"),
-        )
+        # A write and a delete are two commits, so a scratch branch.
+        edge_actions = [
+            ogt._EdgeAction(
+                op,
+                _TypeKey(db.key, "edge", "Supports"),
+                "Supports",
+                derive_coco_key(("s1", to)),
+                "s1",
+                to,
+                (),
+                "Source",
+                "Claim",
+                PropertyDef("slug", "String"),
+                PropertyDef("slug", "String"),
+            )
+            for op, to in (("upsert", "c1"), ("delete", "c2"))
+        ]
         schema_action = _type_action(
             "insert",
             "Added",
@@ -3175,7 +3121,7 @@ class TestApplyEntityActions:
             schema_started.set()
             await ogt._apply_type_schema(_GraphClient(conn), [schema_action])
 
-        entity_task = asyncio.create_task(ogt._apply_entity_actions(cp, [edge_action]))
+        entity_task = asyncio.create_task(_apply_entities(cp, edge_actions))
         await branch_created.wait()
         schema_task = asyncio.create_task(reconcile_schema())
         await schema_started.wait()
@@ -3409,7 +3355,7 @@ class TestFailureMatrix:
             derive_coco_key(("a",)),
         )
         with pytest.raises(type(error)) as info:
-            await ogt._apply_entity_actions(cp, [action])
+            await _apply_entities(cp, [action])
         assert info.value is error
         assert calls == ["main"]  # never retried
 
@@ -4186,23 +4132,19 @@ class TestNodeTargetKeyValidation:
         _in_component(lambda: omnigraph.node_target(_fresh_db("date"), "Doc", schema))
 
     def test_keyless_schema_is_refused(self) -> None:
-        """A hand-built `NodeSchema` with an empty key must be refused at
-        mount, not silently collapse every row onto one target state.
-
-        `NodeSchema` is public and in `__all__`; only `from_class` enforces a
-        non-empty key, and the optional `key=` kwarg is only cross-checked
-        when supplied. Without this guard the type renders with no `@key`,
-        every row derives the SAME `coco_key` from the empty key tuple, all
-        rows share one StableKey (last write wins in tracking), and an
-        unkeyed Omnigraph insert is a strict insert that duplicates on every
-        re-run. `_validate_edge_endpoint` already has this guard — but only
-        for types used as endpoints.
-        """
-        schema = NodeSchema(properties={"slug": PropertyDef("slug", "String")}, key=())
-        with pytest.raises(ValueError, match="must declare a key"):
-            _in_component(
-                lambda: omnigraph.node_target(_fresh_db("keyless"), "Node", schema)
-            )
+        """A hand-built `NodeSchema` must have exactly one key: with none every
+        row shares one identity and an unkeyed insert duplicates the row on
+        every run, and the engine rejects two `@key`s."""
+        props = {
+            "slug": PropertyDef("slug", "String"),
+            "n": PropertyDef("n", "I64"),
+        }
+        for key in ((), ("slug", "n")):
+            schema = NodeSchema(properties=props, key=key)
+            with pytest.raises(ValueError, match="must declare exactly one key"):
+                _in_component(
+                    lambda: omnigraph.node_target(_fresh_db("keyless"), "Node", schema)
+                )
 
 
 class TestRecordToDict:
@@ -4423,14 +4365,8 @@ def _capture_mutations(monkeypatch: pytest.MonkeyPatch) -> list[Query]:
 
 
 def _patch_cli_branch_calls(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A brand-new declaration through a real `coco.App` run reports
-    `prev_may_be_missing=True` (there's genuinely no tracked history yet —
-    see `test_dicts_data_together_insert` in test_component_target_states.py
-    for the same behavior on an unrelated target), so a first-ever edge
-    goes through `_EdgeHandler`'s "replace" path (delete-then-insert, two
-    commits applied via a scratch branch) rather than a bare insert. These
-    no-op the scratch-branch machinery so it doesn't touch a real process;
-    `_capture_mutations` still sees both commits."""
+    """No-op the scratch-branch calls, for a batch that plans into more than
+    one commit; `_capture_mutations` still sees every commit."""
 
     async def noop_branch_create(self: object, name: str, *, frm: str) -> None:
         return None
@@ -4557,12 +4493,7 @@ async def _declare_supports_edge(db: coco.ContextKey[ConnectionFactory]) -> None
 def test_declare_edge_reaches_the_target_state(monkeypatch: pytest.MonkeyPatch) -> None:
     """`coco_key` for an edge is derived from `(from_id, to_id)`, not from
     any property — verifies `declare_edge`'s own key construction, not just
-    `_EdgeHandler.reconcile`'s (already covered elsewhere).
-
-    A first-ever edge declaration through a real `coco.App` run reports
-    `prev_may_be_missing=True`, so this lands as a "replace" (delete then
-    insert, two commits) rather than a bare insert — see
-    `_patch_cli_branch_calls`. Only the insert commit is asserted on."""
+    `_EdgeHandler.reconcile`'s (already covered elsewhere)."""
     _patch_cli_schema_calls(monkeypatch)
     _patch_cli_branch_calls(monkeypatch)
     captured = _capture_mutations(monkeypatch)
@@ -5124,33 +5055,20 @@ class TestEngineSchemaLimitsLive:
 
 
 @_live
-class TestFullCapCommitLive:
-    """A commit at the full `_MAX_ENTITIES_PER_TYPE` must actually reach the
-    engine.
+class TestLargeSyncLive:
+    """A real-size sync reaches the engine. At 8,192 entities the payload is
+    several MB, past the server's 1 MiB request limit, so it must be cut into
+    commits and land through a scratch branch."""
 
-    Nothing exercised this: every chunking test monkeypatches the cap DOWN
-    (to 4), so the suite only ever built commits three orders of magnitude
-    smaller than the one a real component produces. At the real cap the
-    payload is ~1.3 MB of GQ plus ~1.0 MB of params, and passing those
-    inline put both in argv — `OSError: [Errno 7] Argument list too long`
-    on darwin, and on Linux the 128 KiB-per-argument limit would have
-    failed the expression alone somewhere near 800 entities.
-
-    Deliberately the real cap, not a scaled-down stand-in: the number that
-    matters is the one the connector ships with, and the whole defect was
-    that nobody multiplied it by the bytes per entity.
-    """
-
-    def test_a_sync_at_the_entity_cap_applies(self, tmp_path: Path) -> None:
+    def test_a_large_sync_applies(self, tmp_path: Path) -> None:
         """8,192 upserts of one type in one sync reach the graph, each commit
-        under the server's 1 MiB request limit (so through a scratch branch,
-        as several commits)."""
+        under the server's request limit."""
         store_dir = tmp_path / "cap.omni"
         _deploy_live(
             store_dir,
             "node Source {\n  slug: String @key\n  title: String?\n  coco_key: String\n}\n",
         )
-        n = ogt._MAX_ENTITIES_PER_TYPE
+        n = 8192
 
         async def sync() -> None:
             conn = _live_conn(store_dir)
@@ -5175,7 +5093,7 @@ class TestFullCapCommitLive:
                 body = {"query": commit.expr, "params": commit.params, "branch": "main"}
                 assert len(json.dumps(body).encode()) < 1_048_576
             try:
-                await ogt._apply_entity_actions(cp, actions)
+                await _apply_entities(cp, actions)
             finally:
                 await conn.close()
 
@@ -5341,7 +5259,7 @@ class TestApplyTypeActionsLive:
         create_action = ogt._TypeAction(
             key, spec, pg_fragment, "insert", {}, owner="og"
         )
-        await ogt._apply_type_actions(cp, [create_action])
+        await _apply_types(cp, [create_action])
         assert isinstance(ogt._type_child_handler(cp, create_action), ogt._NodeHandler)
         first = _read_schema_source(store_dir)
         assert "node Simple {" in first
@@ -5349,7 +5267,7 @@ class TestApplyTypeActionsLive:
         upsert_action = ogt._TypeAction(
             key, spec, pg_fragment, "upsert", {}, owner="og"
         )
-        await ogt._apply_type_actions(cp, [upsert_action])
+        await _apply_types(cp, [upsert_action])
         assert isinstance(ogt._type_child_handler(cp, upsert_action), ogt._NodeHandler)
         assert _read_schema_source(store_dir) == first
 
@@ -5384,7 +5302,7 @@ class TestApplyTypeActionsLive:
             managed_by=ManagedBy.SYSTEM,
             owner="og",
         )
-        await ogt._apply_type_actions(
+        await _apply_types(
             cp,
             [
                 ogt._TypeAction(
@@ -5415,7 +5333,7 @@ class TestApplyTypeActionsLive:
             {},
             owner="og",
         )
-        await ogt._apply_type_actions(cp, [b_action])
+        await _apply_types(cp, [b_action])
         assert isinstance(ogt._type_child_handler(cp, b_action), ogt._NodeHandler)
 
         schema_source = await client.read_schema()
@@ -5475,7 +5393,7 @@ class TestEdgeIdempotenceLive:
             + render_edge_type("Supports", "Source", "Claim", [], owner="og")
             + "\n",
         )
-        await ogt._apply_entity_actions(
+        await _apply_entities(
             cp, [_upsert(db_key, "Source", "s1"), _upsert(db_key, "Claim", "c1")]
         )
         insert = ogt._EdgeAction(
@@ -5491,10 +5409,122 @@ class TestEdgeIdempotenceLive:
             PropertyDef("slug", "String"),
             PropertyDef("slug", "String"),
         )
-        await ogt._apply_entity_actions(cp, [insert])
-        await ogt._apply_entity_actions(cp, [insert])
+        await _apply_entities(cp, [insert])
+        await _apply_entities(cp, [insert])
         edges = [r for r in _export_rows(store_dir) if r.get("edge") == "Supports"]
         assert len(edges) == 1
+        await conn.close()
+
+    @pytest.mark.asyncio
+    async def test_a_changed_edge_is_one_commit_on_the_live_branch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An edge type is keyed on its endpoints, so an insert of an edge
+        that exists updates it: a changed edge is one upsert, with no
+        delete ahead of it and so no scratch branch."""
+        store_dir = tmp_path / "g.omni"
+        conn = _live_conn(store_dir)
+        cp, db_key = _live_context(conn)
+        _deploy_live(
+            store_dir,
+            "node Source {\n  slug: String @key\n  coco_key: String\n}\n\n"
+            "node Claim {\n  slug: String @key\n  coco_key: String\n}\n\n"
+            + render_edge_type(
+                "Supports", "Source", "Claim", [("w", "I64")], owner="og"
+            )
+            + "\n",
+        )
+        await _apply_entities(
+            cp, [_upsert(db_key, "Source", "s1"), _upsert(db_key, "Claim", "c1")]
+        )
+        handler = _EdgeHandler(
+            "Supports",
+            _TypeKey(db_key, "edge", "Supports"),
+            "Source",
+            "Claim",
+            PropertyDef("slug", "String"),
+            PropertyDef("slug", "String"),
+            {"w": PropertyDef("w", "I64")},
+        )
+        first = handler.reconcile(
+            ("s1", "c1"), _EdgeValue("s1", "c1", {"w": 1}), [], False
+        )
+        assert first is not None
+        assert not isinstance(first.tracking_record, coco.NonExistenceType)
+        await _apply_entities(cp, [first.action])
+        changed = handler.reconcile(
+            ("s1", "c1"),
+            _EdgeValue("s1", "c1", {"w": 2}),
+            [first.tracking_record],
+            False,
+        )
+        assert changed is not None
+
+        created: list[str] = []
+        real_create = _GraphClient.branch_create
+
+        async def spy(self: _GraphClient, name: str, *, frm: str) -> None:
+            created.append(name)
+            await real_create(self, name, frm=frm)
+
+        monkeypatch.setattr(_GraphClient, "branch_create", spy)
+        before = _commit_count(store_dir)
+        await _apply_entities(cp, [changed.action])
+        assert _commit_count(store_dir) - before == 1
+        assert created == []
+        edges = [r for r in _export_rows(store_dir) if r.get("edge") == "Supports"]
+        assert [e["data"]["w"] for e in edges] == [2]
+        await conn.close()
+
+    @pytest.mark.asyncio
+    async def test_an_edge_written_in_the_batch_that_deletes_its_endpoint_survives(
+        self, tmp_path: Path
+    ) -> None:
+        """Deleting a node cascades to its edges. When the same batch writes
+        an edge to a node it deletes, the write lands first and the delete
+        then took the new edge along, while its tracking says it exists. The
+        node has to become a stub instead, as it does for an edge that is
+        already in the graph."""
+        store_dir = tmp_path / "g.omni"
+        conn = _live_conn(store_dir)
+        cp, db_key = _live_context(conn)
+        _deploy_live(
+            store_dir,
+            "node Source {\n  slug: String @key\n  coco_key: String\n}\n\n"
+            "node Claim {\n  slug: String @key\n  title: String?\n  coco_key: String\n}\n\n"
+            + render_edge_type("Supports", "Source", "Claim", [], owner="og")
+            + "\n",
+        )
+        await _apply_entities(
+            cp,
+            [
+                _upsert(db_key, "Source", "s1"),
+                _upsert(db_key, "Claim", "c1", PropertyValue("title", "String?", "T")),
+            ],
+        )
+        delete_claim = ogt._NodeAction(
+            "delete",
+            _TypeKey(db_key, "node", "Claim"),
+            "Claim",
+            (),
+            derive_coco_key(("c1",)),
+            key_properties=(PropertyValue("slug", "String", "c1"),),
+        )
+        edge = _EdgeHandler(
+            "Supports",
+            _TypeKey(db_key, "edge", "Supports"),
+            "Source",
+            "Claim",
+            PropertyDef("slug", "String"),
+            PropertyDef("slug", "String"),
+            {},
+        ).reconcile(("s1", "c1"), _EdgeValue("s1", "c1", {}), [], False)
+        assert edge is not None
+        await _apply_entities(cp, [delete_claim, edge.action])
+        rows = _export_rows(store_dir)
+        assert len([r for r in rows if r.get("edge") == "Supports"]) == 1
+        claims = [r for r in rows if r.get("type") == "Claim"]
+        assert [c["data"].get("title") for c in claims] == [None]
         await conn.close()
 
 
@@ -5540,7 +5570,7 @@ class TestServedMatrixLive:
         conn = _live_conn(store_dir)
         cp, db_key = _live_context(conn)
         key = _TypeKey(db_key, "node", "Source")
-        await ogt._apply_entity_actions(cp, [_upsert(db_key, "Source", "gone")])
+        await _apply_entities(cp, [_upsert(db_key, "Source", "gone")])
 
         on_scratch = asyncio.Event()
         real_mutate = _GraphClient.mutate
@@ -5558,7 +5588,7 @@ class TestServedMatrixLive:
             _upsert(db_key, "Source", "new"),
             ogt._NodeAction("delete", key, "Source", (), derive_coco_key(("gone",))),
         ]
-        task = asyncio.create_task(ogt._apply_entity_actions(cp, mixed))
+        task = asyncio.create_task(_apply_entities(cp, mixed))
         await on_scratch.wait()
         assert len(_branch_names(store_dir)) == 2
         task.cancel()
@@ -5586,7 +5616,7 @@ class TestServedMatrixLive:
                 key = _TypeKey(db_key, "node", "Source")
                 try:
                     for i in range(4):
-                        await ogt._apply_entity_actions(
+                        await _apply_entities(
                             cp,
                             [
                                 _upsert(db_key, "Source", f"{prefix}{i}"),
@@ -5860,74 +5890,6 @@ class TestServedTopologiesLive:
 
 
 @_live
-class TestReplaceOrderingLive:
-    @pytest.mark.asyncio
-    async def test_replace_leaves_exactly_one_edge_with_new_value(
-        self, tmp_path: Path
-    ) -> None:
-        """The check that would have caught the original draft's ordering
-        bug: if phase A (the replaced edge's delete) ran after phase B (its
-        re-insert) instead of before, this would see zero edges survive —
-        insert-then-delete on one coco_key removes both."""
-        store_dir = tmp_path / "g.omni"
-        conn = _live_conn(store_dir)
-        store_uri = f"file://{store_dir}"
-        cp, db_key = _live_context(conn)
-        _deploy_live(store_dir, _basic_pg())
-
-        # Both endpoints already exist, so the edge insert below needs no
-        # retry — that path is exercised separately in TestEndpointRetryLive.
-        await ogt._apply_entity_actions(
-            cp, [_upsert(db_key, "Source", "s1"), _upsert(db_key, "Claim", "c1")]
-        )
-
-        edge_key = _TypeKey(db_key, "edge", "Supports")
-        edge_coco_key = derive_coco_key(("s1", "c1"))
-
-        insert_action = ogt._EdgeAction(
-            "insert",
-            edge_key,
-            "Supports",
-            edge_coco_key,
-            "s1",
-            "c1",
-            (PropertyValue("weight", "I64", 1),),
-            "Source",
-            "Claim",
-            PropertyDef("slug", "String"),
-            PropertyDef("slug", "String"),
-        )
-        await ogt._apply_entity_actions(cp, [insert_action])
-
-        rows = _export_rows(store_uri)
-        edges = [r for r in rows if r.get("edge") == "Supports"]
-        assert len(edges) == 1
-        assert edges[0]["data"].get("weight") == 1
-
-        replace_action = ogt._EdgeAction(
-            "replace",
-            edge_key,
-            "Supports",
-            edge_coco_key,
-            "s1",
-            "c1",
-            (PropertyValue("weight", "I64", 2),),
-            "Source",
-            "Claim",
-            PropertyDef("slug", "String"),
-            PropertyDef("slug", "String"),
-        )
-        commits = plan_commits([replace_action])
-        assert len(commits) == 2  # phase A (delete) + phase B (insert)
-        await ogt._apply_entity_actions(cp, [replace_action])
-
-        rows = _export_rows(store_uri)
-        edges = [r for r in rows if r.get("edge") == "Supports"]
-        assert len(edges) == 1
-        assert edges[0]["data"].get("weight") == 2
-
-
-@_live
 class TestEndpointRetryLive:
     @pytest.mark.asyncio
     async def test_edge_insert_retries_after_creating_missing_endpoint(
@@ -5946,7 +5908,7 @@ class TestEndpointRetryLive:
         cp, db_key = _live_context(conn)
         _deploy_live(store_dir, _basic_pg())
 
-        await ogt._apply_entity_actions(cp, [_upsert(db_key, "Claim", "c1")])
+        await _apply_entities(cp, [_upsert(db_key, "Claim", "c1")])
 
         edge_key = _TypeKey(db_key, "edge", "Supports")
         insert_action = ogt._EdgeAction(
@@ -5962,7 +5924,7 @@ class TestEndpointRetryLive:
             PropertyDef("slug", "String"),
             PropertyDef("slug", "String"),
         )
-        await ogt._apply_entity_actions(cp, [insert_action])
+        await _apply_entities(cp, [insert_action])
 
         rows = _export_rows(store_uri)
         assert len([r for r in rows if r.get("edge") == "Supports"]) == 1
@@ -5986,7 +5948,7 @@ class TestEndpointRetryLive:
         cp, db_key = _live_context(conn)
         _deploy_live(store_dir, _basic_pg(source_extra="  title: String?\n"))
 
-        await ogt._apply_entity_actions(
+        await _apply_entities(
             cp,
             [
                 _upsert(
@@ -6013,7 +5975,7 @@ class TestEndpointRetryLive:
             PropertyDef("slug", "String"),
             PropertyDef("slug", "String"),
         )
-        await ogt._apply_entity_actions(cp, [insert_action])
+        await _apply_entities(cp, [insert_action])
 
         rows = _export_rows(store_uri)
         assert len([r for r in rows if r.get("edge") == "Supports"]) == 1
@@ -6054,7 +6016,7 @@ class TestEndpointRetryLive:
             PropertyDef("slug", "String"),
             PropertyDef("slug", "String"),
         )
-        await ogt._apply_entity_actions(cp, [insert_action])
+        await _apply_entities(cp, [insert_action])
 
         rows = _export_rows(store_uri)
         assert len([r for r in rows if r.get("edge") == "Supports"]) == 1
@@ -6089,7 +6051,7 @@ class TestEndpointRetryLive:
             )
             for s, c in (("s1", "c1"), ("s2", "c2"))
         ]
-        await ogt._apply_entity_actions(cp, actions)
+        await _apply_entities(cp, actions)
 
         rows = _export_rows(store_uri)
         assert len([r for r in rows if r.get("edge") == "Supports"]) == 2
@@ -6702,19 +6664,26 @@ class TestEndToEnd:
     def test_oversized_component_uses_branch(
         self, store: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Force the per-type chunking cap down so a batch of new Source
-        rows plans into multiple upsert commits (plan_commits' chunking via
-        _MAX_ENTITIES_PER_TYPE). More than one commit for a single sync
+        """Force the request budget down so a batch of new Source rows plans
+        into multiple upsert commits. More than one commit for a single sync
         must land on `main` as ONE commit, via a scratch branch merged in
         and cleaned up afterward -- not as several commits applied directly
         to `main`, and not with a stray coco_scratch_* branch left behind.
-        Warms the store up with 2 Source rows (under the cap) first, so the
+        Warms the store up with 2 Source rows first, so the
         commit-count delta measured across the second run isolates the
         chunked entity phase from the type-creation commits, which are a
         separate, unconditional code path covered elsewhere. A sibling
         Claim row, declared and left unchanged in both runs, proves the
         scratch-branch path doesn't disturb it."""
-        monkeypatch.setattr(ogt, "_MAX_ENTITIES_PER_TYPE", 4)
+        row = build_node_upsert(
+            "Source",
+            [
+                PropertyValue("slug", "String", "s0"),
+                PropertyValue("title", "String?", "S0"),
+            ],
+            derive_coco_key(("s0",)),
+        )
+        monkeypatch.setattr(ogt, "_MAX_REQUEST_BYTES", 4 * ogt._statement_bytes(row))
         db = _e2e_db(store, "oversized")
         row_count = {"n": 2}
 
@@ -6732,7 +6701,7 @@ class TestEndToEnd:
         app.update_blocking()  # warm-up: creates both types, 2 Source rows, 1 Claim row
 
         before = _commit_count(store)
-        row_count["n"] = 10  # 8 new rows -> 2 upsert chunks of 4 at cap=4
+        row_count["n"] = 10  # 8 new rows -> 2 upsert commits of 4
         app.update_blocking()
         after = _commit_count(store)
 
@@ -7299,6 +7268,7 @@ class TestEndToEnd:
             "edge Supports: Source -> Claim {\n"
             "  // coco_managed_by_e2e_comment_ownership: Bool? was deliberately omitted\n"
             "  coco_key: String\n"
+            "  @key(@src, @dst)\n"
             "}\n"
         )
         assert _init_live(store_dir, hand_written).returncode == 0
@@ -7328,6 +7298,51 @@ class TestEndToEnd:
             app.drop_blocking()
         assert "was deliberately omitted" in _read_schema_source(store)
         assert len([r for r in _export_rows(store) if r.get("edge") == "Supports"]) == 1
+
+    def test_a_user_edge_type_without_an_endpoint_key_is_refused(
+        self, store: str
+    ) -> None:
+        """Edges are written with a plain `insert`, which updates an edge of a
+        type keyed on its endpoints and adds another copy otherwise, so an
+        unkeyed user-managed edge type is refused before anything is written."""
+        store_dir = Path(store[len("file://") :])
+        hand_written = (
+            "node Source {\n  slug: String @key\n  title: String?\n  coco_key: String\n}\n\n"
+            "node Claim {\n  slug: String @key\n  coco_key: String\n}\n\n"
+            "edge Supports: Source -> Claim {\n"
+            "  // @key(@src, @dst) in a comment does not count\n"
+            "  coco_key: String\n"
+            "}\n"
+        )
+        assert _init_live(store_dir, hand_written).returncode == 0
+        db = _e2e_db(store, "unkeyed_user_edge")
+
+        async def main() -> None:
+            sources = await omnigraph.mount_node_target(
+                db,
+                "Source",
+                await NodeSchema.from_class(_ScSourceNarrow, key="slug"),
+                managed_by=ManagedBy.USER,
+            )
+            claims = await omnigraph.mount_node_target(
+                db,
+                "Claim",
+                await NodeSchema.from_class(_ScClaim, key="slug"),
+                managed_by=ManagedBy.USER,
+            )
+            supports = await omnigraph.mount_edge_target(
+                db, "Supports", sources, claims, managed_by=ManagedBy.USER
+            )
+            sources.declare_node(node=_ScSourceNarrow(slug="a", title="A"))
+            claims.declare_node(node=_ScClaim(slug="c1"))
+            supports.declare_edge(from_id="a", to_id="c1")
+
+        app = coco.App(
+            coco.AppConfig(name="e2e_unkeyed_user_edge", environment=coco_env), main
+        )
+        with pytest.raises(ValueError, match=r"'Supports'.*@key\(@src, @dst\)"):
+            app.update_blocking()
+        assert _export_rows(store) == []
 
     def test_dropping_an_app_leaves_another_apps_edge_type_alone(
         self, store: str

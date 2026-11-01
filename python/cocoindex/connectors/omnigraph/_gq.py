@@ -395,6 +395,19 @@ def _find_type_block(
     return matching[0].start, matching[0].end
 
 
+_ENDPOINT_KEY_RE = re.compile(r"@key\s*\(\s*@src\s*,\s*@dst\s*\)")
+
+
+def edge_keyed_on_endpoints(existing_pg: str, type_name: str) -> bool | None:
+    """Whether the edge type `type_name` declares `@key(@src, @dst)`, or
+    `None` if the schema has no such edge type. Comments do not count."""
+    span = _find_type_block(existing_pg, "edge", type_name)
+    if span is None:
+        return None
+    start, end = span
+    return _ENDPOINT_KEY_RE.search(_blank_comments(existing_pg)[start:end]) is not None
+
+
 #: An ownership declaration together with the whitespace that is its own:
 #: the line break and indentation before it, or the run of spaces before it
 #: in a one-line block — never more, or a release would eat the (blanked)
@@ -573,9 +586,8 @@ _SLOT = "$?"
 
 
 def render_query(statements: Sequence[Statement]) -> Query:
-    """Render statements into ONE `query m(...) { ... }` — one CLI
-    invocation, one commit. N separate `mutate` calls would be N commits
-    and no atomicity.
+    """Render statements into ONE `query m(...) { ... }`: one request, one
+    commit. N separate `mutate` calls would be N commits and no atomicity.
 
     Each statement's binds become parameters `s{i}_{label}`, declared in the
     signature in slot order and substituted for the statement's `$?` slots
@@ -701,10 +713,9 @@ def build_edge_insert(
     props: Sequence[PropertyValue],
     coco_key: str,
 ) -> Statement:
-    """Edge `insert` always creates a new edge — Omnigraph never deduplicates
-    and provides no settable id. Idempotence comes entirely from the connector
-    refusing to re-insert an edge whose `coco_key` it already tracks, and from
-    deleting by `coco_key` before re-inserting a changed one.
+    """Edge `insert`. On a type keyed on its endpoints (`@key(@src, @dst)`,
+    which every edge type the connector writes is) it updates the edge
+    between the two nodes if there is one.
 
     `from_ref.name`/`to_ref.name` are ignored — the assignment is always
     literally `from`/`to`; only `.pg_type` and `.value` address the endpoint.

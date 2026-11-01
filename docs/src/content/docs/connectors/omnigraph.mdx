@@ -220,7 +220,7 @@ def EdgeTarget.declare_edge(
 - `record` — Optional row object whose fields populate the edge's own properties.
 
 
-The connector's identity for an edge is always the `(from_id, to_id)` pair. A system-managed edge type is declared with `@key(@src, @dst)`, so the engine derives the edge's id from its endpoints and an `insert` of an edge that already exists updates it: a second `declare_edge` call for the same pair updates that one edge rather than creating a second, parallel edge.
+The connector's identity for an edge is always the `(from_id, to_id)` pair. Every edge type it writes is keyed on its endpoints, `@key(@src, @dst)` (the connector declares it on a system-managed type and requires it on a user-managed one), so the engine derives the edge's id from its endpoints and an `insert` of an edge that already exists updates it: a second `declare_edge` call for the same pair updates that one edge rather than creating a second, parallel edge.
 
 ### The synthetic `coco_key` property
 
@@ -355,7 +355,7 @@ The one exception is the handoff itself. When a type the connector created is re
 :::caution[`managed_by="user"` types must declare `coco_key` yourself]
 The connector addresses every entity through the synthetic `coco_key` property, and under `managed_by="user"` it never writes the schema — so it cannot add that column for you. Every insert names `coco_key`, and every delete filters on it. Against a type whose `.pg` lacks it, *all* row writes fail with `type 'X' has no property 'coco_key'`.
 
-Add it to the type's definition when you create the graph. Give an edge type `@key(@src, @dst)` as well: the connector's edge identity is its endpoint pair, and without the key a write the engine retries after a partial failure inserts the edge a second time.
+Add it to the type's definition when you create the graph. An edge type also needs `@key(@src, @dst)`: the connector writes an edge with a plain `insert`, which updates an edge keyed on its endpoints and adds another copy of an unkeyed one, so an update refuses a user-managed edge type without the key before writing anything.
 
 ```
 node Source {
@@ -393,9 +393,9 @@ The same shape covers the reverse order. Deleting a node in Omnigraph cascades t
 
 ## Branching and the sink
 
-Within one component's sync, the connector partitions its writes by target graph, and orders node upserts before edge inserts (so endpoints exist before edges reference them) and edge deletes before node deletes (so no edge dangles). If everything fits in one Omnigraph commit — a single kind of change (all upserts, or all deletes), no more than 8,192 entities of any one type and 32,768 in total, and a request body under the server's 1 MiB limit — it's sent as one direct write to the branch configured on `ConnectionFactory`.
+Within one sync of one graph, the connector orders node upserts before edge upserts (so endpoints exist before edges reference them) and edge deletes before node deletes (so no edge dangles). If everything fits in one Omnigraph commit — a single kind of change (all upserts, or all deletes) and a request body under the server's 1 MiB limit — it's sent as one direct write to the branch configured on `ConnectionFactory`.
 
-When a component's writes don't fit — more than 8,192 entities of one type, more than 1 MiB of request, or a mix of upserts *and* deletes in the same sync (Omnigraph refuses to combine `insert`/`update` with `delete` in a single mutation) — the connector opens a scratch branch off the target branch, applies every chunk there, and merges it with one `branch merge` that also deletes it. A single-commit sync that turns out to need an endpoint stub escalates to the same path: the recovery is two commits, and running it against the live branch could leave an orphan stub node behind if the retry then failed. Nothing is lost by the attempt — a failed Omnigraph mutation applies nothing at all. This keeps the component's target-state sync atomic from a reader's perspective, even though it lands as several underlying commits.
+When a component's writes don't fit — more than 1 MiB of request, or a mix of upserts *and* deletes in the same sync (Omnigraph refuses to combine `insert`/`update` with `delete` in a single mutation) — the connector opens a scratch branch off the target branch, applies every chunk there, and merges it with one `branch merge` that also deletes it. A single-commit sync that turns out to need an endpoint stub escalates to the same path: the recovery is two commits, and running it against the live branch could leave an orphan stub node behind if the retry then failed. Nothing is lost by the attempt — a failed Omnigraph mutation applies nothing at all. This keeps the component's target-state sync atomic from a reader's perspective, even though it lands as several underlying commits.
 
 The server orders concurrent writes and merges on a graph itself, so no client-side lock is involved. If another writer changed the same entity on the target branch meanwhile, the merge fails with a `divergent_update` conflict, the component's sync fails, the scratch branch is deleted, and the next run re-reads and retries. If the sync fails for any reason, the branch is deleted on the way out; a process killed before that leaves one behind, which blocks schema changes until it is deleted once it is an hour old.
 
@@ -408,7 +408,7 @@ The connector never retries a write. A write whose outcome is unknown (the conne
 | Bad or missing token, missing permission | `UnauthorizedError` / `ForbiddenError` from the SDK, naming the action |
 | Graph not served | `SchemaDeployError` (schema write) or `NotFoundError`, naming the graph and the server |
 | Merge conflict with a concurrent write | `ConflictError` listing `merge_conflicts`; the next run retries |
-| Over the server's entity or request limit | Connector-planned commits are cut at 8,192 entities and below 1 MiB; only a single entity larger than the limit by itself fails, with `PayloadTooLargeError` |
+| Over the server's request limit | Connector-planned commits are cut below 1 MiB; only a single entity larger than the limit by itself fails, with `PayloadTooLargeError` |
 | Schema deployment blocked by branches | Retried for up to a minute, then `SchemaDeployError` |
 | Schema deployment still running after 5 minutes | `SchemaDeployError` with the deployment id; check it with `omnigraph cluster status --deployment-id` before changing the schema again |
 | A plan that touches another graph, a policy, or deletes a graph | `SchemaDeployError`; nothing is deployed and the schema file is restored |

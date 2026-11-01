@@ -50,14 +50,14 @@ def _transient(error: omnigraph.OmnigraphError) -> bool:
 
 
 async def _read(call: Callable[[], Awaitable[_T]]) -> _T:
-    for attempt in range(_READ_ATTEMPTS):
+    for attempt in range(_READ_ATTEMPTS - 1):
         try:
             return await call()
         except omnigraph.OmnigraphError as e:
-            if attempt + 1 == _READ_ATTEMPTS or not _transient(e):
+            if not _transient(e):
                 raise
-            await asyncio.sleep(_READ_BACKOFF_SECONDS * 2**attempt)
-    raise AssertionError("unreachable")
+        await asyncio.sleep(_READ_BACKOFF_SECONDS * 2**attempt)
+    return await call()
 
 
 class ConnectionFactory:

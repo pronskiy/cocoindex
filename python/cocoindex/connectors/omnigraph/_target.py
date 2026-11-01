@@ -40,6 +40,7 @@ from cocoindex.connectors.omnigraph._gq import (
     build_incident_edges_query,
     build_node_delete,
     build_node_upsert,
+    edge_keyed_on_endpoints,
     edge_types_referencing,
     incident_edge_patterns,
     merge_type_into_schema,
@@ -537,7 +538,7 @@ def _reconcile_removal(
         # ...` — confirmed live, and confirmed against the house pattern
         # (sqlite's `_TableHandler.reconcile` never returns bare `None` for
         # exactly this reason). That is why `reconcile` below always returns an
-        # output for a type that exists, and why `_apply_type_actions` skips
+        # output for a type that exists, and why `_apply_type_schema` skips
         # the schema write for an unchanged type while the factory still
         # builds its child handler.
         return None
@@ -569,7 +570,7 @@ class _TypeHandlerBase(
     coco.TargetHandler[_TypeSpec, _TypeTrackingRecord, _ChildHandlerT]
 ):
     def _render(self, key: _TypeKey, spec: _TypeSpec) -> str:
-        raise NotImplementedError
+        raise NotImplementedError  # pragma: no cover - each handler overrides it
 
     def reconcile(
         self,
@@ -809,7 +810,7 @@ class _NodeAction(NamedTuple):
 
 
 class _EdgeAction(NamedTuple):
-    op: str  # "insert" | "replace" | "delete"
+    op: str  # "upsert" | "delete"
     key: _TypeKey
     type_name: str
     coco_key: str
@@ -949,16 +950,8 @@ class _NodeHandler(coco.TargetHandler[_NodeValue, _EntityTrackingRecord, None]):
         prev_may_be_missing: bool,
         /,
     ) -> coco.TargetReconcileOutput[_NodeAction, _EntityTrackingRecord, None] | None:
-        # A composite key arrives as a tuple; a single-field key arrives as
-        # the bare scalar, so it must be wrapped before zipping with
-        # `key_fields`.
+        # `declare_node` keys the target state by a 1-tuple.
         key_tuple = key if isinstance(key, tuple) else (key,)
-        if len(key_tuple) != len(self._key_fields):
-            raise ValueError(
-                f"Node type {self._type_name!r} declares key fields "
-                f"{self._key_fields!r} but the target state's key is "
-                f"{key_tuple!r}."
-            )
         coco_key = derive_coco_key(key_tuple)
 
         if coco.is_non_existence(desired_target_state):
@@ -1077,43 +1070,19 @@ class _EdgeHandler(coco.TargetHandler[_EdgeValue, _EntityTrackingRecord, None]):
                 tracking_record=coco.NON_EXISTENCE,
             )
 
-        # An edge `insert` is strict — it never merges, so a changed edge
-        # can't be re-inserted without duplicating it, and there is no edge
-        # `update`. A brand-new edge (nothing tracked yet, and the engine is
-        # certain nothing is missing) is the one case a bare insert is safe;
-        # anything already tracked that changed, OR anything whose prior
-        # state is merely uncertain (empty `prev_possible_records` with
-        # `prev_may_be_missing` — e.g. internal state lost while the target
-        # persists, or a crash between emitting a delete and it landing),
-        # must be deleted and re-inserted rather than risk duplicating an
-        # edge that's still there. Encoded here as a single "replace" op —
-        # `plan_commits` (Task 9) is what actually splits it into two
-        # mutations, since a delete and an insert can't share one mutation.
-        # Deleting a nonexistent edge by `coco_key` is a no-op, so "replace"
-        # is always safe even when the edge turns out not to have existed.
-        #
-        # Do NOT port this fork to `statediff.diff`: for edges it is inverted.
-        # `diff` answers "insert" for `(prev=[], prev_may_be_missing=True)` —
-        # the reading that suits a keyed upsert, where re-inserting converges.
-        # An Omnigraph edge has no key to upsert on, so that exact case is the
-        # one that needs "replace", and taking `diff`'s answer would duplicate
-        # a live edge every time internal state was lost. The container
-        # handler above uses `statediff` precisely because a type CAN be
-        # re-declared idempotently; an edge cannot.
+        # Every edge type the connector writes is keyed on its endpoints
+        # (`@key(@src, @dst)`; a user-managed one is checked at the type
+        # sink), so an `insert` of an edge that exists updates it, like a
+        # keyed node `insert`.
         encoded = _encode_properties(
             desired_target_state.properties, self._property_defs
         )
         desired = _entity_record(encoded)
-        if not prev_possible_records and not prev_may_be_missing:
-            op = "insert"
-        elif not _needs_write(desired, prev_possible_records, prev_may_be_missing):
+        if not _needs_write(desired, prev_possible_records, prev_may_be_missing):
             return None
-        else:
-            op = "replace"
-
         return coco.TargetReconcileOutput(
             action=_EdgeAction(
-                op,
+                "upsert",
                 self._key,
                 self._type_name,
                 coco_key,
@@ -1134,28 +1103,12 @@ class _EdgeHandler(coco.TargetHandler[_EdgeValue, _EntityTrackingRecord, None]):
 # Commit planning: reconcile actions -> ordered Mutations, one per commit
 # ---------------------------------------------------------------------------
 
-#: Chunk cap for render_query: a single commit combining more than this
-#: many entities of one type risks an unreasonably large query. Deliberately
-#: a module constant, not a public kwarg — tests monkeypatch it directly.
-_MAX_ENTITIES_PER_TYPE = 8192
-
-#: Cap on a whole commit, across every type in it. The per-type cap above
-#: deliberately gives a large node type and a large edge type their own
-#: budgets rather than making them share one — but with nothing bounding the
-#: total, a sync touching N types produced a single commit of N x 8192
-#: entities (10 types = ~9.5 MB of GQ), and `_mutate_with_endpoint_retry`
-#: re-sends that whole commit on every endpoint-stub retry. Set to 4x the
-#: per-type cap: enough headroom for the common node-plus-its-edges shape to
-#: stay in one commit, while still bounding the pathological case.
-_MAX_ENTITIES_PER_COMMIT = 4 * _MAX_ENTITIES_PER_TYPE
-
 #: Byte budget of one commit's request body. `omnigraph-server` refuses a
 #: JSON request body over 1 MiB (`DEFAULT_REQUEST_BODY_LIMIT_BYTES`, fixed
 #: in 0.14; verified: a 1.1 MB `/mutate` answers 413 "request body refused:
 #: length limit exceeded", and at 2.3 MB the server drops the connection).
-#: An 8,192-entity commit of one short string property and its `coco_key` is
-#: about 2.3 MB, so commits are cut by size as well as by count. The budget
-#: leaves headroom for the request envelope and for estimation slack.
+#: Commits are cut by `_statement_bytes`, an upper bound on what each
+#: statement adds; the rest of the limit covers the request envelope.
 _MAX_REQUEST_BYTES = 900_000
 #: Index digits `render_query` gives a parameter (`s{i}_...`), assumed for
 #: every statement so an estimate never falls short.
@@ -1203,152 +1156,75 @@ def _statement_bytes(statement: Statement) -> int:
     return size
 
 
-def _chunk_by_type(
-    items: Sequence[tuple[str, Statement]],
-    cap: int,
-    total_cap: int,
-    byte_cap: int = _MAX_REQUEST_BYTES,
-) -> list[list[Statement]]:
-    """Split into chunks bounded three ways: no chunk holds more than `cap`
-    mutations for any single `type_name`, none holds more than `total_cap`
-    overall, and none renders to a request body larger than `byte_cap`.
-
-    The per-type cap is checked per type, not across the whole phase, so a
-    large node type and a large edge type each get their own budget rather
-    than sharing one. `total_cap` is what keeps that from being unbounded:
-    without it a sync touching N types emitted one commit of N x `cap`
-    entities, which is re-sent whole on every endpoint-stub retry.
-    """
-    chunks: list[list[Statement]] = []
-    current: list[Statement] = []
-    counts: dict[str, int] = {}
+def _chunk_by_bytes(statements: Sequence[Statement]) -> list[list[Statement]]:
+    """Split `statements`, in order, into chunks that each render to a
+    request body within `_MAX_REQUEST_BYTES`."""
+    chunks: list[list[Statement]] = [[]]
     size = 0
-    for type_name, mutation in items:
-        cost = _statement_bytes(mutation)
-        if current and (
-            counts.get(type_name, 0) >= cap
-            or len(current) >= total_cap
-            or size + cost > byte_cap
-        ):
-            chunks.append(current)
-            current = []
-            counts = {}
+    for statement in statements:
+        cost = _statement_bytes(statement)
+        if chunks[-1] and size + cost > _MAX_REQUEST_BYTES:
+            chunks.append([])
             size = 0
-        current.append(mutation)
-        counts[type_name] = counts.get(type_name, 0) + 1
+        chunks[-1].append(statement)
         size += cost
-    if current:
-        chunks.append(current)
     return chunks
 
 
-def plan_commits(actions: Sequence[Any]) -> list[Query]:
-    """Bucket reconcile actions into three phases and combine each phase's
-    mutations into one commit per phase (chunked past `_MAX_ENTITIES_PER_TYPE`).
+def plan_commits(actions: Sequence[_NodeAction | _EdgeAction]) -> list[Query]:
+    """Turn reconcile actions into the commits that apply them, in order.
 
-    Phase A (pre-deletes): deletes of *replaced* edges only. Must precede
-    their re-insert in phase B — delete selects on `coco_key`, and a
-    replaced edge keeps the same one, so insert-then-delete would remove the
-    new edge too (verified against the engine: leaves zero edges).
+    Writes come first, then deletes: the engine refuses a mutation that
+    mixes the two ("split into separate mutations: (1) inserts and updates,
+    then (2) deletes", verified against 0.14), so a batch with both needs
+    two commits at least.
 
-    Phase B (upserts): node upserts, THEN edge inserts (both brand-new and
-    replaced). The order within the phase matters even though the whole
-    phase is one commit: statements in a combined query execute in the
-    order written, so an edge insert placed ahead of its own endpoint's
-    upsert fails with "not found" and forces the stub-and-retry path on
-    every run — a costly recovery meant for genuine cross-component
-    ordering violations, not for two writes the same component is issuing
-    together. Grouping nodes first makes that self-inflicted case
-    impossible; a failure can then only mean the endpoint really is owned
-    by another component that hasn't run yet.
+    Within the writes, node upserts precede edge upserts: statements run in
+    the order written, and an edge ahead of its own endpoint's upsert fails
+    "not found" and forces the stub-and-retry recovery, which is meant for
+    an endpoint another component owns. No stubs are planned here: a keyed
+    `insert` replaces the whole record, so stubbing every endpoint up front
+    would null out a node's other properties. The sink stubs only the
+    endpoint the engine reports missing (see `_apply_entity_actions`).
 
-    No endpoint stubs here — a keyed `insert` in Omnigraph is a
-    full-record replace, not a partial merge (verified against the engine),
-    so unconditionally stubbing an edge's endpoints would silently null out
-    any other nullable properties a node already has. Instead the sink
-    applies an edge insert optimistically and only builds a stub, for
-    *just* the specific endpoint the engine reports missing, after that
-    insert fails with a "not found" error — see `_apply_entity_actions`.
+    Within the deletes, edges precede nodes.
 
-    Phase C (post-deletes): edge deletes, then node deletes — of removals
-    only (a replaced edge's delete is phase A, not this). Edges must be gone
-    before their nodes.
-
-    A and C cannot merge into one commit even though both are deletes: A
-    must precede B and C must follow it.
+    Each phase is cut into commits that fit the server's request limit.
     """
-    phase_a: list[tuple[str, Statement]] = []
-    phase_b_nodes: list[tuple[str, Statement]] = []
-    phase_b_edges: list[tuple[str, Statement]] = []
-    phase_c_edges: list[tuple[str, Statement]] = []
-    phase_c_nodes: list[tuple[str, Statement]] = []
-
+    node_writes: list[Statement] = []
+    edge_writes: list[Statement] = []
+    edge_deletes: list[Statement] = []
+    node_deletes: list[Statement] = []
     for action in actions:
         if isinstance(action, _NodeAction):
-            if action.op == "upsert":
-                phase_b_nodes.append(
-                    (
-                        action.type_name,
-                        build_node_upsert(
-                            action.type_name, action.properties, action.coco_key
-                        ),
-                    )
-                )
-            elif action.op == "delete":
-                phase_c_nodes.append(
-                    (
-                        action.type_name,
-                        build_node_delete(action.type_name, action.coco_key),
-                    )
-                )
-            else:
-                raise ValueError(f"unknown node action op: {action.op!r}")
-        elif isinstance(action, _EdgeAction):
             if action.op == "delete":
-                phase_c_edges.append(
-                    (
-                        action.type_name,
-                        build_edge_delete(action.type_name, action.coco_key),
-                    )
-                )
-            elif action.op in ("insert", "replace"):
-                if action.op == "replace":
-                    phase_a.append(
-                        (
-                            action.type_name,
-                            build_edge_delete(action.type_name, action.coco_key),
-                        )
-                    )
-                from_ref = _endpoint_ref(action.from_id)
-                to_ref = _endpoint_ref(action.to_id)
-                phase_b_edges.append(
-                    (
-                        action.type_name,
-                        build_edge_insert(
-                            action.type_name,
-                            from_ref,
-                            to_ref,
-                            action.properties,
-                            action.coco_key,
-                        ),
-                    )
+                node_deletes.append(
+                    build_node_delete(action.type_name, action.coco_key)
                 )
             else:
-                raise ValueError(f"unknown edge action op: {action.op!r}")
+                node_writes.append(
+                    build_node_upsert(
+                        action.type_name, action.properties, action.coco_key
+                    )
+                )
+        elif action.op == "delete":
+            edge_deletes.append(build_edge_delete(action.type_name, action.coco_key))
         else:
-            raise TypeError(f"unknown action type: {type(action)!r}")
-
-    phase_b = phase_b_nodes + phase_b_edges
-    phase_c = phase_c_edges + phase_c_nodes
-    commits: list[Query] = []
-    for phase in (phase_a, phase_b, phase_c):
-        if not phase:
-            continue
-        for chunk in _chunk_by_type(
-            phase, _MAX_ENTITIES_PER_TYPE, _MAX_ENTITIES_PER_COMMIT
-        ):
-            commits.append(render_query(chunk))
-    return commits
+            edge_writes.append(
+                build_edge_insert(
+                    action.type_name,
+                    _endpoint_ref(action.from_id),
+                    _endpoint_ref(action.to_id),
+                    action.properties,
+                    action.coco_key,
+                )
+            )
+    return [
+        render_query(chunk)
+        for phase in (node_writes + edge_writes, edge_deletes + node_deletes)
+        if phase
+        for chunk in _chunk_by_bytes(phase)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1640,9 +1516,10 @@ async def _keep_referenced_nodes(
     shape for "an edge whose endpoint nobody declares": the key-only stub
     it writes when an edge arrives before its node. A referenced node is
     reduced to that same stub, so the edge survives, and the node's next
-    declaration fills it back in. Edges this batch deletes itself do not
-    count, so a node undeclared together with all of its edges is deleted
-    outright, as before.
+    declaration fills it back in. An edge this batch writes counts too: the
+    writes land before the deletes, so its endpoint's delete would cascade
+    to it. Edges this batch deletes itself do not count, so a node
+    undeclared together with all of its edges is deleted outright.
 
     The edge types to look at come from the live schema, one read per
     batch; nodes of a type no edge type references cost nothing more. Each
@@ -1654,12 +1531,18 @@ async def _keep_referenced_nodes(
     deletes = [a for a in actions if isinstance(a, _NodeAction) and a.op == "delete"]
     if not deletes:
         return list(actions)
+    written_endpoints = {
+        endpoint
+        for a in actions
+        if isinstance(a, _EdgeAction) and a.op == "upsert"
+        for endpoint in ((a.from_type, str(a.from_id)), (a.to_type, str(a.to_id)))
+    }
     existing = await client.read_schema()
     patterns = {
         type_name: incident_edge_patterns(existing, type_name)
         for type_name in {a.type_name for a in deletes}
     }
-    if not any(patterns.values()):
+    if not any(patterns.values()) and not written_endpoints:
         return list(actions)
     deleted_edges = {
         (a.type_name, a.coco_key)
@@ -1671,8 +1554,9 @@ async def _keep_referenced_nodes(
         if not (isinstance(action, _NodeAction) and action.op == "delete"):
             out.append(action)
             continue
-        referenced = False
-        for pattern in patterns[action.type_name]:
+        (key,) = action.key_properties
+        referenced = (action.type_name, str(key.value)) in written_endpoints
+        for pattern in [] if referenced else patterns[action.type_name]:
             rows = await client.query(
                 render_query(
                     [
@@ -1702,55 +1586,34 @@ async def _keep_referenced_nodes(
 
 
 async def _apply_entity_actions(
-    context_provider: ContextProvider, actions: Sequence[_NodeAction | _EdgeAction]
+    conn: ConnectionFactory, actions: Sequence[_NodeAction | _EdgeAction]
 ) -> None:
-    if not actions:
-        return
-    by_db: dict[str, list[_NodeAction | _EdgeAction]] = {}
-    for action in actions:
-        by_db.setdefault(action.key.db_key, []).append(action)
-
-    for db_key, db_actions in by_db.items():
-        conn: ConnectionFactory = context_provider.get(db_key)
-        client = _GraphClient(conn)
-        db_actions = await _keep_referenced_nodes(
-            client, db_actions, branch=conn.branch
-        )
-        commits = plan_commits(db_actions)
-        if not commits:
-            continue
-        edge_actions = [a for a in db_actions if isinstance(a, _EdgeAction)]
-        if len(commits) == 1:
-            # One commit is atomic on its own, so send it straight to the
-            # live branch — no scratch branch, no merge. Deliberately NOT
-            # `_mutate_with_endpoint_retry`: that recovery is two commits
-            # (the stub, then the retried commit), which on the live branch
-            # would leave an orphan stub node behind — untracked, and
-            # visible to readers — if the retry then failed for an
-            # unrelated reason. A failed mutation applies nothing (verified
-            # against the engine; see TestMutationAtomicityLive), so the
-            # optimistic attempt costs nothing but the round-trip, and the
-            # moment recovery is actually needed this falls through to the
-            # scratch-branch path below and redoes the whole thing there.
-            try:
-                await client.mutate(commits[0], branch=conn.branch)
-                continue
-            except _og.BadRequestError as e:
-                if _parse_missing_endpoint(e) is None:
-                    raise
-        # More than one commit needs atomicity across all of them together,
-        # and one CLI invocation is one commit — so apply the whole sequence
-        # on a scratch branch and merge it in as a single step. `branch merge`
-        # has no compare-and-swap precondition (as of 0.10.0 only `mutate`
-        # takes `--if-commit`); a conflicted merge simply surfaces as a
-        # non-zero exit from `branch_merge` and propagates like any other
-        # failure below.
-        async with _scratch_branch(client, frm=conn.branch) as scratch:
-            for commit in commits:
-                await _mutate_with_endpoint_retry(
-                    client, commit, branch=scratch, edge_actions=edge_actions
-                )
-            await client.branch_merge(scratch, into=conn.branch)
+    client = _GraphClient(conn)
+    actions = await _keep_referenced_nodes(client, actions, branch=conn.branch)
+    commits = plan_commits(actions)
+    edge_actions = [a for a in actions if isinstance(a, _EdgeAction)]
+    if len(commits) == 1:
+        # One commit is atomic on its own, so it goes straight to the live
+        # branch. Not through `_mutate_with_endpoint_retry`: its recovery is
+        # two commits (the stub, then the retry), which on the live branch
+        # would leave an untracked stub behind if the retry then failed. A
+        # failed mutation applies nothing (see TestMutationAtomicityLive), so
+        # when recovery is needed this falls through and redoes the batch on
+        # a scratch branch.
+        try:
+            await client.mutate(commits[0], branch=conn.branch)
+            return
+        except _og.BadRequestError as e:
+            if _parse_missing_endpoint(e) is None:
+                raise
+    # Several commits are made atomic together by applying them on a scratch
+    # branch and merging it in one step.
+    async with _scratch_branch(client, frm=conn.branch) as scratch:
+        for commit in commits:
+            await _mutate_with_endpoint_retry(
+                client, commit, branch=scratch, edge_actions=edge_actions
+            )
+        await client.branch_merge(scratch, into=conn.branch)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1766,7 +1629,7 @@ class _EntitySink:
         actions: Sequence[_NodeAction | _EdgeAction],
         /,
     ) -> None:
-        await _apply_entity_actions(context_provider, actions)
+        await _apply_entity_actions(context_provider.get(self.db_key), actions)
 
 
 def _entity_sink(db_key: str) -> coco.TargetActionSink[_NodeAction | _EdgeAction]:
@@ -1928,6 +1791,23 @@ def _orphaned_endpoint_error(
     )
 
 
+def _check_user_edges_keyed(existing_pg: str, names: Sequence[str]) -> None:
+    """A user-managed edge type has to be keyed on its endpoints, as the
+    connector's own are: an edge is written with a plain `insert`, which
+    updates a keyed edge and adds another copy of an unkeyed one."""
+    unkeyed = sorted(
+        n for n in names if edge_keyed_on_endpoints(existing_pg, n) is False
+    )
+    if unkeyed:
+        raise ValueError(
+            f"Omnigraph edge type{'s' if len(unkeyed) > 1 else ''} {unkeyed!r} "
+            f"{'are' if len(unkeyed) > 1 else 'is'} declared managed_by='user' but "
+            f"not keyed on {'their' if len(unkeyed) > 1 else 'its'} endpoints: add "
+            f"`@key(@src, @dst)` to the edge type in the schema, or every write "
+            f"of an edge would add another copy of it."
+        )
+
+
 async def _apply_type_schema(
     client: _GraphClient, actions: Sequence[_TypeAction]
 ) -> None:
@@ -1968,6 +1848,15 @@ async def _apply_type_schema(
     must be re-declared from scratch, which is exactly what the drop half
     does at the schema level.
     """
+    user_edges = [
+        a.key.type_name
+        for a in actions
+        if a.key.type_kind == "edge"
+        and not coco.is_non_existence(a.spec)
+        and a.spec.managed_by == ManagedBy.USER
+    ]
+    if user_edges:
+        _check_user_edges_keyed(await client.read_schema(), user_edges)
     pending = [
         a
         for a in actions
@@ -2069,18 +1958,6 @@ async def _apply_type_schema_locked(
         await _deploy_schema(client, served=existing, desired=desired, types=types)
 
 
-async def _apply_type_actions(
-    context_provider: ContextProvider, actions: Sequence[_TypeAction]
-) -> None:
-    by_db: dict[str, list[_TypeAction]] = {}
-    for action in actions:
-        by_db.setdefault(action.key.db_key, []).append(action)
-
-    for db_key, db_actions in by_db.items():
-        conn: ConnectionFactory = context_provider.get(db_key)
-        await _apply_type_schema(_GraphClient(conn), db_actions)
-
-
 def _type_child_handler(
     context_provider: ContextProvider, action: _TypeAction, /
 ) -> _NodeHandler | _EdgeHandler:
@@ -2124,7 +2001,9 @@ class _TypeSink:
     async def __call__(
         self, context_provider: ContextProvider, actions: Sequence[_TypeAction], /
     ) -> None:
-        await _apply_type_actions(context_provider, actions)
+        await _apply_type_schema(
+            _GraphClient(context_provider.get(self.db_key)), actions
+        )
 
 
 def _type_sink(db_key: str) -> coco.TargetActionSink[_TypeAction]:
@@ -2281,7 +2160,11 @@ class EdgeTarget(
                 )
         _check_endpoint_id(from_id, self._type_name, "from_id", self._from_target)
         _check_endpoint_id(to_id, self._type_name, "to_id", self._to_target)
-        properties = _record_to_dict(record, self._schema) if record is not None else {}
+        properties = (
+            _record_to_dict(record, self._schema)
+            if record is not None and self._schema is not None
+            else {}
+        )
         key = (from_id, to_id)
         coco.declare_target_state(
             self._provider.target_state(key, _EdgeValue(from_id, to_id, properties))
@@ -2332,19 +2215,14 @@ def _check_endpoint_id(
         )
 
 
-def _record_to_dict(
-    record: Any, schema: NodeSchema | EdgeSchema | None
-) -> dict[str, Any]:
+def _record_to_dict(record: Any, schema: NodeSchema | EdgeSchema) -> dict[str, Any]:
     """Extract `{property_name: raw_value}` from a dataclass or dict record.
 
     Values are NOT encoded here — `_encode_properties` (used by
     `_NodeHandler`/`_EdgeHandler.reconcile`, above) applies `PropertyDef.encoder`
     at commit time, once the property's `pg_type` is back in scope.
     """
-    property_names = schema.properties.keys() if schema is not None else None
     if isinstance(record, dict):
-        if schema is None:
-            return dict(record)
         # A dict record's keys are unchecked user input. A misspelled name used
         # to be dropped without a word, leaving EVERY declared property `None`
         # — so the key's `coco_key` was derived from `None` and the engine
@@ -2371,9 +2249,7 @@ def _record_to_dict(
                 f"nullable property (e.g. `str | None`) may be omitted."
             )
         return {name: record.get(name) for name in schema.properties}
-    if property_names is None:
-        return {f.name: getattr(record, f.name) for f in dataclasses.fields(record)}
-    return {name: getattr(record, name) for name in property_names}
+    return {name: getattr(record, name) for name in schema.properties}
 
 
 def _validate_edge_endpoint(target: NodeTarget[Any], role: str) -> None:
@@ -2395,15 +2271,6 @@ def _validate_edge_endpoint(target: NodeTarget[Any], role: str) -> None:
     property outside the key — Omnigraph rejects the insert.
     """
     schema = target.schema
-    if len(schema.key) != 1:
-        # `NodeSchema.from_class` guarantees this, but `NodeSchema` is public
-        # and can be built by hand, so don't let it fall through to an
-        # unpacking error with nothing naming the type.
-        raise ValueError(
-            f"Node type {target.type_name!r} cannot be referenced as an edge "
-            f"endpoint ({role}): its key is {schema.key!r}, and an endpoint is "
-            f"addressed by a single key value."
-        )
     (key_field,) = schema.key
     key_type = schema.properties[key_field].pg_type
     if key_type not in _ENDPOINT_KEY_TYPES:
@@ -2504,20 +2371,15 @@ def node_target(
     the app declaring it, which is only known there.
     """
     validate_identifier(type_name, "node type")
-    if not schema.key:
-        # `NodeSchema.from_class` guarantees a key, but `NodeSchema` is public
-        # and can be built by hand — and an empty key is silently catastrophic
-        # rather than merely wrong: the type renders with no `@key`, every row
-        # derives the same `coco_key` from the same empty tuple and so shares
-        # one StableKey (last write wins in tracking), while an unkeyed
-        # Omnigraph insert is a strict insert that duplicates the row on every
-        # re-run. `_validate_edge_endpoint` already refuses this, but only for
-        # types used as endpoints.
+    if len(schema.key) != 1:
+        # `NodeSchema.from_class` guarantees one, but `NodeSchema` is public.
+        # With no key every row would share one identity and an unkeyed
+        # `insert` duplicates the row on every run; the engine rejects more
+        # than one `@key`.
         raise ValueError(
-            f"Node type {type_name!r} must declare a key: its schema's key is "
-            f"empty, so every row would share one identity. Build the schema "
-            f"with `NodeSchema.from_class(..., key=...)`, or pass a non-empty "
-            f"`key` to `NodeSchema`."
+            f"Node type {type_name!r} must declare exactly one key property, "
+            f"not {schema.key!r}. Build the schema with "
+            f"`NodeSchema.from_class(..., key=...)`."
         )
     for key_field in schema.key:
         prop = schema.properties[key_field]

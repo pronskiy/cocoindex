@@ -405,7 +405,7 @@ The connector never retries a write. A write whose outcome is unknown (the conne
 | Bad or missing token, missing permission | `UnauthorizedError` / `ForbiddenError` from the SDK, naming the action |
 | Graph not served | `SchemaDeployError` (schema write) or `NotFoundError`, naming the graph and the server |
 | Merge conflict with a concurrent write | `ConflictError` listing `merge_conflicts`; the next run retries |
-| Over the server's request limit | Connector-planned commits are cut below 1 MiB; only a single entity larger than the limit by itself fails, with `PayloadTooLargeError` |
+| Over the server's request limit | Commits are cut below 1 MiB; a single node or edge too large to fit on its own is refused with `ValueError` before anything is sent |
 | Schema deployment blocked by branches | Retried for up to a minute, then `SchemaDeployError` |
 | Schema deployment still running after 5 minutes | `SchemaDeployError` with the deployment id; check it with `omnigraph cluster status --deployment-id` before changing the schema again |
 | A plan that touches another graph, a policy, or deletes a graph | `SchemaDeployError`; nothing is deployed and the schema file is restored |

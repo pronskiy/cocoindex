@@ -2627,6 +2627,25 @@ class TestPlanCommitsByteBudget:
             sent = len(json.dumps(body).encode()) - envelope
             assert sent <= sum(ogt._statement_bytes(s) for s in statements), count
 
+    def test_an_entity_over_the_request_limit_is_refused_before_sending(
+        self,
+    ) -> None:
+        """The server answers 413 for a body somewhat over its limit and drops
+        the connection for a much larger one, which reads as a write of
+        unknown outcome. An entity that cannot fit is refused up front."""
+        action = ogt._NodeAction(
+            "upsert",
+            _TypeKey("og", "node", "Source"),
+            "Source",
+            (
+                PropertyValue("slug", "String", "s"),
+                PropertyValue("title", "String?", "x" * 8_000_000),
+            ),
+            derive_coco_key(("s",)),
+        )
+        with pytest.raises(ValueError, match=r"insert Source .* request limit"):
+            plan_commits([action])
+
     def test_commits_stay_under_the_servers_request_limit(self) -> None:
         key = _TypeKey("og", "node", "Source")
         actions = [

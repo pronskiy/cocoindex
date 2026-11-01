@@ -1086,11 +1086,21 @@ def _statement_bytes(statement: Statement) -> int:
 
 def _chunk_by_bytes(statements: Sequence[Statement]) -> list[list[Statement]]:
     """Split `statements`, in order, into chunks that each render to a
-    request body within `_MAX_REQUEST_BYTES`."""
+    request body within `_MAX_REQUEST_BYTES`.
+
+    A statement that cannot fit on its own is refused here: the server
+    answers a body somewhat over its limit with 413 but drops the connection
+    for a much larger one, which reads as a write of unknown outcome."""
     chunks: list[list[Statement]] = [[]]
     size = 0
     for statement in statements:
         cost = _statement_bytes(statement)
+        if cost > _MAX_REQUEST_BYTES:
+            raise ValueError(
+                f"`{statement.body[:60]}...` is about {cost:,} bytes as a request, "
+                f"over the {_MAX_REQUEST_BYTES:,}-byte budget for omnigraph-server's "
+                f"1 MiB request limit; store a value that large outside the graph"
+            )
         if chunks[-1] and size + cost > _MAX_REQUEST_BYTES:
             chunks.append([])
             size = 0

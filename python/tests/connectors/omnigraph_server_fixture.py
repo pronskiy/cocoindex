@@ -35,6 +35,7 @@ import re
 import selectors
 import shutil
 import socket
+import socketserver
 import ssl
 import subprocess
 import tempfile
@@ -242,6 +243,16 @@ class _TlsProxy:
         self._listener.close()
 
 
+class _LocalHTTPServer(http.server.ThreadingHTTPServer):
+    """`ThreadingHTTPServer` without the reverse DNS lookup its bind does
+    (`socket.getfqdn`), which hung past the test timeout on a CI runner."""
+
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name, self.server_port = str(host), int(port)
+
+
 class LossyProxy:
     """A plain-HTTP proxy to the server that, once armed, forwards the next
     request whose path ends with the armed suffix and then closes the
@@ -297,7 +308,7 @@ class LossyProxy:
 
             do_GET = do_POST = do_PUT = do_DELETE = do_HEAD = _forward
 
-        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server = _LocalHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
         threading.Thread(target=self._server.serve_forever, daemon=True).start()
 

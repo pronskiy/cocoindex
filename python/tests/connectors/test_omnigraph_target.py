@@ -2286,6 +2286,21 @@ class TestEdgeReconcile:
         out = _edge_handler().reconcile(("a", "b"), coco.NON_EXISTENCE, [], True)
         assert out is not None and out.action.op == "delete"
 
+    def test_undeclared_and_never_tracked_is_noop(self) -> None:
+        assert (
+            _edge_handler().reconcile(("a", "b"), coco.NON_EXISTENCE, [], False) is None
+        )
+
+    def test_an_edge_type_action_builds_an_edge_handler(self) -> None:
+        source = _bare_node_target(
+            NodeSchema(properties={"slug": _SOURCE_PROPS["slug"]}, key=("slug",)),
+            "Source",
+        )
+        spec = ogt._build_edge_spec(None, source, source, ManagedBy.SYSTEM, "og")
+        action = ogt._TypeAction(_EK, spec, "", "insert", {}, "og")
+        handler = ogt._type_child_handler(ContextProvider(), action)
+        assert isinstance(handler, _EdgeHandler)
+
     def test_repointing_changes_coco_key(self) -> None:
         h = _edge_handler()
         a = h.reconcile(("s1", "c1"), _EdgeValue("s1", "c1", {}), [], False)
@@ -5073,6 +5088,27 @@ def test_declare_edge_without_a_schema_rejects_a_record() -> None:
         )
 
 
+def test_an_edge_type_of_optional_properties_takes_no_record() -> None:
+    """Omitting `record=` is refused only when the edge type has a property
+    the insert would then leave out but must provide."""
+    endpoint = _bare_node_target(
+        NodeSchema(properties={"slug": PropertyDef("slug", "String")}, key=("slug",)),
+        "Person",
+    )
+    declared: list[Any] = []
+    target = omnigraph.EdgeTarget(
+        cast(Any, type("_P", (), {"target_state": lambda self, k, v: (k, v)})()),
+        EdgeSchema(properties={"w": PropertyDef("w", "I64?")}),
+        "KNOWS",
+        endpoint,
+        endpoint,
+    )
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(coco, "declare_target_state", declared.append)
+        target.declare_edge(from_id="a", to_id="b")
+    assert declared == [(("a", "b"), _EdgeValue("a", "b", {}))]
+
+
 def test_declare_edge_without_a_record_rejects_a_non_nullable_schema() -> None:
     """The mirror of the guard above, and the gap it left open: a schema with
     no record.
@@ -6192,6 +6228,74 @@ class TestServedTopologiesLive:
             app.update_blocking()
             rows = [r for r in _export_rows(store) if r.get("type") == "Source"]
             assert [r["data"].get("title") for r in rows] == ["second"]
+        finally:
+            proxy.close()
+
+    @pytest.mark.parametrize(
+        "lost",
+        [
+            "/schema",
+            "/query",
+            "/branches",
+            "/branches/merge",
+        ],
+        ids=["schema-read", "incident-edge-query", "branch-create", "merge"],
+    )
+    def test_a_lost_response_on_the_scratch_branch_path_converges(
+        self, store: str, lost: str
+    ) -> None:
+        """A run that writes and deletes in one sync reads the schema, queries
+        the deleted node's edges, and creates, writes and merges a scratch
+        branch. Losing the response to any of those fails the sync, leaves
+        no branch behind (one would block every schema deployment for an
+        hour), and the next run converges."""
+        server = _server(store)
+        proxy = LossyProxy(server.base_url)
+        try:
+            db = ContextKey[ConnectionFactory](f"e2e_lossy_{uuid.uuid4().hex}")
+            coco_env.context_provider.provide(
+                db, server.connection_factory(base_url=proxy.url)
+            )
+            slugs = {"value": ["a", "b"]}
+
+            async def main() -> None:
+                sources = await omnigraph.mount_node_target(
+                    db,
+                    "Source",
+                    await NodeSchema.from_class(_ScSourceNarrow, key="slug"),
+                )
+                claims = await omnigraph.mount_node_target(
+                    db, "Claim", await NodeSchema.from_class(_ScClaim, key="slug")
+                )
+                supports = await omnigraph.mount_edge_target(
+                    db, "Supports", sources, claims
+                )
+                claims.declare_node(node=_ScClaim(slug="c"))
+                for slug in slugs["value"]:
+                    sources.declare_node(node=_ScSourceNarrow(slug=slug, title=slug))
+                    supports.declare_edge(from_id=slug, to_id="c")
+
+            app = coco.App(
+                coco.AppConfig(
+                    name=f"e2e_lossy_{uuid.uuid4().hex[:8]}", environment=coco_env
+                ),
+                main,
+            )
+            app.update_blocking()
+            slugs["value"] = ["b", "d"]  # delete a, add d: writes and deletes
+            proxy.drop_next(lost)
+            with pytest.raises(_og.NetworkError):
+                app.update_blocking()
+            assert proxy.dropped and proxy.dropped[0].endswith(lost)
+            assert _branch_names(store) == ["main"]
+
+            app.update_blocking()
+            rows = _export_rows(store)
+            assert sorted(
+                r["data"]["slug"] for r in rows if r.get("type") == "Source"
+            ) == ["b", "d"]
+            assert len([r for r in rows if r.get("edge") == "Supports"]) == 2
+            assert _branch_names(store) == ["main"]
         finally:
             proxy.close()
 

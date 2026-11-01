@@ -1346,30 +1346,28 @@ async def _scratch_branch(client: _GraphClient, *, frm: str) -> AsyncIterator[st
     """Own a scratch branch for the duration of the block.
 
     The block ends by merging it with `client.branch_merge`, which deletes
-    it in the same call. If the block fails, the branch is deleted here: a
-    leftover non-main branch blocks every schema deployment on the graph.
-    The name carries its creation time, so `_reap_abandoned_scratch_branches`
-    can tell an abandoned branch from a live one on any host.
+    it in the same call. If the block fails, or the create itself does (its
+    answer may be what was lost), the branch is deleted here: a leftover
+    non-main branch blocks every schema deployment on the graph. The name
+    carries its creation time, so `_reap_abandoned_scratch_branches` can
+    tell an abandoned branch from a live one on any host.
     """
     async with _schema_gate(client.conn).shared():
         name = _scratch_branch_name(datetime.datetime.now(datetime.UTC))
         _live_scratch_branches.add(name)
         try:
             await client.branch_create(name, frm=frm)
+            yield name
+        except BaseException as e:
             try:
-                yield name
-            except BaseException as e:
-                try:
-                    await client.branch_delete(name)
-                except _og.NotFoundError:
-                    pass
-                except _og.OmnigraphError as cleanup:
-                    # Report the original failure; the reaper removes the
-                    # branch once its TTL has passed.
-                    e.add_note(
-                        f"deleting scratch branch {name!r} also failed: {cleanup}"
-                    )
-                raise
+                await client.branch_delete(name)
+            except _og.NotFoundError:
+                pass
+            except _og.OmnigraphError as cleanup:
+                # Report the original failure; the reaper removes the branch
+                # once its TTL has passed.
+                e.add_note(f"deleting scratch branch {name!r} also failed: {cleanup}")
+            raise
         finally:
             _live_scratch_branches.discard(name)
 

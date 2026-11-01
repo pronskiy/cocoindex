@@ -4156,6 +4156,46 @@ class TestOrphanedEdgeEndpoints:
         assert "node Company" in final
 
     @pytest.mark.asyncio
+    async def test_a_key_change_goes_through_when_its_edge_type_is_dropped_with_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A `@key` change on Person is refused while WorksAt still points at
+        it, but not when the same batch drops WorksAt."""
+        applied = self._mock(monkeypatch, self.SCHEMA)
+        new_person = f"node Person {{\n  pid: String @key\n{self._MARKED}}}"
+        await ogt._apply_type_schema(
+            _client(),
+            [
+                _type_action("replace", "Person", new_person),
+                _type_action("delete", "WorksAt", None, type_kind="edge"),
+            ],
+        )
+        final = applied[-1]
+        assert "pid: String @key" in final
+        assert "edge WorksAt" not in final
+
+    @pytest.mark.asyncio
+    async def test_a_key_change_is_refused_while_a_redeclared_edge_type_points_at_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._mock(monkeypatch, self.SCHEMA)
+        new_person = f"node Person {{\n  pid: String @key\n{self._MARKED}}}"
+        edge = _type_action(
+            "upsert",
+            "WorksAt",
+            f"edge WorksAt: Person -> Company {{\n{self._MARKED}  w: I64?\n}}",
+            type_kind="edge",
+        )._replace(
+            spec=replace(_PLACEHOLDER_SPEC, from_type="Person", to_type="Company")
+        )
+        with pytest.raises(
+            ValueError, match=r"Cannot remove Omnigraph node type 'Person'"
+        ):
+            await ogt._apply_type_schema(
+                _client(), [_type_action("replace", "Person", new_person), edge]
+            )
+
+    @pytest.mark.asyncio
     async def test_an_edge_re_pointed_in_the_same_batch_as_its_old_node_drop_survives(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

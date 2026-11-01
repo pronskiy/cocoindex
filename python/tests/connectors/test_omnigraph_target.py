@@ -34,7 +34,7 @@ from cocoindex.connectors import omnigraph
 from cocoindex.connectors.omnigraph import _gq as ogq
 from cocoindex.connectors.omnigraph import _target as ogt
 from cocoindex.connectors.omnigraph._client import ConnectionFactory, _GraphClient
-from cocoindex.connectors.omnigraph._cluster import ClusterConfig
+from cocoindex.connectors.omnigraph._cluster import ClusterConfig, SchemaDeployError
 from cocoindex.connectors.omnigraph._gq import (
     COCO_KEY,
     Bind,
@@ -560,6 +560,35 @@ class TestIncidentEdges:
 
 
 class TestOwnershipDetection:
+    def test_a_type_that_is_not_there_has_no_owner_and_nothing_to_release(
+        self,
+    ) -> None:
+        pg = "node A {\n  k: String @key\n}\n"
+        assert ogq.ownership_marker(pg, "node", "B") is None
+        assert ogq.release_ownership(pg, "node", "B", "coco_managed_by_x") == pg
+
+    @pytest.mark.parametrize(
+        ("pg", "message"),
+        [
+            ("edge E {\n  w: I64\n}\n", "without `: FROM -> TO` endpoints"),
+            ("node A\nnode B {\n  k: String @key\n}\n", "without a `{ ... }` body"),
+            ("node A {\n  k: String @key\n", "unbalanced braces"),
+        ],
+    )
+    def test_a_schema_it_cannot_parse_is_not_edited(
+        self, pg: str, message: str
+    ) -> None:
+        with pytest.raises(ValueError, match=message):
+            ogq.merge_type_into_schema(pg, "node", "Z", "node Z {\n}")
+
+    def test_nested_braces_stay_inside_their_block(self) -> None:
+        pg = "node A {\n  k: String @key @index({ x: 1 })\n}\nnode B {\n}\n"
+        assert ogq.remove_type_from_schema(pg, "node", "A").strip() == "node B {\n}"
+
+    def test_an_incident_edge_has_a_role(self) -> None:
+        with pytest.raises(ValueError, match="edge role must be 'from' or 'to'"):
+            ogq.build_incident_edges_query("A", "k", ogq.IncidentEdge("E", "sideways"))
+
     """`coco_managed_by_<app>` is a declared property. Ownership detection
     searched the block's raw text, comments included, so a user-owned block
     whose comment merely mentioned the property counted as the connector's
@@ -931,6 +960,35 @@ class TestDeriveCocoKey:
 
 
 class TestTypeMapping:
+    def test_annotated_without_an_override_maps_its_base(self) -> None:
+        assert ogt._pg_type_for(Annotated[int, "a note"]) == "I64"
+
+    def test_a_union_of_two_types_has_no_mapping(self) -> None:
+        with pytest.raises(TypeError, match="no Omnigraph type mapping for union"):
+            ogt._pg_type_for(int | str)
+
+    @pytest.mark.asyncio
+    async def test_a_key_that_is_not_a_field_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="'missing' is not a field of _Doc"):
+            await NodeSchema.from_class(_Doc, key="missing")
+
+    def test_an_edited_function_encoder_is_a_different_encoder(self) -> None:
+        """The encoder's identity is tracked, so editing a lambda's body has to
+        change it; a callable without code is named by its type."""
+
+        def make(factor: int) -> ogt.ValueEncoder:
+            if factor == 10:
+                return lambda v: v * 10
+            return lambda v: v * 100
+
+        ten, hundred = make(10), make(100)
+        a = ogt._encoder_identity(PropertyDef("w", "I64", ten))
+        b = ogt._encoder_identity(PropertyDef("w", "I64", hundred))
+        assert a != b and a.split("#")[0] == b.split("#")[0]
+        assert ogt._encoder_identity(PropertyDef("w", "I64", str.lower)).endswith(
+            "str.lower"
+        )
+
     @pytest.mark.asyncio
     async def test_scalar_mapping(self) -> None:
         schema = await NodeSchema.from_class(_Doc, key="slug")
@@ -2436,7 +2494,7 @@ class TestPlanCommits:
         non-string-keyed endpoint — an int-keyed Meeting, say — failed on
         every edge insert."""
         action = ogt._EdgeAction(
-            "insert",
+            "upsert",
             _TypeKey("og", "edge", "Attended"),
             "Attended",
             derive_coco_key(("Ada", 7)),
@@ -2629,7 +2687,7 @@ class TestParseMissingEndpoint:
 class TestBuildEndpointStub:
     def test_uses_the_endpoint_schemas_declared_key_type(self) -> None:
         action = ogt._EdgeAction(
-            "insert",
+            "upsert",
             _TypeKey("og", "edge", "Supports"),
             "Supports",
             derive_coco_key((7, "c1")),
@@ -2673,6 +2731,100 @@ class TestBuildEndpointStub:
 
 
 class TestApplyEntityActions:
+    @staticmethod
+    def _batch(db_key: str, *ops: str) -> list[ogt._NodeAction | ogt._EdgeAction]:
+        """Edge actions Source -> Claim, one per op."""
+        return [
+            ogt._EdgeAction(
+                op,
+                _TypeKey(db_key, "edge", "Supports"),
+                "Supports",
+                derive_coco_key(("s1", f"c{i}")),
+                "s1",
+                f"c{i}",
+                (),
+                "Source",
+                "Claim",
+                PropertyDef("slug", "String"),
+                PropertyDef("slug", "String"),
+            )
+            for i, op in enumerate(ops)
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("ops", "message"),
+        [
+            (("upsert",), "type `Supports` has no property `w`"),
+            (("upsert", "delete"), "type `Supports` has no property `w`"),
+            (("upsert",), "__dst 'elsewhere' not found in Claim"),
+            (("upsert", "delete"), "__dst 'elsewhere' not found in Claim"),
+        ],
+        ids=[
+            "live-other",
+            "scratch-other",
+            "live-unknown-endpoint",
+            "scratch-unknown-endpoint",
+        ],
+    )
+    async def test_an_engine_refusal_it_cannot_recover_from_propagates(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        ops: tuple[str, ...],
+        message: str,
+    ) -> None:
+        """Only a "not found" naming an endpoint some edge in the batch
+        references is recovered, by a stub; anything else fails the sync with
+        the engine's own error, and a scratch branch is deleted."""
+        calls: list[str] = []
+
+        async def refuse(self: object, mutation: Query, *, branch: str) -> None:
+            calls.append(f"mutate:{branch}")
+            raise _engine_error(message)
+
+        def record(name: str) -> Callable[..., Any]:
+            async def fn(self: object, *args: object, **kwargs: object) -> None:
+                calls.append(name)
+
+            return fn
+
+        monkeypatch.setattr(_GraphClient, "mutate", refuse)
+        monkeypatch.setattr(_GraphClient, "branch_create", record("create"))
+        monkeypatch.setattr(_GraphClient, "branch_delete", record("delete"))
+        db = ContextKey[ConnectionFactory](f"test_db_{uuid.uuid4().hex}")
+        cp = ContextProvider()
+        cp.provide(db, _fake_conn())
+        with pytest.raises(_og.BadRequestError, match=message.split("'")[0]):
+            await _apply_entities(cp, self._batch(db.key, *ops))
+        if len(ops) == 1 and "not found" not in message:
+            assert calls == ["mutate:main"]
+        else:
+            assert calls[-1] == "delete"
+            assert sum(c.startswith("mutate:coco_scratch_") for c in calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_scratch_branch_already_gone_is_not_a_second_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def noop(self: object, *args: object, **kwargs: object) -> None:
+            return None
+
+        async def refuse(self: object, mutation: Query, *, branch: str) -> None:
+            raise _engine_error("type `Supports` has no property `w`")
+
+        async def gone(self: object, name: str) -> None:
+            raise _og.NotFoundError(name, status=404, method="DELETE", url="u")
+
+        monkeypatch.setattr(_GraphClient, "branch_create", noop)
+        monkeypatch.setattr(_GraphClient, "mutate", refuse)
+        monkeypatch.setattr(_GraphClient, "branch_delete", gone)
+        db = ContextKey[ConnectionFactory](f"test_db_{uuid.uuid4().hex}")
+        cp = ContextProvider()
+        cp.provide(db, _fake_conn())
+        with pytest.raises(_og.BadRequestError) as info:
+            await _apply_entities(cp, self._batch(db.key, "upsert", "delete"))
+        assert not getattr(info.value, "__notes__", None)
+
     @pytest.mark.asyncio
     async def test_branch_create_failure_propagates_original_error(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2933,7 +3085,7 @@ class TestApplyEntityActions:
         key = _TypeKey(db.key, "edge", "Supports")
         actions: list[ogt._NodeAction | ogt._EdgeAction] = [
             ogt._EdgeAction(
-                "insert",
+                "upsert",
                 key,
                 "Supports",
                 derive_coco_key(("s1", "c1")),
@@ -2960,7 +3112,7 @@ class TestApplyEntityActions:
         key = _TypeKey(db_key, "edge", "Supports")
         return [
             ogt._EdgeAction(
-                "insert",
+                "upsert",
                 key,
                 "Supports",
                 derive_coco_key((s, c)),
@@ -3358,6 +3510,78 @@ class TestFailureMatrix:
             await _apply_entities(cp, [action])
         assert info.value is error
         assert calls == ["main"]  # never retried
+
+
+def _sdk_on(conn: ConnectionFactory, monkeypatch: pytest.MonkeyPatch, sdk: Any) -> None:
+    async def acquire() -> Any:
+        return sdk
+
+    monkeypatch.setattr(conn, "acquire", acquire)
+
+
+class TestGraphClient:
+    @pytest.mark.asyncio
+    async def test_a_read_that_never_reached_the_server_is_retried(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "cocoindex.connectors.omnigraph._client._READ_BACKOFF_SECONDS", 0
+        )
+
+        def refused() -> _og.NetworkError:
+            return _og.NetworkError(
+                "refused", method="GET", url="u", request_dispatched=False
+            )
+
+        schema = _FakeSchema([refused(), refused(), "node A {}"])
+        conn = _fake_conn()
+        _sdk_on(conn, monkeypatch, _FakeSdk(schema))
+        assert await _GraphClient(conn).read_schema() == "node A {}"
+        assert schema.calls == 3
+
+        schema = _FakeSchema([refused(), refused(), refused(), "unused"])
+        _sdk_on(conn, monkeypatch, _FakeSdk(schema))
+        with pytest.raises(_og.NetworkError):
+            await _GraphClient(conn).read_schema()
+        assert schema.calls == 3
+
+    @pytest.mark.asyncio
+    async def test_a_merge_whose_branch_was_not_deleted_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A leftover scratch branch blocks every schema deployment, so a merge
+        that landed but kept its source branch is a failure."""
+
+        class _Branches:
+            async def merge(self, name: str, **kwargs: Any) -> Any:
+                return {
+                    "branch_deleted": False,
+                    "branch_delete_error_details": {"error": "busy"},
+                }
+
+        class _Sdk:
+            branches = _Branches()
+
+        conn = _fake_conn()
+        _sdk_on(conn, monkeypatch, _Sdk())
+        with pytest.raises(RuntimeError, match=r"could not delete it: busy"):
+            await _GraphClient(conn).branch_merge("coco_scratch_x", into="main")
+
+    @pytest.mark.asyncio
+    async def test_a_schema_write_without_a_cluster_configuration_is_refused(
+        self,
+    ) -> None:
+        """A declaration without `cluster` is refused at mount; a removal runs
+        from tracking alone, so it can still reach the deployment."""
+        conn = ConnectionFactory("http://og.invalid", graph_id="g")
+
+        async def reap() -> None:
+            return None
+
+        with pytest.raises(SchemaDeployError, match=r"ClusterConfig"):
+            await _GraphClient(conn).apply_schema(
+                "", served="node A {}", types={"A"}, on_blocked_by_branches=reap
+            )
 
 
 class TestApplyTypeSchema:
@@ -4517,6 +4741,73 @@ def test_declare_edge_reaches_the_target_state(monkeypatch: pytest.MonkeyPatch) 
     assert m.params["s0_p_coco_key"] == derive_coco_key(("s1", "c1"))
 
 
+def test_declared_types_are_deployed_without_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`declare_node_target` / `declare_edge_target` declare a type with no
+    rows of its own, e.g. one that only exists as an endpoint."""
+    deployed: list[str] = []
+
+    async def capture_schema(self: object, schema_pg: str, **_: object) -> None:
+        deployed.append(schema_pg)
+
+    monkeypatch.setattr(_GraphClient, "apply_schema", capture_schema)
+    monkeypatch.setattr(_GraphClient, "read_schema", _noop_read_schema)
+    db = _fresh_db("declare_targets")
+    names: list[str] = []
+
+    async def main() -> None:
+        schema = await NodeSchema.from_class(_ScClaim, key="slug")
+        omnigraph.declare_node_target(db, "Tag", schema)
+        sources = await omnigraph.mount_node_target(db, "Source", schema)
+        claims = await omnigraph.mount_node_target(db, "Claim", schema)
+        names.append(
+            omnigraph.declare_edge_target(db, "Supports", sources, claims).type_name
+        )
+
+    coco.App(
+        coco.AppConfig(name="test_declared_types", environment=coco_env), main
+    ).update_blocking()
+    assert names == ["Supports"]
+    assert any("node Tag" in pg for pg in deployed)
+    assert any("edge Supports: Source -> Claim" in pg for pg in deployed)
+
+
+def test_a_memoized_component_taking_an_edge_target_is_skipped_when_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An `EdgeTarget` is a memo key part, as a `NodeTarget` is: an unchanged
+    component that declares edges is skipped on the next run."""
+    _patch_cli_schema_calls(monkeypatch)
+    captured = _capture_mutations(monkeypatch)
+    db = _fresh_db("memo_edge_target")
+    runs: list[int] = []
+
+    @coco.fn(memo=True)
+    async def link(links: omnigraph.EdgeTarget[Any], n: int) -> None:
+        runs.append(n)
+        links.declare_edge(from_id="s1", to_id="c1")
+
+    async def main() -> None:
+        sources = await omnigraph.mount_node_target(
+            db, "Source", await NodeSchema.from_class(_ScClaim, key="slug")
+        )
+        claims = await omnigraph.mount_node_target(
+            db, "Claim", await NodeSchema.from_class(_ScClaim, key="slug")
+        )
+        links = await omnigraph.mount_edge_target(db, "Supports", sources, claims)
+        await coco.mount(coco.component_subpath("link"), link, links, 1)
+
+    app = coco.App(
+        coco.AppConfig(name="test_memo_edge_target", environment=coco_env), main
+    )
+    app.update_blocking()
+    writes = len(captured)
+    app.update_blocking()
+    assert runs == [1]
+    assert len(captured) == writes
+
+
 @dataclass
 class _Reading:
     sensor: str
@@ -4582,6 +4873,13 @@ class TestDateTimeKeyIdentity:
     still declared, and its later unchanged updates left it missing."""
 
     AT = PropertyDef("at", "DateTime", ogt._isoformat)
+
+    def test_a_tracked_instant_goes_back_out_as_iso(self) -> None:
+        """A node delete carries its key in the transport encoding, for when a
+        referencing edge turns the delete into a key-only upsert."""
+        at = datetime.datetime(2026, 1, 1, 12, 0, tzinfo=datetime.UTC)
+        tracked = ogt._tracking_key_value(self.AT, at)
+        assert ogt._transport_key_value(self.AT, tracked) == at.isoformat()
 
     def test_two_offsets_of_one_instant_share_a_tracking_key(self) -> None:
         utc = datetime.datetime(2026, 1, 1, 12, 0, tzinfo=datetime.UTC)
@@ -5397,7 +5695,7 @@ class TestEdgeIdempotenceLive:
             cp, [_upsert(db_key, "Source", "s1"), _upsert(db_key, "Claim", "c1")]
         )
         insert = ogt._EdgeAction(
-            "insert",
+            "upsert",
             _TypeKey(db_key, "edge", "Supports"),
             "Supports",
             derive_coco_key(("s1", "c1")),
@@ -5912,7 +6210,7 @@ class TestEndpointRetryLive:
 
         edge_key = _TypeKey(db_key, "edge", "Supports")
         insert_action = ogt._EdgeAction(
-            "insert",
+            "upsert",
             edge_key,
             "Supports",
             derive_coco_key(("s1", "c1")),
@@ -5963,7 +6261,7 @@ class TestEndpointRetryLive:
 
         edge_key = _TypeKey(db_key, "edge", "Supports")
         insert_action = ogt._EdgeAction(
-            "insert",
+            "upsert",
             edge_key,
             "Supports",
             derive_coco_key(("s1", "c1")),
@@ -6004,7 +6302,7 @@ class TestEndpointRetryLive:
         # Neither Source nor Claim has been written by any other component.
         edge_key = _TypeKey(db_key, "edge", "Supports")
         insert_action = ogt._EdgeAction(
-            "insert",
+            "upsert",
             edge_key,
             "Supports",
             derive_coco_key(("s1", "c1")),
@@ -6037,7 +6335,7 @@ class TestEndpointRetryLive:
         edge_key = _TypeKey(db_key, "edge", "Supports")
         actions = [
             ogt._EdgeAction(
-                "insert",
+                "upsert",
                 edge_key,
                 "Supports",
                 derive_coco_key((s, c)),

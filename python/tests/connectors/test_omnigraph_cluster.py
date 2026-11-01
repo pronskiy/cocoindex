@@ -404,3 +404,85 @@ async def test_the_cli_runs_with_the_callers_omnigraph_home(
     await _cluster._run_cli(config, "cluster", "plan")
     assert seen["env"] is None  # inherits the caller's environment as is
     assert "--operator-config" not in seen["argv"]
+
+
+class _FakeProc:
+    def __init__(self, out: bytes = b"", *, hang: bool = False) -> None:
+        self.returncode: int | None = None if hang else 0
+        self._out = out
+        self._hang = hang
+        self.killed = False
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        if self._hang:
+            await asyncio.Event().wait()
+        return self._out, b""
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self) -> int:
+        assert self.returncode is not None
+        return self.returncode
+
+
+def _fake_exec(monkeypatch: pytest.MonkeyPatch, proc: _FakeProc) -> None:
+    async def fake_exec(*argv: str, **kwargs: Any) -> _FakeProc:
+        return proc
+
+    monkeypatch.setattr(
+        "cocoindex.connectors.omnigraph._cluster.asyncio.create_subprocess_exec",
+        fake_exec,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cli_output_that_is_not_json_is_kept_as_text(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _fake_exec(monkeypatch, _FakeProc(b"error: no such target\n"))
+    config = ClusterConfig(config_dir=tmp_path, target="srv", schema_file="g.pg")
+    result = await _cluster._run_cli(config, "cluster", "plan")
+    assert result.body == "error: no such target"
+    assert not result.refused_without_effect
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_cli_is_killed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A sync cancelled mid-deployment must not leave the CLI running."""
+    proc = _FakeProc(hang=True)
+    _fake_exec(monkeypatch, proc)
+    config = ClusterConfig(config_dir=tmp_path, target="srv", schema_file="g.pg")
+    task = asyncio.create_task(_cluster._run_cli(config, "cluster", "apply"))
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert proc.killed
+
+
+@pytest.mark.asyncio
+async def test_a_change_another_process_already_deployed_is_left_alone(
+    cluster: ClusterConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cli = FakeCli([])
+    monkeypatch.setattr(_cluster, "_run_cli", cli)
+    await _deploy(cluster, served=DESIRED, after=DESIRED)
+    assert cli.calls == []
+    assert _schema_file(cluster) == SERVED
+
+
+@pytest.mark.asyncio
+async def test_a_plan_that_is_not_json_fails_and_restores_the_file(
+    cluster: ClusterConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def cli(cluster: ClusterConfig, *args: str) -> _cluster._CliResult:
+        return _cluster._CliResult(2, "error: unreadable config", "")
+
+    monkeypatch.setattr(_cluster, "_run_cli", cli)
+    with pytest.raises(SchemaDeployError, match="cluster plan failed"):
+        await _deploy(cluster)
+    assert _schema_file(cluster) == SERVED

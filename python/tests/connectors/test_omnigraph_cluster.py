@@ -503,3 +503,48 @@ async def test_a_cli_that_already_exited_is_not_killed(
     with pytest.raises(asyncio.CancelledError):
         await _cluster._run_cli(config, "cluster", "apply")
     assert not proc.killed
+
+
+def test_only_a_failed_run_is_a_busy_operator_configuration() -> None:
+    message = "Error: could not lock operator configuration: would block\n"
+    for code in (1, 2):
+        assert _cluster._CliResult(code, None, message).operator_lock_busy
+    assert not _cluster._CliResult(0, None, message).operator_lock_busy
+
+
+def test_error_text_prefers_the_error_then_the_diagnostics() -> None:
+    diagnostics = {
+        "ok": False,
+        "diagnostics": [
+            {"code": "a", "message": "first"},
+            {"code": "b", "message": "second"},
+        ],
+    }
+    assert _cluster._error_text(_cluster._CliResult(1, diagnostics, "")) == (
+        "a: first; b: second"
+    )
+    assert _cluster._error_text(_cluster._CliResult(1, {"ok": False}, " err \n")) == (
+        "err"
+    )
+    assert _cluster._error_text(_cluster._CliResult(1, {"ok": False}, "")) == (
+        "{'ok': False}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "plan",
+    [_plan(_schema_change(ADD_B), ok=False), {"changes": [_schema_change(ADD_B)]}],
+    ids=["not-ok", "no-ok-field"],
+)
+async def test_a_plan_that_is_not_ok_is_refused(
+    cluster: ClusterConfig, monkeypatch: pytest.MonkeyPatch, plan: dict[str, Any]
+) -> None:
+    async def cli(c: ClusterConfig, *args: str) -> _cluster._CliResult:
+        assert args[1] == "plan"
+        return _cluster._CliResult(1, plan, "")
+
+    monkeypatch.setattr(_cluster, "_run_cli", cli)
+    with pytest.raises(SchemaDeployError, match="cluster plan refused"):
+        await _deploy(cluster)
+    assert _schema_file(cluster) == SERVED

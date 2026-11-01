@@ -1364,7 +1364,7 @@ class TestNodeTypeReconcile:
         prev = _type_tracking_record_from_spec(
             _spec(await NodeSchema.from_class(_V1, key="slug"))
         )
-        with pytest.raises(ValueError, match="non-nullable"):
+        with pytest.raises(ValueError, match=r"non-nullable property \['title'\]"):
             _NodeTypeHandler().reconcile(
                 _TypeKey("og", "node", "Doc"),
                 _spec(await NodeSchema.from_class(_V2, key="slug")),
@@ -2553,7 +2553,8 @@ class TestPlanCommits:
             )
         )
         monkeypatch.setattr(ogt, "_MAX_REQUEST_BYTES", 4 * one)
-        assert len(plan_commits([_node("upsert", f"s{i}") for i in range(10)])) == 3
+        commits = plan_commits([_node("upsert", f"s{i}") for i in range(10)])
+        assert [c.expr.count("insert Source") for c in commits] == [4, 4, 2]
 
     def test_a_mixed_batch_writes_then_deletes(self) -> None:
         """The engine refuses a mutation mixing writes and deletes, so a
@@ -2626,6 +2627,22 @@ class TestPlanCommitsByteBudget:
             body = {"query": q.expr, "params": q.params, "branch": "main"}
             sent = len(json.dumps(body).encode()) - envelope
             assert sent <= sum(ogt._statement_bytes(s) for s in statements), count
+
+    def test_the_estimate_is_exact_at_its_assumed_index_width(self) -> None:
+        """Past index 99,999 a parameter name has the six index digits the
+        estimate assumes, so a statement adds exactly its estimate."""
+
+        def body_bytes(count: int) -> int:
+            q = render_query(
+                [
+                    build_node_delete("Source", derive_coco_key((i,)))
+                    for i in range(count)
+                ]
+            )
+            return len(json.dumps({"query": q.expr, "params": q.params}).encode())
+
+        added = build_node_delete("Source", derive_coco_key((100_000,)))
+        assert body_bytes(100_001) - body_bytes(100_000) == ogt._statement_bytes(added)
 
     def test_an_entity_over_the_request_limit_is_refused_before_sending(
         self,
@@ -3628,6 +3645,18 @@ class TestGraphClient:
 
 
 class TestApplyTypeSchema:
+    def test_unkeyed_user_edge_types_are_named_in_the_refusal(self) -> None:
+        pg = (
+            "edge A: N -> N {\n  coco_key: String\n}\n"
+            "edge B: N -> N {\n  coco_key: String\n}\n"
+            "edge K: N -> N {\n  coco_key: String\n  @key(@src, @dst)\n}\n"
+        )
+        ogt._check_user_edges_keyed(pg, ["K", "Missing"])
+        with pytest.raises(ValueError, match=r"edge type \['A'\] is declared .* its"):
+            ogt._check_user_edges_keyed(pg, ["A", "K"])
+        with pytest.raises(ValueError, match=r"edge types \['A', 'B'\] are .* their"):
+            ogt._check_user_edges_keyed(pg, ["B", "A"])
+
     """Unit coverage for _apply_type_schema's read-merge-deploy, mocked so it
     doesn't need a server."""
 

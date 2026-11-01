@@ -2559,6 +2559,50 @@ class TestPlanCommits:
 
 
 class TestPlanCommitsByteBudget:
+    @pytest.mark.parametrize(
+        "make",
+        [
+            lambda i: build_node_delete("Source", derive_coco_key((i,))),
+            lambda i: build_edge_delete("Supports", derive_coco_key((i,))),
+            lambda i: build_node_upsert(
+                "Source", [PropertyValue("n", "I64", i)], derive_coco_key((i,))
+            ),
+            lambda i: build_node_upsert(
+                "Source",
+                [PropertyValue(f"p{j}", "String?", "x") for j in range(10)],
+                derive_coco_key((i,)),
+            ),
+            lambda i: build_node_upsert(
+                "Source",
+                [PropertyValue("t", "String", "é\U0001f600" * 20)],
+                derive_coco_key((i,)),
+            ),
+            lambda i: build_edge_insert(
+                "Supports",
+                PropertyValue("ref", "String", str(i)),
+                PropertyValue("ref", "String", str(i + 1)),
+                [],
+                derive_coco_key((i,)),
+            ),
+        ],
+        ids=["node-delete", "edge-delete", "node-int", "node-10-props", "unicode", "edge"],
+    )
+    def test_the_estimate_bounds_the_rendered_request(
+        self, make: Callable[[int], Statement]
+    ) -> None:
+        """`_statement_bytes` is what keeps a commit under the server's limit,
+        so it has to be an upper bound on what a statement adds to the body
+        the SDK sends, at every parameter index a commit can reach."""
+        envelope = len(
+            json.dumps({"query": "query m() {  }", "params": {}, "branch": "main"})
+        )
+        for count in (1, 10, 1_000, 20_000):
+            statements = [make(i) for i in range(count)]
+            q = render_query(statements)
+            body = {"query": q.expr, "params": q.params, "branch": "main"}
+            sent = len(json.dumps(body).encode()) - envelope
+            assert sent <= sum(ogt._statement_bytes(s) for s in statements), count
+
     def test_commits_stay_under_the_servers_request_limit(self) -> None:
         key = _TypeKey("og", "node", "Source")
         actions = [

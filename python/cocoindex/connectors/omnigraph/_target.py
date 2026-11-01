@@ -1192,14 +1192,14 @@ def _endpoint_ref(value: Any) -> PropertyValue:
 
 def _statement_bytes(statement: Statement) -> int:
     """An upper estimate of what `statement` adds to a rendered request body:
-    its text, and per bind a signature entry, the parameter reference, and
-    the JSON-encoded parameter."""
+    its text, and per bind the parameter's name three times (signature,
+    reference, params key), its type, its JSON value and the separators."""
     size = len(statement.body) + 1
     for bind in statement.binds:
         name = len(bind.label) + _PARAM_INDEX_DIGITS + 2
         # As the SDK encodes it: `json.dumps` escapes non-ASCII as `\uXXXX`.
         value = json.dumps(bind.value, default=str)
-        size += 2 * name + len(bind.pg_type) + len(value) + 12
+        size += 3 * name + len(bind.pg_type) + len(value) + 10
     return size
 
 

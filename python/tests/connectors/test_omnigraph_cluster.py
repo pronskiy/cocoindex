@@ -486,3 +486,20 @@ async def test_a_plan_that_is_not_json_fails_and_restores_the_file(
     with pytest.raises(SchemaDeployError, match="cluster plan failed"):
         await _deploy(cluster)
     assert _schema_file(cluster) == SERVED
+
+
+@pytest.mark.asyncio
+async def test_a_cli_that_already_exited_is_not_killed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    proc = _FakeProc()
+
+    async def cancelled() -> tuple[bytes, bytes]:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(proc, "communicate", cancelled)
+    _fake_exec(monkeypatch, proc)
+    config = ClusterConfig(config_dir=tmp_path, target="srv", schema_file="g.pg")
+    with pytest.raises(asyncio.CancelledError):
+        await _cluster._run_cli(config, "cluster", "apply")
+    assert not proc.killed

@@ -560,6 +560,15 @@ class TestIncidentEdges:
 
 
 class TestOwnershipDetection:
+    def test_an_edge_type_is_keyed_on_its_endpoints_only_by_a_declaration(
+        self,
+    ) -> None:
+        keyed = "edge E: A -> B {\n  @key(@src, @dst)\n}\n"
+        commented = "edge E: A -> B {\n  // @key(@src, @dst)\n}\n"
+        assert ogq.edge_keyed_on_endpoints(keyed, "E") is True
+        assert ogq.edge_keyed_on_endpoints(commented, "E") is False
+        assert ogq.edge_keyed_on_endpoints(keyed, "Other") is None
+
     def test_a_type_that_is_not_there_has_no_owner_and_nothing_to_release(
         self,
     ) -> None:

@@ -508,15 +508,11 @@ def _reconcile_removal(
 ) -> coco.TargetReconcileOutput[_TypeAction, _TypeTrackingRecord, Any] | None:
     """Reconcile a type the app no longer declares.
 
-    `resolve_system_transition` is what makes this safe: it returns `None`
-    when there is nothing tracked, and — crucially — when any previous record
-    is user-managed. The connector did not create a `managed_by=user` type and
-    does not get to delete it; dropping the block takes every row in it along,
-    which is the one irreversible thing this connector can do to data it was
-    explicitly told it does not manage. The old hand-rolled path dropped
-    unconditionally and structurally could not do better, because the desired
-    state is `NON_EXISTENCE` and the tracking record did not persist
-    `managed_by` at all.
+    `resolve_system_transition` returns `None` when nothing is tracked and
+    when any previous record is user-managed: the connector did not create a
+    `managed_by=user` type and does not get to delete it, since dropping the
+    block takes every row in it along. That is why the tracking record
+    carries `managed_by`.
     """
     main_action, _ = statediff.diff_composite(
         statediff.resolve_system_transition(
@@ -526,21 +522,11 @@ def _reconcile_removal(
         )
     )
     if main_action is None:
-        # Safe to answer bare `None` *here*, and only here: the type is gone,
-        # so it owns no children that could be left without a provider.
-        # Answering `None` for a type that still exists is a shipped bug, not
-        # a style choice — this is a ROOT provider, the engine only refreshes
-        # a child's handler when the parent's own `reconcile()` returns an
-        # action (that is when it calls the sink's `child_handler` factory),
-        # and an unchanged type that returned `None` starved its own children the very next time it reconciled as
-        # unchanged: any node/edge declared under it then found no handler and
-        # the engine raised `RuntimeError: provider not ready for target state
-        # ...` — confirmed live, and confirmed against the house pattern
-        # (sqlite's `_TableHandler.reconcile` never returns bare `None` for
-        # exactly this reason). That is why `reconcile` below always returns an
-        # output for a type that exists, and why `_apply_type_schema` skips
-        # the schema write for an unchanged type while the factory still
-        # builds its child handler.
+        # `None` is safe only for a type that is gone. The engine builds a
+        # type's child handler only when its `reconcile` returns an output,
+        # so `reconcile` below returns one for every type that exists, even
+        # unchanged (as sqlite's `_TableHandler` does), and
+        # `_apply_type_schema` skips the write for an unchanged type.
         return None
     # Every record in the store is this app's, so any of them names it.
     owner = next(iter(prev_possible_records)).tracking_record.main.owner
@@ -634,17 +620,10 @@ class _TypeHandlerBase(
             main_action = "upsert"
 
         # --- The tracked path: what CocoIndex has actually seen before. ---
-        #
-        # The same records, diffed as if `prev` were known complete and
-        # without `resolve_system_transition`: the non-nullable guard below
-        # and the child invalidation both need to see *through* ownership
-        # rather than past it.
-        #
-        # Reading the guard off the write path instead would silently disable
-        # it. Under `--reprocess` (or any other `prev_may_be_missing`) the
-        # main action becomes "upsert", which empties `property_actions` and
-        # leaves the guard nothing to fire on — reintroducing the raw
-        # `OG-MF-103` engine error it exists to replace.
+        # The same records diffed as if `prev` were complete and ignoring
+        # ownership, for the guard and the child invalidation below. Not the
+        # write path: under `prev_may_be_missing` its main action is "upsert",
+        # which leaves no property actions for the guard to see.
         tracked_main, tracked_transitions = statediff.diff_composite(
             statediff.TrackingRecordTransition(
                 desired.tracking_record,
@@ -659,32 +638,15 @@ class _TypeHandlerBase(
                 if action is not None:
                     tracked_actions[sub_key] = action
 
-        # A USER-managed type is never validated, let alone altered, by this
-        # connector: the schema is the user's, migrated with `omnigraph schema
-        # apply` on their own schedule, and the declaration is simply tracked
-        # from then on. An earlier guard compared the declaration against the
-        # *tracked* one and refused on any difference — and since reconcile
-        # never reads the live schema, the migration that guard advised could
-        # not unblock it: every later run failed the same way. The guard below
-        # is about a schema write this connector would itself issue, so it
-        # applies to SYSTEM-managed types only.
-        # `==`, not `is`: ManagedBy is a StrEnum, so a plain `"user"` string
-        # compares equal but is not identical — and an identity check would
-        # silently fall through to full SYSTEM management, letting the
-        # connector rewrite a schema the user said they own. The sibling
-        # connectors compare by value (see `connectorkits.statediff`).
+        # A USER-managed type's schema is the user's, so it is never checked
+        # here. `!=`, not `is not`: `ManagedBy` is a StrEnum and a plain
+        # `"user"` must count.
         if spec.managed_by != ManagedBy.USER and tracked_main is None:
-            # Verified in Task 1: `schema apply` rejects adding a NON-nullable
-            # property to an existing type (OG-MF-103, "requires a backfill and
-            # is not supported in schema migration v1"). Only initial creation
-            # or a full rebuild may declare one, so this fires on the in-place
-            # path only — `tracked_main is None`, never on a "replace".
-            # Failing here names the offending property in Python; letting it
-            # through surfaces as an opaque error from the Rust binary with
-            # nothing pointing at the user's dataclass. We do NOT silently
-            # escalate to a destructive rebuild — dropping a populated type
-            # because someone added a field is not a call the connector gets to
-            # make on the user's behalf.
+            # The engine refuses to add a non-nullable property to an existing
+            # type (OG-MF-103, "requires a backfill and is not supported in
+            # schema migration v1"; verified). Refuse here, naming the
+            # property, rather than with the engine's error; never escalate to
+            # dropping a populated type.
             #
             # "upsert" counts as an addition alongside "insert": it means at
             # least one candidate previous state lacked the property, and we
@@ -766,23 +728,9 @@ class _EdgeTypeHandler(_TypeHandlerBase["_EdgeHandler"]):
 
 
 class _EntityTrackingRecord(msgspec.Struct, frozen=True, array_like=True):
-    """Fingerprint of the *encoded* property values, not the values themselves.
-
-    Encoded, because that is what the graph holds: fingerprinting the raw
-    Python values let a changed `PropertyDef.encoder` rewrite every stored
-    value without change detection ever noticing.
-
-    Internal-state size grows with target-state count, so storing full property
-    blobs for every entity in a large graph would bloat LMDB for no
-    reconciliation benefit.
-
-    `array_like` for the same reason: this is the highest-cardinality record
-    the connector persists — one per node and per edge — so encoding it as an
-    object would pay for the literal key `"fingerprint"` on every single one,
-    which is exactly the overhead the paragraph above exists to avoid. The
-    siblings go further and track a bare `bytes` (neo4j's `_RowFingerprint`);
-    the struct is kept here only for the nominal typing.
-    """
+    """Fingerprint of the *encoded* property values: what the graph holds, so
+    a changed `PropertyDef.encoder` is a change. A fingerprint rather than the
+    values, and `array_like`, because there is one per node and per edge."""
 
     fingerprint: bytes
 
@@ -955,18 +903,9 @@ class _NodeHandler(coco.TargetHandler[_NodeValue, _EntityTrackingRecord, None]):
         coco_key = derive_coco_key(key_tuple)
 
         if coco.is_non_existence(desired_target_state):
-            # `prev_may_be_missing` means we may simply have lost track of a
-            # row that is still in the graph — after a `--reprocess`, after
-            # internal state was lost while the store persisted, or when a
-            # prior delete's tracking record was dropped before the delete
-            # landed. Only "nothing tracked AND the engine is certain nothing
-            # is missing" proves there is nothing to remove; anything else
-            # must still issue the delete, or the row survives untracked
-            # forever (nothing else ever removes it). Deleting a nonexistent
-            # entity by `coco_key` is a documented no-op, so the defensive
-            # delete costs nothing when it turns out to be unnecessary. Same
-            # guard every sibling connector uses, and the same reading the
-            # insert path below already applies to this exact signal.
+            # Only "nothing tracked and nothing possibly missing" proves there
+            # is nothing to remove; otherwise the entity may still be in the
+            # graph untracked, and deleting a missing one is a no-op.
             if not prev_possible_records and not prev_may_be_missing:
                 return None
             key_properties = tuple(
@@ -1038,18 +977,7 @@ class _EdgeHandler(coco.TargetHandler[_EdgeValue, _EntityTrackingRecord, None]):
         coco_key = derive_coco_key(key)
 
         if coco.is_non_existence(desired_target_state):
-            # `prev_may_be_missing` means we may simply have lost track of a
-            # row that is still in the graph — after a `--reprocess`, after
-            # internal state was lost while the store persisted, or when a
-            # prior delete's tracking record was dropped before the delete
-            # landed. Only "nothing tracked AND the engine is certain nothing
-            # is missing" proves there is nothing to remove; anything else
-            # must still issue the delete, or the row survives untracked
-            # forever (nothing else ever removes it). Deleting a nonexistent
-            # entity by `coco_key` is a documented no-op, so the defensive
-            # delete costs nothing when it turns out to be unnecessary. Same
-            # guard every sibling connector uses, and the same reading the
-            # insert path below already applies to this exact signal.
+            # As for a node.
             if not prev_possible_records and not prev_may_be_missing:
                 return None
             return coco.TargetReconcileOutput(
@@ -1232,19 +1160,10 @@ def plan_commits(actions: Sequence[_NodeAction | _EdgeAction]) -> list[Query]:
 # ---------------------------------------------------------------------------
 
 
-#: Emitted by the engine when an edge insert references a node that doesn't
-#: exist yet — verified against the binary: `src '<key>' not found in
-#: <Type>` for the `from` endpoint, `dst '<key>' not found in <Type>` for
-#: `to`. The CLI colors its stderr with ANSI escapes even when not a TTY
-#: (verified: piped subprocess output still carries them), and a leading
-#: `\b` would break on that — the color-reset sequence right before "src"/
-#: "dst" ends in a letter (`\x1b[91m`), so there's no word boundary there.
-#: `(src|dst) '...' not found in` is a tight enough anchor on its own; an
-#: unrelated error would need this exact multi-token phrase to trigger a
-#: spurious stub.
-# Match the closing quote by its full error-message suffix rather than treating
-# every apostrophe as the end of the key. String keys are allowed to contain
-# apostrophes (for example, ``O'Brien``).
+#: The engine's refusal of an edge whose endpoint node does not exist yet:
+#: `__src '<key>' not found in <Type>` for `from`, `__dst ...` for `to`
+#: (verified against 0.14). The key is matched up to the whole suffix, not the
+#: next apostrophe, since a key may contain one (`O'Brien`).
 _ENDPOINT_NOT_FOUND_RE = re.compile(r"__(src|dst) '([\s\S]*?)' not found in (\w+)")
 
 
@@ -1309,30 +1228,15 @@ async def _mutate_with_endpoint_retry(
     branch: str,
     edge_actions: Sequence[_EdgeAction],
 ) -> None:
-    """Apply `commit` optimistically — without any endpoint stub — since the
-    common case is that both endpoints either already exist or aren't
-    needed at all. A keyed `insert` in Omnigraph is a full-record replace,
-    not a partial merge (verified against the engine), so unconditionally
-    stubbing every edge's endpoints was proven to silently null out a
-    node's other nullable properties whenever the owning component had
-    already written real values. Building a stub only reactively, from a
-    "not found" failure, is provably safe: the engine has just confirmed
-    the node doesn't exist, so there's nothing to wipe.
+    """Apply `commit`, stubbing each endpoint the engine reports missing.
 
-    The engine reports only the *first* missing endpoint per attempt
-    (verified: with both `from` and `to` absent, only `src` is reported),
-    and with up to 1024 components running concurrently, an edge component
-    preceding the components that own its endpoints is ordinary, not
-    exotic. A commit carries every edge of a component, so the number of
-    stub rounds it may need is the number of distinct endpoints those
-    edges reference — not two, which is the budget for a single edge and
-    failed any commit with three or more absent endpoints.
-
-    The loop is bounded by exactly that set: a stub is only ever built for
-    an endpoint some edge in `edge_actions` references, and each `(type,
-    key)` is stubbed at most once. A "not found" that names an endpoint
-    already stubbed, or one no edge here references, propagates instead
-    of spinning.
+    A stub is built only after the engine has confirmed the node is absent,
+    so it never overwrites a node's properties (a keyed `insert` replaces the
+    whole record). The engine reports one missing endpoint per attempt, so a
+    commit may need one round per distinct endpoint its edges reference. The
+    loop is bounded by that set: each `(type, key)` is stubbed at most once,
+    and a "not found" for an endpoint already stubbed, or one no edge here
+    references, propagates.
     """
     stubbed: set[tuple[str, str]] = set()
     while True:
@@ -1360,7 +1264,7 @@ class _SchemaGate:
     within this process scratch work holds the gate shared and a schema
     deployment holds it exclusive; a waiting deployment keeps new scratch
     work out until it is done. Other processes are handled by the bounded
-    retry in `deploy_schema` (decision 46).
+    retry in `deploy_schema`.
     """
 
     def __init__(self) -> None:
@@ -1504,29 +1408,20 @@ async def _deploy_schema(
 async def _keep_referenced_nodes(
     client: _GraphClient, actions: Sequence[_NodeAction | _EdgeAction], *, branch: str
 ) -> list[_NodeAction | _EdgeAction]:
-    """Turn the delete of a node that an edge outside `actions` still
-    references into a key-only upsert of that node.
+    """Turn the delete of a node an edge still references into a key-only
+    upsert of that node: the stub an edge gets when it arrives before its
+    node.
 
-    Deleting a node cascades to its edges in the graph (`affected_edges` in
-    the mutation's result, verified against the engine) — silently, from
-    the point of view of whichever component declared those edges: their
-    tracking still says they exist, so once the node came back the edges'
-    reconcile found nothing to do and they were gone for good. The edge is
-    the declared state that still holds, and the connector already has a
-    shape for "an edge whose endpoint nobody declares": the key-only stub
-    it writes when an edge arrives before its node. A referenced node is
-    reduced to that same stub, so the edge survives, and the node's next
-    declaration fills it back in. An edge this batch writes counts too: the
-    writes land before the deletes, so its endpoint's delete would cascade
-    to it. Edges this batch deletes itself do not count, so a node
-    undeclared together with all of its edges is deleted outright.
+    Deleting a node cascades to its edges, while their components' tracking
+    says they exist, so they would be gone for good. A reference is an edge
+    in the graph that this batch does not delete, or an edge this batch
+    writes (writes land before deletes). A node undeclared together with all
+    of its edges is deleted outright.
 
-    The edge types to look at come from the live schema, one read per
-    batch; nodes of a type no edge type references cost nothing more. Each
-    remaining delete costs one read per (edge type, end) at which its type
-    sits. An edge inserted by another component between that read and this
-    batch's commit is still cascaded; the window is the same one every
-    unlocked entity write has.
+    Costs one schema read per batch with a node delete, and one read per
+    (edge type, end) for each delete of a type some edge type references.
+    An edge another component inserts between that read and this commit is
+    still cascaded, the same window every unlocked write has.
     """
     deletes = [a for a in actions if isinstance(a, _NodeAction) and a.op == "delete"]
     if not deletes:
@@ -1671,12 +1566,8 @@ def _check_no_kind_clash(existing_pg: str, pending: Sequence[_TypeAction]) -> No
 def _check_no_kind_clash_within_batch(pending: Sequence[_TypeAction]) -> None:
     """Refuse a batch that writes a node and an edge under the same name.
 
-    Same rule and same consequence as `_check_no_kind_clash` below, but
-    applied to the batch rather than the live schema — which is the only
-    place it can be caught when both types are new. The live-schema check
-    can only ever see types that are ALREADY in the graph, so two fresh
-    clashing types slip past it on an initialized store, and on a fresh
-    store it isn't reached at all (the `init` path returns first).
+    Same rule as `_check_no_kind_clash`, applied to the batch: the live
+    schema cannot show two types that are both new.
     """
     kind_by_name: dict[str, str] = {}
     for action in pending:
@@ -1814,39 +1705,20 @@ async def _apply_type_schema(
     """Fold every schema-changing action for one graph into one read and at
     most two deployments.
 
-    Omnigraph's schema is applied whole-graph, not per type (verified
-    against the engine: applying a single new type's fragment alone
-    silently dropped every other existing type). Task 6 reconciles each
-    type independently and only ever renders that one type's fragment, so
-    every action funnels through here: read the current whole-graph
-    source, fold this batch's fragments into it in memory, and write the
-    result back. The whole batch arrives in one call — the sink's batcher
-    never has more than one group in flight — so doing a full
-    read-merge-write round-trip per action would be N times the CLI
-    invocations for the same end state.
+    Omnigraph's schema is deployed whole-graph (a deployment of one type's
+    fragment alone drops every other type), while each type reconciles to
+    its own fragment, so the batch is folded into the served source and
+    deployed once. A graph always has a schema, possibly empty: graphs are
+    created by cluster deployments, never by the connector.
 
-    A served graph always has a schema, possibly empty: a graph is created
-    by a cluster deployment, never by the connector, so there is no
-    first-type special case.
+    A drop removes the type's block, which is also what deletes its rows:
+    the engine emits no per-child deletes for a removed container.
 
-    Two exceptions to the single write:
-
-    `"drop"` removes the type's block. Nothing else deletes a dropped
-    type's nodes or edges: when a container target state disappears the
-    engine emits no per-child deletes, so if this didn't drop the block,
-    the type and every row in it would persist forever, untracked.
-
-    `"replace"` (a `@key` or edge-endpoint change) cannot go through the
-    ordinary merge: the engine flatly rejects an in-place key change
-    ("removing property constraints ... not supported in schema migration
-    v1", verified against the binary — not a soft/hard-drop distinction,
-    `--allow-data-loss` doesn't help). It needs a genuine rebuild, so a
-    batch containing any `"replace"` costs one extra `schema apply` that
-    lands the replaced types' removal first, before the final apply
-    re-adds them under their new definitions. `child_invalidation=
-    "destructive"` on a `"replace"` already tells every child entity it
-    must be re-declared from scratch, which is exactly what the drop half
-    does at the schema level.
+    A `"replace"` (a `@key` or endpoint change) needs a rebuild, since the
+    engine rejects an in-place key change ("removing property constraints
+    ... not supported in schema migration v1"; verified). The replaced types
+    are removed in a first deployment and re-added by the second; their
+    children are re-declared (`child_invalidation="destructive"`).
     """
     user_edges = [
         a.key.type_name
@@ -1899,18 +1771,11 @@ async def _apply_type_schema_locked(
     # `_apply_type_schema` hands over one app's types at a time.
     marker = ownership_property(pending[0].owner)
 
-    # A node type's drop may find an edge type of this app still pointing
-    # at it. Every mounted type is its own component and all of them share
-    # one sink batcher, so when an app is dropped the edge type's own
-    # removal is queued behind this very batch — waiting for it here
-    # deadlocks until a timeout (verified live). Its removal is coming
-    # regardless, so take this app's own edge types along now; the edge's
-    # batch then finds nothing left to remove. An edge type marked as
-    # another app's is that app's to remove — its removal is not coming,
-    # and a marker that only said "some app of this connector" let one
-    # app's drop delete another's edges — and one without any marker is a
-    # user's or another tool's; neither is removed on their behalf, and a
-    # `@key` change keeps the edge declared, so all three still fail here.
+    # A dropped node type may still have an edge type of this app pointing
+    # at it, whose own removal is queued behind this batch (waiting for it
+    # deadlocks), so this app's edge types go along now. Another app's, or
+    # one with no ownership property (a user's), is not removed on its
+    # behalf, and a `@key` change keeps the edge declared: those fail here.
     taken_along: list[str] = []
     for removal in _blocked_node_removals(existing, pending):
         foreign = {
@@ -2306,9 +2171,8 @@ def _build_edge_spec(
     managed_by: ManagedBy,
     owner: str,
 ) -> _TypeSpec:
-    """Pure seam between `edge_target()` and `_TypeSpec` construction — kept
-    separate so the endpoint key-field wiring (Task 10 step 4) is directly
-    testable without reaching into `coco.TargetState`'s private value."""
+    """The spec `edge_target` declares, with the endpoints' key definitions
+    the sink needs for stubs."""
     if schema is not None and not isinstance(schema, EdgeSchema):
         raise TypeError(
             f"An edge type's schema must be an EdgeSchema, not "
@@ -2385,16 +2249,10 @@ def node_target(
         prop = schema.properties[key_field]
         allowed = _KEY_ENCODERS.get(prop.pg_type.rstrip("?"), ())
         if prop.encoder is not None and prop.encoder not in allowed:
-            # The key is the node's identity, and an edge addresses that
-            # identity by the raw key value its author passed to
-            # `declare_edge`. A custom encoder would make the graph key on
-            # something else: changing one from `str.lower` to `str.upper`
-            # upserted a second node under the new spelling and left the old
-            # one behind, and an edge declared with the raw value would never
-            # find either. Only the fixed Date/DateTime encoders are allowed
-            # on a key, each on the type it encodes — pure functions of the
-            # value, never changing, and such types cannot be edge endpoints
-            # at all.
+            # Edges address a node by the raw key value, so an encoder on the
+            # key would make the graph key on something else, and changing
+            # it would leave the old node behind. Only the fixed Date and
+            # DateTime encodings are allowed, each on its own type.
             raise ValueError(
                 f"Node type {type_name!r}: key property {key_field!r} has a custom "
                 f"encoder. The key is the node's identity, and edges address it by "

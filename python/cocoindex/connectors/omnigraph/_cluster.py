@@ -24,7 +24,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection
 from typing import Any, BinaryIO
 
-if sys.platform == "win32":
+if sys.platform == "win32":  # pragma: no cover - run by the Windows CI job
     import msvcrt
 else:
     import fcntl
@@ -109,7 +109,7 @@ class _CliResult:
         return isinstance(disposition, dict) and disposition.get("effects") == "none"
 
 
-if sys.platform == "win32":
+if sys.platform == "win32":  # pragma: no cover - run by the Windows CI job
 
     def _lock_file(f: BinaryIO) -> None:
         f.seek(0, 2)
